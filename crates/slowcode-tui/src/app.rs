@@ -735,6 +735,9 @@ impl App {
         if let UiTurnEnd::Error { code, message } = reason {
             self.state = RunState::Error;
             self.push(MessageBlock::Error(format!("{code}: {message}")));
+            self.push_background(MessageBlock::System(
+                "if this is a slowcode bug, run /feedback to write a bundle; the journal's error events are included automatically".to_owned(),
+            ));
         }
         self.pending_approval = None;
         self.assistant_live = None;
@@ -2945,7 +2948,7 @@ fn command_help_text(name: &str, args: &str, description: &str) -> String {
             "\nexample: /skills install ./path/to/skill\n         /skills install ./path/to/skill --role navigator\n         /skills remove skill-name --global",
         ),
         "/feedback" => text.push_str(
-            "\nfree text becomes the note; its first line becomes the title\n  --plan PATH   attach a plan artifact\n  --title TEXT  override the derived title\n  --note TEXT   same as typing free text\nexample: /feedback the plan never paused\n         /feedback --plan .scratch/plans/<artifact>.md",
+            "\nfree text describes what actually happened; its first line becomes the title\n  --plan PATH   attach a plan artifact\n  --title TEXT  override the derived title\n  --note TEXT   same as typing free text\nexample: /feedback the plan never paused\n         /feedback --plan .scratch/plans/<artifact>.md",
         ),
         "/mcp" => text.push_str(
             "\nexample: /mcp add ChromeDevTools/chrome-devtools-mcp\n         /mcp enable chrome-devtools\n         /mcp add fs npx -y @modelcontextprotocol/server-filesystem",
@@ -3248,14 +3251,14 @@ fn named_flag_value<'a>(
 const FEEDBACK_USAGE: &str = "usage: /feedback [--title TEXT] [--note TEXT] [--plan PATH] [text]";
 
 fn feedback_hint() -> String {
-    "feedback: type the problem in plain words, or add --plan <path>\nexample: /feedback the plan never paused\n         /feedback --plan .scratch/plans/<artifact>.md".to_owned()
+    "feedback: type what actually happened in plain words, or add --plan <path>\nerror events from the session journal are included automatically\nexample: /feedback the turn failed while running the tests\n         /feedback --plan .scratch/plans/<artifact>.md".to_owned()
 }
 
 fn feedback_preview_text(preview: &BundlePreview, candidates: usize) -> String {
     let mut lines = vec![
         format!("feedback bundle: {}", preview.title),
         format!(
-            "note: {}",
+            "actual: {}",
             preview
                 .note
                 .as_deref()
@@ -4569,8 +4572,12 @@ mod tests {
         assert!(app.assistant_live.is_none());
         assert!(app.reasoning_live.is_none());
         assert!(matches!(
+            &app.messages[app.messages.len() - 2],
+            MessageBlock::Error(text) if text == "provider: boom"
+        ));
+        assert!(matches!(
             app.messages.last(),
-            Some(MessageBlock::Error(text)) if text == "provider: boom"
+            Some(MessageBlock::System(text)) if text.contains("/feedback")
         ));
     }
 
@@ -5158,7 +5165,7 @@ mod tests {
             Some(MessageBlock::System(text)) => text.clone(),
             other => panic!("expected a system hint, got {other:?}"),
         };
-        assert!(hint.contains("type the problem in plain words"), "{hint}");
+        assert!(hint.contains("type what actually happened"), "{hint}");
 
         app.handle_command(Command::Feedback("a failure".to_owned()))
             .await;
