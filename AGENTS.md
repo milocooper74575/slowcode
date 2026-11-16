@@ -130,6 +130,12 @@ cargo run -p slowcode-cli -- --read-only --workspace <dir> "task"
 - `/distill` requires `## 理解漏洞报告` with the four required sections and
   one repair attempt.
 
+## Feedback
+
+- Every `/feedback` issue must become regression coverage before the fix is
+  complete: a unit test for the failing seam and an e2e test for the
+  user-visible workflow. Do not close the issue on manual validation alone.
+
 ## Security
 
 - Keys come from `.env` or `DEEPSEEK_API_KEY`. Never print or commit them.
