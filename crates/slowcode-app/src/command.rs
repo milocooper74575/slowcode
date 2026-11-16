@@ -14,7 +14,7 @@ pub enum Command {
     Role(Option<RoleName>),
     Context(Option<String>),
     Cache,
-    Login,
+    Login(LoginCommand),
     Logout,
     Skills(Option<String>),
     Mcp(Option<String>),
@@ -44,6 +44,15 @@ pub enum SessionCommand {
     New,
     Rename(String),
     Switch(String),
+}
+
+/// `/login` modes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoginCommand {
+    /// Report the credential status, prompting when none is configured.
+    Show,
+    /// Always prompt for a key, replacing any configured one.
+    Key,
 }
 
 /// Static description used by `/help` and completion.
@@ -88,13 +97,13 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/login",
-        args: "",
-        description: "check the DeepSeek credential",
+        args: "[key]",
+        description: "show the credential or enter an API key",
     },
     CommandSpec {
         name: "/logout",
         args: "",
-        description: "remove the configured credential reference",
+        description: "remove the API key from the workspace .env",
     },
     CommandSpec {
         name: "/skills",
@@ -306,6 +315,7 @@ fn argument_candidates(command: &str) -> &'static [&'static str] {
             "deepseek-v4-flash-vision-exp",
         ],
         "/context" => &["reload"],
+        "/login" => &["key"],
         "/skills" => &["install", "remove", "reload"],
         "/mcp" => &["add", "test", "tools", "remove", "reload"],
         "/feedback" => &["--plan", "--title", "--note"],
@@ -346,6 +356,7 @@ fn argument_description(command: &str, candidate: &str) -> Option<&'static str> 
         ("/feedback", "--plan") => Some("attach a plan artifact"),
         ("/feedback", "--title") => Some("override the derived title"),
         ("/feedback", "--note") => Some("same as typing free text"),
+        ("/login", "key") => Some("enter or replace the API key"),
         _ => None,
     }
 }
@@ -445,8 +456,12 @@ fn parse_cache(_rest: &str) -> Command {
     Command::Cache
 }
 
-fn parse_login(_rest: &str) -> Command {
-    Command::Login
+fn parse_login(rest: &str) -> Command {
+    match rest.trim() {
+        "" => Command::Login(LoginCommand::Show),
+        "key" => Command::Login(LoginCommand::Key),
+        other => Command::Unknown(format!("/login {other}")),
+    }
 }
 
 fn parse_logout(_rest: &str) -> Command {
@@ -551,6 +566,14 @@ mod tests {
     fn parses_high_frequency_commands() {
         assert_eq!(parse_command("/help"), Some(Command::Help(None)));
         assert_eq!(parse_command("/model"), Some(Command::Model(None)));
+        assert_eq!(
+            parse_command("/login"),
+            Some(Command::Login(LoginCommand::Show))
+        );
+        assert_eq!(
+            parse_command("/login key"),
+            Some(Command::Login(LoginCommand::Key))
+        );
         assert_eq!(
             parse_command("/model deepseek-v4-pro"),
             Some(Command::Model(Some("deepseek-v4-pro".to_owned())))
@@ -705,7 +728,6 @@ mod tests {
     fn argument_less_commands_ignore_rest() {
         for input in [
             "/cache now",
-            "/login deepseek",
             "/logout",
             "/scaffold all",
             "/continue now",
@@ -726,7 +748,6 @@ mod tests {
     fn expected_argument_less(input: &str) -> Command {
         match input.split_whitespace().next().unwrap_or_default() {
             "/cache" => Command::Cache,
-            "/login" => Command::Login,
             "/logout" => Command::Logout,
             "/scaffold" => Command::Scaffold,
             "/continue" => Command::Continue,
@@ -736,6 +757,14 @@ mod tests {
             "/quit" | "/exit" => Command::Quit,
             other => panic!("test bug: {other} is not argument-less"),
         }
+    }
+
+    #[test]
+    fn login_rejects_unknown_modes() {
+        assert_eq!(
+            parse_command("/login deepseek"),
+            Some(Command::Unknown("/login deepseek".to_owned()))
+        );
     }
 
     #[test]

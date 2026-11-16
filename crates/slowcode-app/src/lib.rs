@@ -4,14 +4,19 @@
 //! parsing. It never renders and never reads the terminal.
 
 mod command;
+mod credentials;
 pub mod plan;
 mod runtime;
 mod text;
 pub mod workflow;
 
 pub use command::{
-    Command, CommandCompletion, SessionCommand, command_specs, complete, complete_answer,
-    parse_command,
+    Command, CommandCompletion, LoginCommand, SessionCommand, command_specs, complete,
+    complete_answer, parse_command,
+};
+pub use credentials::{
+    API_KEY_ENV, CredentialError, CredentialSourceKind, CredentialStatus, WorkspaceCredentials,
+    credential_status, remove_api_key, save_api_key,
 };
 pub use runtime::{
     ContextBreakdown, ContextSlice, McpInstallReport, Runtime, RuntimeConfig, RuntimeError,

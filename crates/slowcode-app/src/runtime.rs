@@ -23,6 +23,7 @@ use slowcode_roles::{ExtraToolSlot, RoleName, RoleSession, RoleSessionConfig, Ro
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::credentials::WorkspaceCredentials;
 use crate::plan::{self, PlanCommand, PlanConfig, PlanOutcome};
 use crate::workflow::{AuditedReadonlyShell, WorkflowStore};
 
@@ -778,8 +779,11 @@ pub fn build_provider(config: &RuntimeConfig) -> Result<Arc<dyn ModelProvider>, 
             .with_default_context_window(context_window)
             .map_err(|error| RuntimeError::Provider(error.to_string()))?;
     }
-    let provider = DeepSeekProvider::from_environment(deepseek)
-        .map_err(|error| RuntimeError::Provider(error.to_string()))?;
+    let provider = DeepSeekProvider::new(
+        deepseek,
+        Arc::new(WorkspaceCredentials::new(config.workspace.clone())),
+    )
+    .map_err(|error| RuntimeError::Provider(error.to_string()))?;
     Ok(Arc::new(provider))
 }
 

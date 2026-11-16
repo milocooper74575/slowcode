@@ -195,7 +195,12 @@ fn build_provider(options: &CliOptions) -> Result<DeepSeekProvider, Box<dyn Erro
     if let Some(context_window) = options.context_window {
         config = config.with_default_context_window(context_window)?;
     }
-    Ok(DeepSeekProvider::from_environment(config)?)
+    Ok(DeepSeekProvider::new(
+        config,
+        Arc::new(slowcode_app::WorkspaceCredentials::new(
+            options.workspace.clone(),
+        )),
+    )?)
 }
 
 pub async fn run_with_provider(
