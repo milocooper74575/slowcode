@@ -1021,14 +1021,20 @@ mod tests {
     }
 
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{collections::VecDeque, sync::Mutex};
 
     use slowcode_kernel::{
         agent::{ToolExecutionFuture, ToolExecutionRequest, ToolExecutorError, ToolShutdownFuture},
-        model::JsonValue,
+        model::{
+            ContentBlockType, FinishReason, JsonValue, LlmCallConfigAdapterDefaults,
+            NonNegativeSafeInteger, StreamChunk,
+        },
         provider::{
             PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
             ProviderPrepareError, ProviderRequest, ProviderRequestDraft, ProviderStream,
+            ProviderStreamError,
         },
+        ui::{UiEventKind, UiEventReceiver},
     };
 
     /// Env-mutating runtime tests run one at a time in this binary.
@@ -1058,6 +1064,67 @@ mod tests {
         ) -> ProviderStream {
             unreachable!("runtime lifecycle tests never reach the provider")
         }
+    }
+
+    struct ScriptedProvider {
+        attempts: Mutex<VecDeque<Vec<Result<StreamChunk, ProviderStreamError>>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(attempts: Vec<Vec<Result<StreamChunk, ProviderStreamError>>>) -> Self {
+            Self {
+                attempts: Mutex::new(attempts.into()),
+            }
+        }
+    }
+
+    impl ModelProvider for ScriptedProvider {
+        fn prepare_call(
+            &self,
+            config: LlmCallConfig,
+        ) -> Result<PreparedProviderCall, ProviderPrepareError> {
+            let mut raw = config.raw().as_value().clone();
+            raw.as_object_mut()
+                .expect("call config is an object")
+                .insert("maxTokens".to_owned(), serde_json::json!(4_096));
+            let config = serde_json::from_value(raw).expect("max tokens produce a valid config");
+            Ok(PreparedProviderCall::new(
+                config,
+                LlmCallConfigAdapterDefaults::default(),
+                Some(NonNegativeSafeInteger::new(16_384).expect("context window fits")),
+            ))
+        }
+
+        fn preflight_request(
+            &self,
+            draft: ProviderRequestDraft<'_>,
+        ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+            let prepared = self.prepare_call(draft.config().clone())?;
+            draft.finish(prepared, 1)
+        }
+
+        fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
+            let chunks = self
+                .attempts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted provider has a response");
+            Box::pin(futures_util::stream::iter(chunks))
+        }
+    }
+
+    fn text_response(text: &str) -> Vec<Result<StreamChunk, ProviderStreamError>> {
+        vec![
+            Ok(StreamChunk::block_start(0, ContentBlockType::Text).unwrap()),
+            Ok(StreamChunk::text_delta(0, text).unwrap()),
+            Ok(StreamChunk::block_end(
+                0,
+                slowcode_kernel::model::ContentBlock::text(text).unwrap(),
+            )
+            .unwrap()),
+            Ok(StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap()),
+        ]
     }
 
     struct CountingTool {
@@ -1102,6 +1169,15 @@ mod tests {
     }
 
     async fn runtime_with_temp_home(label: &str) -> (Runtime, PathBuf, PathBuf) {
+        let (runtime, _events, home, workspace) =
+            runtime_with_provider(label, Arc::new(PanicProvider)).await;
+        (runtime, home, workspace)
+    }
+
+    async fn runtime_with_provider(
+        label: &str,
+        provider: Arc<dyn ModelProvider>,
+    ) -> (Runtime, UiEventReceiver, PathBuf, PathBuf) {
         let home = temp_dir(&format!("{label}-home"));
         let workspace = temp_dir(&format!("{label}-workspace"));
         let previous = std::env::var_os("HOME");
@@ -1112,7 +1188,7 @@ mod tests {
         let started = Runtime::start_with(
             RuntimeConfig::new(workspace.clone()),
             SessionChoice::New,
-            Arc::new(PanicProvider),
+            provider,
         )
         .await
         .expect("runtime starts");
@@ -1122,7 +1198,7 @@ mod tests {
                 std::env::set_var("HOME", previous);
             }
         }
-        (started.runtime, home, workspace)
+        (started.runtime, started.events, home, workspace)
     }
 
     #[tokio::test]
@@ -1167,6 +1243,60 @@ mod tests {
             .await
             .expect("feedback snapshot after a plan command");
         assert!(!snapshot.journal.is_empty());
+        runtime.shutdown().await.expect("runtime shuts down");
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn plan_command_streams_events_into_the_durable_session() {
+        let _guard = HOME_LOCK.lock().await;
+        let provider = Arc::new(ScriptedProvider::new(vec![text_response(
+            "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+",
+        )]));
+        let (mut runtime, mut events, home, workspace) =
+            runtime_with_provider("plan-stream", provider).await;
+        let id = runtime.session_id().to_owned();
+
+        let outcome = runtime
+            .run_plan_command(
+                PlanCommand::Plan("count lines".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("plan succeeds");
+
+        assert!(outcome.output.contains("## 证据包"));
+        let mut saw_delta = false;
+        let mut saw_assistant = false;
+        while let Ok(event) = events.try_recv() {
+            match event.kind {
+                UiEventKind::AssistantTextDelta { .. } => saw_delta = true,
+                UiEventKind::AssistantMessage { .. } => saw_assistant = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_delta || saw_assistant,
+            "plan output reaches the UI event stream"
+        );
+        assert_eq!(runtime.session_id(), id);
+        let snapshot = runtime
+            .feedback_snapshot()
+            .await
+            .expect("feedback snapshot after a streamed plan");
+        assert!(
+            snapshot.journal.len() > 200,
+            "plan turns are written to the durable journal"
+        );
         runtime.shutdown().await.expect("runtime shuts down");
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_dir_all(workspace);

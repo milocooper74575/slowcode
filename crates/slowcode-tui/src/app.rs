@@ -5846,6 +5846,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plan_commands_are_classified_for_input_echo() {
+        assert!(is_plan_command(&Command::Plan("count lines".to_owned())));
+        assert!(is_plan_command(&Command::Status(None)));
+        assert!(is_plan_command(&Command::Hint("why".to_owned())));
+        assert!(!is_plan_command(&Command::Help(None)));
+        assert!(!is_plan_command(&Command::Model(None)));
+    }
+
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
@@ -5885,7 +5894,9 @@ mod tests {
             .await;
         app.handle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL))
             .await;
-        assert_eq!(app.composer, "\n\n");
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.composer, "\n\n\n");
 
         let action = app
             .handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -5899,7 +5910,7 @@ mod tests {
         );
         let action = app.handle_key(release).await;
         assert!(!action.quit);
-        assert_eq!(app.composer, "\n\n");
+        assert_eq!(app.composer, "\n\n\n");
     }
 
     #[tokio::test]
@@ -5950,6 +5961,32 @@ mod tests {
         assert!(!app.running);
         assert!(app.messages.iter().any(|message| {
             matches!(message, MessageBlock::Assistant(text) if text.contains("## Plan"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn plan_finished_does_not_duplicate_streamed_output() {
+        let mut app = test_app().await;
+        app.running = true;
+        app.plan_expects_assistant = true;
+        app.plan_output_seen = true;
+        app.messages
+            .push(MessageBlock::Assistant("streamed plan".to_owned()));
+
+        app.handle_app_event(AppEvent::PlanFinished(Ok(PlanOutcome {
+            path: std::path::PathBuf::from(".scratch/plans/p.md"),
+            output: "final plan".to_owned(),
+            workflow_id: None,
+        })));
+
+        let assistant = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message, MessageBlock::Assistant(_)))
+            .count();
+        assert_eq!(assistant, 1);
+        assert!(app.messages.iter().any(|message| {
+            matches!(message, MessageBlock::Assistant(text) if text == "streamed plan")
         }));
     }
 

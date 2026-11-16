@@ -437,4 +437,32 @@ mod tests {
         assert!(flat.contains("https://x.test"));
         assert!(!flat.contains("**"));
     }
+
+    #[test]
+    fn cjk_table_cells_keep_the_same_visual_width() {
+        let rendered = render(
+            "| 任务 | 状态 |\n|---|---|\n| 读取输入 | 可执行 |",
+            Color::Reset,
+        );
+        assert!(rendered.len() >= 3);
+        assert_eq!(rendered[0].width(), rendered[2].width());
+    }
+
+    #[test]
+    fn unclosed_fence_renders_the_remainder_as_code() {
+        let rendered = render("```rust\nlet x = 1;\nlet y = 2;", Color::Reset);
+        let flat = text(&rendered);
+        assert!(flat.contains("let x = 1;"));
+        assert!(flat.contains("let y = 2;"));
+        assert!(!flat.contains("```"));
+    }
+
+    #[test]
+    fn lone_inline_markers_do_not_panic_or_swallow_text() {
+        let rendered = render("2 * 3 and a _ b and [not a link", Color::Reset);
+        let flat = text(&rendered);
+        assert!(flat.contains("2 * 3"));
+        assert!(flat.contains("_ b"));
+        assert!(flat.contains("[not a link"));
+    }
 }
