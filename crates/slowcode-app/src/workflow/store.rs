@@ -765,7 +765,7 @@ impl WorkflowStore {
             flaky_reruns: 0,
             output_tail: failure.unwrap_or_default(),
         };
-        self.record_test_run(workflow_id, TestRunUpdate::new(record), u32::MAX, u64::MAX)
+        self.record_test_run(workflow_id, TestRunUpdate::new(record), u32::MAX)
     }
 
     /// Record one fixed-contract test run.
@@ -777,7 +777,6 @@ impl WorkflowStore {
         workflow_id: &str,
         update: TestRunUpdate,
         max_consecutive_same_failure: u32,
-        max_rounds: u64,
     ) -> Result<WorkflowState, WorkflowError> {
         let _lock = self.lock()?;
         let mut state = self.load(workflow_id)?;
@@ -787,6 +786,7 @@ impl WorkflowStore {
         state.test.attempts += 1;
         state.budget.model_calls += update.model_calls;
         state.budget.tokens += update.tokens;
+        state.budget.enforced_tokens += update.tokens;
         state.budget.active_seconds += update.active_seconds;
         let record = update.record;
         state.test.last_status = Some(record.status);
@@ -869,30 +869,17 @@ impl WorkflowStore {
                     "consecutive_same_failure": consecutive,
                 }),
             ));
-        } else if u64::from(rounds) >= max_rounds {
-            let failure = state.test.last_failure.clone();
-            apply_block(
-                &mut state,
-                "budget",
-                failure.clone(),
-                "raise test_fix.max_rounds in .slowcode/workflow.toml, then /workflow use <id>",
-            );
-            events.push((
-                "workflow.blocked",
-                json!({ "reason": "budget", "last_failure": failure, "rounds": rounds }),
-            ));
         }
         self.commit(&mut state, events)?;
         Ok(state)
     }
 
-    /// Add one fix turn's usage to the workflow budget.
-    pub fn record_fix_usage(
+    /// Add one model turn's usage to the workflow budget.
+    pub fn record_model_usage(
         &self,
         workflow_id: &str,
         model_calls: u64,
         tokens: u64,
-        active_seconds: u64,
     ) -> Result<WorkflowState, WorkflowError> {
         let _lock = self.lock()?;
         let mut state = self.load(workflow_id)?;
@@ -901,6 +888,33 @@ impl WorkflowStore {
         }
         state.budget.model_calls += model_calls;
         state.budget.tokens += tokens;
+        state.budget.enforced_tokens += tokens;
+        let budget = state.budget.clone();
+        self.commit(
+            &mut state,
+            vec![(
+                "model.used",
+                json!({
+                    "model_calls": model_calls,
+                    "tokens": tokens,
+                    "budget": budget,
+                }),
+            )],
+        )?;
+        Ok(state)
+    }
+
+    /// Add one fix turn's active time to the workflow counters.
+    pub fn record_fix_active_seconds(
+        &self,
+        workflow_id: &str,
+        active_seconds: u64,
+    ) -> Result<WorkflowState, WorkflowError> {
+        let _lock = self.lock()?;
+        let mut state = self.load(workflow_id)?;
+        if state.status != WorkflowStatus::Active {
+            return Err(super::state::GateError::NotActive(state.status).into());
+        }
         state.budget.active_seconds += active_seconds;
         let budget = state.budget.clone();
         self.commit(
@@ -908,8 +922,6 @@ impl WorkflowStore {
             vec![(
                 "fix.used",
                 json!({
-                    "model_calls": model_calls,
-                    "tokens": tokens,
                     "active_seconds": active_seconds,
                     "budget": budget,
                 }),

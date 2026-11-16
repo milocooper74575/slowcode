@@ -34,6 +34,10 @@ pub struct BundleRequest<'a> {
     pub title: Option<String>,
     pub note: Option<String>,
     pub plan: Option<PathBuf>,
+    /// Errors the UI showed on screen that the durable journal does not
+    /// contain. Plan commands run on ephemeral sessions, so their failures only
+    /// exist in the console until the caller passes them here.
+    pub console_errors: &'a [String],
 }
 
 /// What the bundle contains after a successful write.
@@ -67,7 +71,8 @@ pub struct BundlePreview {
 /// One error event worth carrying into the issue draft.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ErrorFact {
-    /// `turn` for a `turn/end` error, `tool` for a failed `tool/result`.
+    /// `turn` for a `turn/end` error, `tool` for a failed `tool/result`, and
+    /// `console` for an error the UI showed but the journal did not record.
     pub source: &'static str,
     pub code: String,
     pub message: String,
@@ -237,6 +242,24 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
     for error in &mut analysis.errors {
         error.message = redact(&error.message, workspace.as_deref());
     }
+    for message in request.console_errors {
+        let message = redact(message, workspace.as_deref());
+        if message.trim().is_empty()
+            || analysis
+                .errors
+                .iter()
+                .any(|error| same_error(&error.message, &message))
+        {
+            continue;
+        }
+        analysis.errors.push(ErrorFact {
+            source: "console",
+            code: "UI_ERROR".to_owned(),
+            message,
+            turn: None,
+            step: None,
+        });
+    }
     let title = request
         .title
         .clone()
@@ -262,6 +285,14 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         plan,
         sha256,
     })
+}
+
+/// A console line that repeats a journaled error adds no information. The UI
+/// often prefixes the journal message with its own code or wrapper text.
+fn same_error(recorded: &str, console: &str) -> bool {
+    let recorded = recorded.trim();
+    let console = console.trim();
+    recorded == console || (recorded.len() >= 16 && console.contains(recorded))
 }
 
 /// Use the first non-empty line of the free-form note as a title.
@@ -1094,6 +1125,7 @@ mod tests {
             title: Some("a real failure".to_owned()),
             note: Some("expected success".to_owned()),
             plan: None,
+            console_errors: &[],
         }
     }
 
@@ -1314,6 +1346,81 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
         assert_eq!(metadata["errors"][0]["code"], "ABORTED_BEFORE_DISPATCH");
         assert_eq!(metadata["errors"][1]["code"], "AGENT_TOOL_EXECUTOR");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn carries_console_errors_into_the_issue_and_metadata() {
+        let base = temp_dir("console-errors");
+        let out = base.join("out");
+        let journal = journal();
+        let console = vec![
+            "model call failed: the agent reached its step limit (AGENT_MAX_STEPS)".to_owned(),
+            "detail at /tmp/example-project with sk-abcdefghijklmnopqrstuv".to_owned(),
+        ];
+        let mut request = request(&out, journal.as_bytes());
+        request.console_errors = &console;
+        let outcome = write_bundle(request).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        let section = issue
+            .split("## 关键错误")
+            .nth(1)
+            .expect("error section")
+            .split("## 期望")
+            .next()
+            .expect("error body");
+        assert!(
+            section.contains(
+                "- [console] `UI_ERROR`: model call failed: the agent reached its step limit (AGENT_MAX_STEPS)"
+            ),
+            "{issue}"
+        );
+        assert!(!section.contains("/tmp/example-project"), "{issue}");
+        assert!(!section.contains("sk-abcdefghijklmnopqrstuv"), "{issue}");
+
+        let metadata: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
+        let errors = metadata["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), console.len());
+        assert!(
+            errors
+                .iter()
+                .all(|error| error["source"] == "console" && error["code"] == "UI_ERROR"),
+            "{metadata}"
+        );
+        assert!(
+            errors.iter().all(|error| !error["message"]
+                .as_str()
+                .unwrap()
+                .contains("/tmp/example-project")),
+            "{metadata}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn skips_console_errors_that_repeat_a_journal_error() {
+        let base = temp_dir("console-dedup");
+        let out = base.join("out");
+        let journal = error_journal();
+        let console = vec![
+            "AGENT_TOOL_EXECUTOR: the tool executor failed before producing a result".to_owned(),
+        ];
+        let mut request = request(&out, journal.as_bytes());
+        request.console_errors = &console;
+        let outcome = write_bundle(request).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let metadata: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
+        let errors = metadata["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "{metadata}");
+        assert!(
+            errors.iter().all(|error| error["source"] != "console"),
+            "{metadata}"
+        );
         let _ = fs::remove_dir_all(base);
     }
 

@@ -29,7 +29,8 @@ use slowcode_kernel::skill_roots::SkillRoots;
 use slowcode_kernel::{
     agent::{
         AgentLoop, ApprovalFuture, ApprovalProvider, ApprovalRequest, FileChangePolicy,
-        NoApprovalProvider, ShellPolicy, ToolExecutor, ToolExecutorError, TurnProposal,
+        MAX_AGENT_STEPS_PER_TURN, NoApprovalProvider, ShellPolicy, ToolExecutor, ToolExecutorError,
+        TurnProposal,
     },
     model::{ContentBlock, LlmCallConfig, Message, MessageSource},
     provider::{ModelProvider, deepseek::DEEPSEEK_PROVIDER},
@@ -43,14 +44,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::workflow::{
     AnswerSnapshot, AnswerSource, AnswerUpdate, CapabilityProfile, ClassifiedFailure,
-    DistillAnswerUpdate, DistillDecision, Domain, ExecState, ManifestFile, ModelCall, Phase,
+    DEFAULT_MAX_OUTPUT_TOKENS, DistillAnswerUpdate, DistillDecision, Domain, ExecState,
+    MAX_CONSECUTIVE_SAME_FAILURE, MAX_OUTPUT_TOKENS_PER_TURN, ManifestFile, ModelCall, Phase,
     ProjectTestConfig, Question, QuestionKind, QuestionStatus, ScaffoldContract, SecretPolicy,
     SelectorChoice, Strategy, Task as WorkflowTask, TestContract, TestRun, TestRunRecord,
-    TestRunUpdate, TestStatus, UnknownGap, WorkflowBudget, WorkflowState, WorkflowStore,
-    build_contract, build_review_contract, build_skill_manifest, changed_files, derive_selector,
-    detect_project, hash_arguments, input::redact_secrets, read_answer_file, sha256_hex,
-    snapshot_workspace, test_exec, validate_selector, verify_core_implemented, verify_hashes,
-    verify_test_contract_hashes, verify_test_flip,
+    TestRunUpdate, TestStatus, UnknownGap, WorkflowBudget, WorkflowState, WorkflowStatus,
+    WorkflowStore, build_contract, build_review_contract, build_skill_manifest, changed_files,
+    derive_selector, detect_project, hash_arguments, input::redact_secrets, read_answer_file,
+    sha256_hex, snapshot_workspace, test_exec, validate_selector, verify_core_implemented,
+    verify_hashes, verify_test_contract_hashes, verify_test_flip,
 };
 
 /// Errors from a Plan command. The message is user-facing.
@@ -237,6 +239,20 @@ impl PlanCommand {
             Self::Hint(_) => "hint",
         }
     }
+
+    /// Whether this command can spend model tokens.
+    #[must_use]
+    pub fn uses_model(&self) -> bool {
+        matches!(
+            self,
+            Self::Plan(_)
+                | Self::Answer(_)
+                | Self::Scaffold
+                | Self::Fix
+                | Self::Distill(_)
+                | Self::Hint(_)
+        )
+    }
 }
 
 /// Result of one Plan command.
@@ -256,6 +272,7 @@ struct PlanAgentPolicy {
     approval: Option<Arc<dyn ApprovalProvider>>,
     workflow_id: Option<String>,
     audit_sink: Option<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+    max_steps_per_turn: Option<usize>,
 }
 
 /// Run one Plan command.
@@ -276,12 +293,22 @@ pub async fn run_command(
         command,
         PlanCommand::Scaffold | PlanCommand::Fix | PlanCommand::Execute
     );
+    let uses_model = command.uses_model();
     let operation = command.label();
     let creates_workflow = matches!(&command, PlanCommand::Plan(_));
     let record_run = !matches!(
         command,
         PlanCommand::Status(_) | PlanCommand::Next | PlanCommand::Workflow(_)
     );
+    // A model command must not start once the workflow's total token budget
+    // is already spent. `/plan` has no active workflow yet and is checked
+    // after it creates one.
+    if uses_model && let Some(state) = &active {
+        let budget = load_budget(&config.workspace)?;
+        if let Some(reason) = budget_exhausted(state, &budget) {
+            return block_for_budget(&store, state, &reason, "");
+        }
+    }
     // Run-level journal sits beside the workflow journal. A run links back by
     // workflow id, but the runtime never reads the workflow state. Starting a
     // run fails closed; finishing it is best effort so a successful command is
@@ -360,10 +387,26 @@ pub async fn run_command(
             }
         }
     });
-    let result = match recorder {
+    let mut result = match recorder {
         Some(recorder) => ACTIVE_RUN.scope(recorder, dispatch).await,
         None => dispatch.await,
     };
+    // A turn can spend the final tokens of the budget. Block the workflow
+    // after the command so the next model call cannot start.
+    if uses_model
+        && result.is_ok()
+        && let Ok(Some(state)) = store.load_active()
+        && state.status == WorkflowStatus::Active
+    {
+        let budget = load_budget(&config.workspace)?;
+        if let Some(reason) = budget_exhausted(&state, &budget) {
+            let detail = result
+                .as_ref()
+                .map(|outcome| outcome.output.clone())
+                .unwrap_or_default();
+            result = Ok(block_for_budget(&store, &state, &reason, &detail)?);
+        }
+    }
     let cancelled = cancellation.is_cancelled()
         || result
             .as_ref()
@@ -474,13 +517,14 @@ pub async fn run_plan(
             approval: None,
             workflow_id: None,
             audit_sink: Some(Arc::clone(&audit_sink)),
+            max_steps_per_turn: Some(MAX_AGENT_STEPS_PER_TURN),
         },
     )
     .await?;
 
     finish_plan(
         async {
-            let mut output = run_text_turn(
+            let (mut output, mut usage) = run_text_turn_usage(
                 &mut agent,
                 &plan_user_prompt(task),
                 1,
@@ -491,7 +535,11 @@ pub async fn run_plan(
             let mut validation = validate_plan_output(&output);
             if !validation.is_valid() {
                 let repair = repair_prompt(&validation.reasons);
-                output = run_text_turn(&mut agent, &repair, 2, config, &cancellation).await?;
+                let (repaired, repair_usage) =
+                    run_text_turn_usage(&mut agent, &repair, 2, config, &cancellation).await?;
+                usage.model_calls += repair_usage.model_calls;
+                usage.output_tokens += repair_usage.output_tokens;
+                output = repaired;
                 validation = validate_plan_output(&output);
             }
 
@@ -505,6 +553,11 @@ pub async fn run_plan(
             let tasks = workflow_tasks(&parse_task_table(&output), &[]);
             let questions = workflow_questions(&tasks, &parse_question_table(&output));
             let state = store.create_with_questions(task, None, tasks, questions)?;
+            let state = store.record_model_usage(
+                &state.workflow_id,
+                usage.model_calls,
+                usage.output_tokens,
+            )?;
             flush_shell_audit(&store, &state.workflow_id, &audit_sink)?;
             record_manifest(
                 &config.workspace,
@@ -662,6 +715,7 @@ pub fn run_answer<'a>(
                 approval: None,
                 workflow_id: Some(active.workflow_id.clone()),
                 audit_sink: None,
+                max_steps_per_turn: None,
             },
         )
         .await?;
@@ -1078,6 +1132,7 @@ pub async fn run_scaffold(
             approval: approval.clone(),
             workflow_id: Some(active.workflow_id.clone()),
             audit_sink: None,
+            max_steps_per_turn: None,
         },
     )
     .await?;
@@ -1270,14 +1325,46 @@ fn load_budget(workspace: &Path) -> Result<WorkflowBudget, BoxError> {
     WorkflowBudget::load(workspace).map_err(|error| invalid(error.to_string()))
 }
 
-fn budget_blocked(state: &WorkflowState, budget: &WorkflowBudget) -> Option<String> {
-    if state.budget.active_seconds >= budget.max_active_seconds.value {
-        return Some(format!(
-            "active time budget reached: {}s of {}s",
-            state.budget.active_seconds, budget.max_active_seconds.value
-        ));
+fn budget_exhausted(state: &WorkflowState, budget: &WorkflowBudget) -> Option<String> {
+    (state.budget.enforced_tokens >= budget.max_output_tokens.value).then(|| {
+        format!(
+            "token budget reached: {} of {} output tokens",
+            state.budget.enforced_tokens, budget.max_output_tokens.value
+        )
+    })
+}
+
+fn blocked_outcome(
+    store: &WorkflowStore,
+    state: &WorkflowState,
+    reason: &str,
+    detail: &str,
+) -> PlanOutcome {
+    let mut output = format!("blocked: {reason}");
+    if !detail.trim().is_empty() {
+        output.push_str("\n\n");
+        output.push_str(detail.trim());
     }
-    None
+    PlanOutcome {
+        path: store.root().join(&state.workflow_id).join("state.json"),
+        output,
+        workflow_id: Some(state.workflow_id.clone()),
+    }
+}
+
+fn block_for_budget(
+    store: &WorkflowStore,
+    state: &WorkflowState,
+    reason: &str,
+    detail: &str,
+) -> Result<PlanOutcome, BoxError> {
+    let state = store.block(
+        &state.workflow_id,
+        "budget",
+        Some(reason.to_owned()),
+        "raise [budget].max_output_tokens in .slowcode/workflow.toml, then /workflow use <id>",
+    )?;
+    Ok(blocked_outcome(store, &state, reason, detail))
 }
 
 async fn run_contract_with_retries(
@@ -1310,37 +1397,6 @@ pub async fn run_test(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
     let store = WorkflowStore::new(&config.workspace);
     let active = store.require_active()?;
     active.can_enter_test()?;
-    let budget = load_budget(&config.workspace)?;
-    if let Some(reason) = budget_blocked(&active, &budget) {
-        store.block(
-            &active.workflow_id,
-            "budget",
-            Some(reason.clone()),
-            "raise workflow.max_active_seconds, then /workflow use <id>",
-        )?;
-        return Ok(PlanOutcome {
-            path: store.root().join(&active.workflow_id).join("state.json"),
-            output: format!("blocked: {reason}"),
-            workflow_id: Some(active.workflow_id),
-        });
-    }
-    if u64::from(active.test.rounds) >= budget.max_rounds.value {
-        let reason = format!(
-            "round budget reached: {} of {}",
-            active.test.rounds, budget.max_rounds.value
-        );
-        store.block(
-            &active.workflow_id,
-            "budget",
-            Some(reason.clone()),
-            "raise test_fix.max_rounds in .slowcode/workflow.toml, then /workflow use <id>",
-        )?;
-        return Ok(PlanOutcome {
-            path: store.root().join(&active.workflow_id).join("state.json"),
-            output: format!("blocked: {reason}"),
-            workflow_id: Some(active.workflow_id),
-        });
-    }
     let contract = active
         .test_contract
         .clone()
@@ -1359,12 +1415,7 @@ pub async fn run_test(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
     let (run, flaky_reruns, total_ms) =
         run_contract_with_retries(&config.workspace, &contract).await?;
     let update = test_run_update(&run, flaky_reruns, total_ms);
-    let state = store.record_test_run(
-        &active.workflow_id,
-        update,
-        u32::try_from(budget.max_consecutive_same_failure.value).unwrap_or(u32::MAX),
-        budget.max_rounds.value,
-    )?;
+    let state = store.record_test_run(&active.workflow_id, update, MAX_CONSECUTIVE_SAME_FAILURE)?;
     let path = resolve_plan_path(config)?;
     let artifact = fs::read_to_string(&path)?;
     let heading = format!("Test {}", now_unix()?);
@@ -1419,20 +1470,6 @@ pub async fn run_fix(
             "/fix cannot write in phase {}",
             active.phase
         )));
-    }
-    let budget = load_budget(&config.workspace)?;
-    if let Some(reason) = budget_blocked(&active, &budget) {
-        store.block(
-            &active.workflow_id,
-            "budget",
-            Some(reason.clone()),
-            "raise workflow.max_active_seconds, then /workflow use <id>",
-        )?;
-        return Ok(PlanOutcome {
-            path: store.root().join(&active.workflow_id).join("state.json"),
-            output: format!("blocked: {reason}"),
-            workflow_id: Some(active.workflow_id),
-        });
     }
     let contract = active
         .test_contract
@@ -1494,6 +1531,7 @@ pub async fn run_fix(
             approval: approval.clone(),
             workflow_id: Some(active.workflow_id.clone()),
             audit_sink: None,
+            max_steps_per_turn: None,
         },
     )
     .await?;
@@ -1501,7 +1539,7 @@ pub async fn run_fix(
     finish_plan(
         Box::pin(async {
             let started = std::time::Instant::now();
-            let (mut output, mut usage) = run_text_turn_usage(
+            let mut output = run_text_turn(
                 &mut agent,
                 &fix_user_prompt(&artifact, &evidence),
                 1,
@@ -1512,20 +1550,12 @@ pub async fn run_fix(
             let mut validation = validate_failure_classifications(&output, &expected_failures);
             if !validation.is_valid() {
                 let repair = failure_classification_repair_prompt(&validation.reasons);
-                let (repaired, repair_usage) =
-                    run_text_turn_usage(&mut agent, &repair, 2, config, &cancellation).await?;
-                usage.model_calls += repair_usage.model_calls;
-                usage.output_tokens += repair_usage.output_tokens;
+                let repaired = run_text_turn(&mut agent, &repair, 2, config, &cancellation).await?;
                 output = repaired;
                 validation = validate_failure_classifications(&output, &expected_failures);
             }
             let active_seconds = started.elapsed().as_secs();
-            let state = store.record_fix_usage(
-                &active.workflow_id,
-                usage.model_calls,
-                usage.output_tokens,
-                active_seconds,
-            )?;
+            let state = store.record_fix_active_seconds(&active.workflow_id, active_seconds)?;
             if let Err(error) = verify_test_contract_hashes(&config.workspace, &contract) {
                 store.block(
                     &state.workflow_id,
@@ -1536,28 +1566,6 @@ pub async fn run_fix(
                 return Err(invalid(format!(
                     "/fix modified locked framework or test files: {error}"
                 )));
-            }
-            if usage.model_calls > budget.max_model_calls_per_round.value
-                || usage.output_tokens > budget.max_output_tokens_per_round.value
-            {
-                let reason = format!(
-                    "fix turn exceeded its budget: {} model calls (max {}), {} output tokens (max {})",
-                    usage.model_calls,
-                    budget.max_model_calls_per_round.value,
-                    usage.output_tokens,
-                    budget.max_output_tokens_per_round.value
-                );
-                let state = store.block(
-                    &state.workflow_id,
-                    "budget",
-                    Some(reason.clone()),
-                    "raise the test_fix budget, then /workflow use <id>",
-                )?;
-                return Ok(PlanOutcome {
-                    path: path.clone(),
-                    output: format!("blocked: {reason}"),
-                    workflow_id: Some(state.workflow_id),
-                });
             }
             if !validation.is_valid() {
                 return Err(invalid(format!(
@@ -1574,8 +1582,7 @@ pub async fn run_fix(
                     evidence: row.evidence.clone(),
                 })
                 .collect();
-            let state =
-                store.record_fix_completed(&state.workflow_id, &classifications)?;
+            let state = store.record_fix_completed(&state.workflow_id, &classifications)?;
             let body = format!("### 失败分类\n\n{output}");
             let heading = format!("Fix {}", now_unix()?);
             let updated = append_section(&artifact, &heading, &body);
@@ -1590,9 +1597,7 @@ pub async fn run_fix(
                     evidence: row.evidence.clone(),
                 })
                 .collect();
-            let contract_error = rows
-                .iter()
-                .find(|row| row.kind == "test_contract_error");
+            let contract_error = rows.iter().find(|row| row.kind == "test_contract_error");
             let environment = rows.iter().find(|row| row.kind == "environment");
 
             if !unknown.is_empty() {
@@ -1766,6 +1771,7 @@ pub async fn run_distill(
             approval: None,
             workflow_id: Some(active.workflow_id.clone()),
             audit_sink: None,
+            max_steps_per_turn: None,
         },
     )
     .await?;
@@ -1886,6 +1892,7 @@ pub async fn run_hint(
             approval: None,
             workflow_id: Some(active.workflow_id.clone()),
             audit_sink: None,
+            max_steps_per_turn: None,
         },
     )
     .await?;
@@ -2021,10 +2028,11 @@ pub async fn run_status(
     let budget = load_budget(&config.workspace)?;
     let mut outcome = workflow_outcome(&store, &state);
     outcome.output.push_str(&format!(
-        "\n\n{}\n  model_calls: {}\n  tokens: {}\n  active_seconds: {}",
+        "\n\n{}\n  model_calls: {}\n  tokens: {}\n  enforced_tokens: {}\n  active_seconds: {}",
         budget.render(),
         state.budget.model_calls,
         state.budget.tokens,
+        state.budget.enforced_tokens,
         state.budget.active_seconds,
     ));
     Ok(outcome)
@@ -2465,7 +2473,25 @@ fn plan_agent<'a>(
 ) -> PlanAgentFuture<'a> {
     Box::pin(async move {
         let call = LlmCallConfig::new(DEEPSEEK_PROVIDER, &config.model)?;
-        let call = crate::apply_max_tokens(call, config.max_tokens)?;
+        // Keep a single request from spending the whole workflow budget. The
+        // caller still settles actual usage after the turn.
+        let budget =
+            WorkflowBudget::load(&config.workspace).map_err(|error| invalid(error.to_string()))?;
+        let active = WorkflowStore::new(&config.workspace)
+            .load_active()
+            .ok()
+            .flatten();
+        let remaining = active.as_ref().map_or(DEFAULT_MAX_OUTPUT_TOKENS, |state| {
+            budget
+                .max_output_tokens
+                .value
+                .saturating_sub(state.budget.enforced_tokens)
+        });
+        let request_cap = MAX_OUTPUT_TOKENS_PER_TURN.min(remaining).max(1);
+        let max_tokens = config
+            .max_tokens
+            .map_or(request_cap, |value| value.min(request_cap));
+        let call = crate::apply_max_tokens(call, Some(max_tokens))?;
         let approval: Arc<dyn ApprovalProvider> = policy
             .approval
             .clone()
@@ -2484,6 +2510,7 @@ fn plan_agent<'a>(
         spec.shell = ShellPolicy::Deny;
         spec.approval = approval;
         spec.install_workspace_instructions = true;
+        spec.max_steps_per_turn = policy.max_steps_per_turn;
         if policy.profile.is_read_only() {
             let store = WorkflowStore::new(&config.workspace);
             let shell = match policy.audit_sink.clone() {
@@ -2750,6 +2777,13 @@ async fn run_text_turn_usage(
     let outcome = agent
         .run_turn(TurnProposal::Enter(vec![message]), cancellation.clone())
         .await?;
+    let usage = TurnUsage {
+        model_calls: u64::try_from(outcome.attempts()).unwrap_or(u64::MAX),
+        output_tokens: outcome.reported_output_tokens(),
+    };
+    settle_model_usage(usage);
+    let output = crate::outcome_text(&outcome);
+    record_model_turn(config, turn, text, &output, usage);
     match outcome.reason() {
         TurnEndReason::Completed | TurnEndReason::MaxTokens => {}
         TurnEndReason::Aborted { .. } => {
@@ -2767,13 +2801,6 @@ async fn run_text_turn_usage(
             return Err(io::Error::other(format!("turn ended with {reason:?}")).into());
         }
     }
-    let usage = TurnUsage {
-        model_calls: u64::try_from(outcome.attempts()).unwrap_or(u64::MAX),
-        output_tokens: outcome.reported_output_tokens(),
-    };
-    settle_model_usage(usage);
-    let output = crate::outcome_text(&outcome);
-    record_model_turn(config, turn, text, &output, usage);
     Ok((output, usage))
 }
 
@@ -2788,6 +2815,7 @@ fn record_model_turn(
     let Ok(Some(state)) = store.load_active() else {
         return;
     };
+    let _ = store.record_model_usage(&state.workflow_id, usage.model_calls, usage.output_tokens);
     let call = ModelCall {
         turn_id: format!("{}-turn-{turn}", state.workflow_id),
         model: config.model.clone(),
@@ -4498,7 +4526,7 @@ validation: ok
     }
 
     #[tokio::test]
-    async fn round_budget_blocks_after_the_configured_limit() {
+    async fn legacy_round_limit_is_ignored() {
         let workspace = temp_workspace();
         seed_red_cargo_project(&workspace);
         let workflow_id = seed_test_fix_workflow(&workspace);
@@ -4511,14 +4539,83 @@ validation: ok
         let config = PlanConfig::new(workspace.clone());
         let outcome = run_test(&config).await.expect("red test runs");
         assert!(
-            outcome.output.contains("blocked: budget"),
+            !outcome.output.contains("blocked: budget"),
             "{}",
             outcome.output
         );
         let state = WorkflowStore::new(&workspace)
             .load(&workflow_id)
             .expect("state");
-        assert_eq!(state.status, crate::workflow::WorkflowStatus::Blocked);
+        assert_eq!(state.status, crate::workflow::WorkflowStatus::Active);
+        assert_eq!(state.test.rounds, 1);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn plan_backfills_usage_into_the_new_workflow_budget() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(FakeProvider::with_attempts(vec![text_response_with_usage(
+                known_plan_text(),
+                7,
+                11,
+            )]));
+
+        let outcome = run_command(
+            PlanCommand::Plan("analyze the notes".to_owned()),
+            &config,
+            provider,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("plan succeeds");
+        let workflow_id = outcome.workflow_id.expect("workflow id");
+        let state = WorkflowStore::new(&workspace)
+            .load(&workflow_id)
+            .expect("state");
+        assert_eq!(state.budget.model_calls, 1);
+        assert_eq!(state.budget.tokens, 11);
+        assert_eq!(state.budget.enforced_tokens, 11);
+        assert_eq!(state.status, WorkflowStatus::Active);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn exhausted_token_budget_blocks_the_next_model_command() {
+        let workspace = temp_workspace();
+        seed_red_cargo_project(&workspace);
+        let workflow_id = seed_test_fix_workflow(&workspace);
+        fs::create_dir_all(workspace.join(".slowcode")).expect("config directory");
+        fs::write(
+            workspace.join(".slowcode/workflow.toml"),
+            "[budget]\nmax_output_tokens = 10\n",
+        )
+        .expect("budget config");
+        let store = WorkflowStore::new(&workspace);
+        store
+            .record_model_usage(&workflow_id, 1, 10)
+            .expect("usage recorded");
+        let config = PlanConfig::new(workspace.clone());
+
+        let outcome = run_command(
+            PlanCommand::Hint("what next".to_owned()),
+            &config,
+            Arc::new(PanicProvider),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("budget block is not an error");
+
+        assert!(
+            outcome.output.contains("blocked: token budget"),
+            "{}",
+            outcome.output
+        );
+        let state = store.load(&workflow_id).expect("state");
+        assert_eq!(state.status, WorkflowStatus::Blocked);
         assert_eq!(
             state
                 .blocked
@@ -4526,6 +4623,48 @@ validation: ok
                 .map(|blocked| blocked.reason.as_str()),
             Some("budget")
         );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_exhausts_the_budget_blocks_after_the_command() {
+        let workspace = temp_workspace();
+        seed_red_cargo_project(&workspace);
+        let workflow_id = seed_test_fix_workflow(&workspace);
+        fs::create_dir_all(workspace.join(".slowcode")).expect("config directory");
+        fs::write(
+            workspace.join(".slowcode/workflow.toml"),
+            "[budget]\nmax_output_tokens = 10\n",
+        )
+        .expect("budget config");
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(FakeProvider::with_attempts(vec![text_response_with_usage(
+                "coach answer",
+                1,
+                11,
+            )]));
+
+        let outcome = run_command(
+            PlanCommand::Hint("what next".to_owned()),
+            &config,
+            provider,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("hint completes");
+
+        assert!(
+            outcome.output.contains("blocked: token budget"),
+            "{}",
+            outcome.output
+        );
+        let state = WorkflowStore::new(&workspace)
+            .load(&workflow_id)
+            .expect("state");
+        assert_eq!(state.budget.enforced_tokens, 11);
+        assert_eq!(state.status, WorkflowStatus::Blocked);
         let _ = fs::remove_dir_all(&workspace);
     }
 

@@ -113,7 +113,7 @@ _Avoid_: 测试过滤、测试路径
 _Avoid_: 失败原因、错误类型
 
 **修复轮次 (TestFix round)**:
-一次 `/test` 的红测记录。连续相同失败集合与轮次上限触发 `Blocked`，保留最后一次失败证据。预算来自 `.slowcode/workflow.toml`，`/status` 显示生效值与来源。
+一次 `/test` 的红测记录。连续相同失败集合触发 `Blocked`，保留最后一次失败证据；轮次本身不再是预算。唯一可配置预算是 `.slowcode/workflow.toml` 中 `[budget].max_output_tokens` 的 workflow 总 output token 上限，`/status` 显示生效值与来源。
 _Avoid_: 重试次数、迭代
 
 **暂停 workflow (Paused workflow)**:

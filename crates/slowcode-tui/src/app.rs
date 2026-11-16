@@ -244,6 +244,7 @@ struct PendingFeedback {
     title: Option<String>,
     note: Option<String>,
     plan: Option<std::path::PathBuf>,
+    console_errors: Vec<String>,
     prompt: String,
 }
 
@@ -745,7 +746,7 @@ impl App {
 
     fn push_feedback_hint(&mut self) {
         self.push_background(MessageBlock::System(
-            "if this is a slowcode bug, run /feedback to write a bundle; the journal's error events are included automatically".to_owned(),
+            "if this is a slowcode bug, run /feedback to write a bundle; journal and on-screen errors are included automatically".to_owned(),
         ));
     }
 
@@ -1989,6 +1990,7 @@ impl App {
             self.push(MessageBlock::System(feedback_hint()));
             return KeyAction::none();
         }
+        let console_errors = feedback_console_errors(&self.messages);
         let snapshot = {
             let mut runtime = self.runtime.lock().await;
             runtime.feedback_snapshot().await
@@ -2023,6 +2025,7 @@ impl App {
             title: request.title.clone(),
             note: request.note.clone(),
             plan: plan.clone(),
+            console_errors: &console_errors,
         };
         let preview = match preview(&bundle) {
             Ok(preview) => preview,
@@ -2031,7 +2034,7 @@ impl App {
                 return KeyAction::none();
             }
         };
-        let prompt = feedback_preview_text(&preview, candidates.len());
+        let prompt = feedback_preview_text(&preview, candidates.len(), console_errors.len());
         self.messages.push(MessageBlock::Prompt(prompt.clone()));
         self.scroll_to_bottom();
         self.pending_feedback = Some(PendingFeedback {
@@ -2042,6 +2045,7 @@ impl App {
             title: request.title,
             note: request.note,
             plan,
+            console_errors,
             prompt,
         });
         KeyAction::none()
@@ -2062,6 +2066,7 @@ impl App {
             title: pending.title,
             note: pending.note,
             plan: pending.plan,
+            console_errors: &pending.console_errors,
         });
         match outcome {
             Ok(outcome) if outcome.complete => self.push(MessageBlock::System(format!(
@@ -3256,10 +3261,28 @@ fn named_flag_value<'a>(
 const FEEDBACK_USAGE: &str = "usage: /feedback [--title TEXT] [--note TEXT] [--plan PATH] [text]";
 
 fn feedback_hint() -> String {
-    "feedback: type what actually happened in plain words, or add --plan <path>\nerror events from the session journal are included automatically\nexample: /feedback the turn failed while running the tests\n         /feedback --plan .scratch/plans/<artifact>.md".to_owned()
+    "feedback: type what actually happened in plain words, or add --plan <path>\nerror events from the session journal and the current screen are included automatically\nexample: /feedback the turn failed while running the tests\n         /feedback --plan .scratch/plans/<artifact>.md".to_owned()
 }
 
-fn feedback_preview_text(preview: &BundlePreview, candidates: usize) -> String {
+fn feedback_console_errors(messages: &[MessageBlock]) -> Vec<String> {
+    let start = messages
+        .iter()
+        .rposition(|block| matches!(block, MessageBlock::User(_)))
+        .map_or(0, |index| index + 1);
+    messages[start..]
+        .iter()
+        .filter_map(|block| match block {
+            MessageBlock::Error(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn feedback_preview_text(
+    preview: &BundlePreview,
+    candidates: usize,
+    console_errors: usize,
+) -> String {
     let mut lines = vec![
         format!("feedback bundle: {}", preview.title),
         format!(
@@ -3289,6 +3312,9 @@ fn feedback_preview_text(preview: &BundlePreview, candidates: usize) -> String {
     }
     for warning in &preview.warnings {
         lines.push(format!("warning: {warning}"));
+    }
+    if console_errors > 0 {
+        lines.push(format!("console errors: {console_errors}"));
     }
     lines.push("reply y to write, n to cancel".to_owned());
     lines.join("\n")
@@ -5208,6 +5234,33 @@ mod tests {
         assert!(issue.contains("complete: `true`"), "{issue}");
         let manifest = std::fs::read_to_string(out_dir.join("manifest.json")).expect("manifest");
         assert!(manifest.contains("\"complete\": true"), "{manifest}");
+    }
+
+    #[tokio::test]
+    async fn feedback_carries_console_errors_into_the_issue() {
+        let mut app = test_app().await;
+        let session_id = app.session_id.clone();
+        let out_dir = app.workspace().join("feedback").join(&session_id);
+
+        app.push(MessageBlock::Error(
+            "model call failed: the agent reached its step limit (AGENT_MAX_STEPS)".to_owned(),
+        ));
+        app.handle_command(Command::Feedback("the plan never finished".to_owned()))
+            .await;
+        let prompt = match app.messages.last() {
+            Some(MessageBlock::Prompt(text)) => text.clone(),
+            other => panic!("expected a feedback prompt, got {other:?}"),
+        };
+        assert!(prompt.contains("console errors: 1"), "{prompt}");
+
+        app.respond_to_prompt("y").await;
+        let issue = std::fs::read_to_string(out_dir.join("issue.md")).expect("issue");
+        assert!(
+            issue.contains(
+                "- [console] `UI_ERROR`: model call failed: the agent reached its step limit (AGENT_MAX_STEPS)"
+            ),
+            "{issue}"
+        );
     }
 
     #[tokio::test]

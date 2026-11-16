@@ -40,9 +40,8 @@ pub use approval::{
     ModelCall, hash_arguments,
 };
 pub use budget::{
-    BudgetError, BudgetSource, BudgetValue, DEFAULT_MAX_ACTIVE_SECONDS,
-    DEFAULT_MAX_CONSECUTIVE_SAME_FAILURE, DEFAULT_MAX_MODEL_CALLS_PER_ROUND,
-    DEFAULT_MAX_OUTPUT_TOKENS_PER_ROUND, DEFAULT_MAX_ROUNDS, WorkflowBudget,
+    BudgetError, BudgetSource, BudgetValue, DEFAULT_MAX_OUTPUT_TOKENS, MAX_ACTIVE_SECONDS,
+    MAX_CONSECUTIVE_SAME_FAILURE, MAX_OUTPUT_TOKENS_PER_TURN, WorkflowBudget,
 };
 pub use contract::{
     CORE_MARKER, ContractError, FileStamp, ManifestFile, build_contract, build_review_contract,

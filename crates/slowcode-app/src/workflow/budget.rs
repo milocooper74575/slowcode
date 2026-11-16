@@ -1,12 +1,12 @@
-//! TestFix and workflow budgets.
+//! Workflow token budget.
 //!
-//! Limits have built-in defaults. A workspace can override individual fields
-//! in `.slowcode/workflow.toml`. Every resolved field keeps its source so
-//! `/status` can explain whether a number came from code or from the file.
+//! The only user-tunable limit is the total output token budget for one
+//! workflow. Internal safety limits live in code: a per-turn output cap, a
+//! repeated-failure detector, and an informational active-time counter.
 //!
-//! The file is strict: unknown keys and zero limits are rejected. A silent
-//! fallback would hide a typo exactly where the budget is supposed to protect
-//! the workflow.
+//! The file is strict: unknown keys and zero limits are rejected. Legacy
+//! `[test_fix]` and `[workflow]` keys are accepted but ignored so an older
+//! workspace file does not turn into a hard failure.
 
 use std::{
     fs,
@@ -16,16 +16,14 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Default failed `/test` rounds before the workflow blocks.
-pub const DEFAULT_MAX_ROUNDS: u32 = 10;
-/// Default model calls in one `/fix` turn.
-pub const DEFAULT_MAX_MODEL_CALLS_PER_ROUND: u64 = 8;
-/// Default output tokens in one `/fix` turn.
-pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_ROUND: u64 = 60_000;
-/// Default consecutive identical failure sets before the workflow blocks.
-pub const DEFAULT_MAX_CONSECUTIVE_SAME_FAILURE: u32 = 3;
-/// Default active seconds across the workflow.
-pub const DEFAULT_MAX_ACTIVE_SECONDS: u64 = 3_600;
+/// Default total output tokens for one workflow.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 2_000_000;
+/// Internal per-turn output safety cap. Not user configurable.
+pub const MAX_OUTPUT_TOKENS_PER_TURN: u64 = 60_000;
+/// Internal repeated-failure limit before a workflow blocks. Not configurable.
+pub const MAX_CONSECUTIVE_SAME_FAILURE: u32 = 3;
+/// Internal active-time value. Recorded and displayed, never a hard block.
+pub const MAX_ACTIVE_SECONDS: u64 = 7_200;
 
 /// Where one resolved limit came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,27 +68,16 @@ impl BudgetValue {
 /// Effective limits for one workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowBudget {
-    pub max_rounds: BudgetValue,
-    pub max_model_calls_per_round: BudgetValue,
-    pub max_output_tokens_per_round: BudgetValue,
-    pub max_consecutive_same_failure: BudgetValue,
-    pub max_active_seconds: BudgetValue,
+    pub max_output_tokens: BudgetValue,
+    /// Removed fields found in an older config file. Accepted but ignored.
+    pub legacy_keys: Vec<String>,
 }
 
 impl Default for WorkflowBudget {
     fn default() -> Self {
         Self {
-            max_rounds: BudgetValue::default_value(u64::from(DEFAULT_MAX_ROUNDS)),
-            max_model_calls_per_round: BudgetValue::default_value(
-                DEFAULT_MAX_MODEL_CALLS_PER_ROUND,
-            ),
-            max_output_tokens_per_round: BudgetValue::default_value(
-                DEFAULT_MAX_OUTPUT_TOKENS_PER_ROUND,
-            ),
-            max_consecutive_same_failure: BudgetValue::default_value(u64::from(
-                DEFAULT_MAX_CONSECUTIVE_SAME_FAILURE,
-            )),
-            max_active_seconds: BudgetValue::default_value(DEFAULT_MAX_ACTIVE_SECONDS),
+            max_output_tokens: BudgetValue::default_value(DEFAULT_MAX_OUTPUT_TOKENS),
+            legacy_keys: Vec::new(),
         }
     }
 }
@@ -115,51 +102,34 @@ impl WorkflowBudget {
 
     fn from_file(file: FileBudget) -> Result<Self, String> {
         let defaults = Self::default();
+        let mut legacy_keys = Vec::new();
+        file.test_fix.collect_legacy(&mut legacy_keys);
+        file.workflow.collect_legacy(&mut legacy_keys);
         Ok(Self {
-            max_rounds: resolve(
-                "test_fix.max_rounds",
-                file.test_fix.max_rounds,
-                defaults.max_rounds,
+            max_output_tokens: resolve(
+                "budget.max_output_tokens",
+                file.budget.max_output_tokens,
+                defaults.max_output_tokens,
             )?,
-            max_model_calls_per_round: resolve(
-                "test_fix.max_model_calls_per_round",
-                file.test_fix.max_model_calls_per_round,
-                defaults.max_model_calls_per_round,
-            )?,
-            max_output_tokens_per_round: resolve(
-                "test_fix.max_output_tokens_per_round",
-                file.test_fix.max_output_tokens_per_round,
-                defaults.max_output_tokens_per_round,
-            )?,
-            max_consecutive_same_failure: resolve(
-                "test_fix.max_consecutive_same_failure",
-                file.test_fix.max_consecutive_same_failure,
-                defaults.max_consecutive_same_failure,
-            )?,
-            max_active_seconds: resolve(
-                "workflow.max_active_seconds",
-                file.workflow.max_active_seconds,
-                defaults.max_active_seconds,
-            )?,
+            legacy_keys,
         })
     }
 
     /// Render the effective values and their sources for `/status`.
     #[must_use]
     pub fn render(&self) -> String {
-        format!(
-            "budget:\n  max_rounds: {} ({})\n  max_model_calls_per_round: {} ({})\n  max_output_tokens_per_round: {} ({})\n  max_consecutive_same_failure: {} ({})\n  max_active_seconds: {} ({})\n  max_cost_per_round: not enforced (no pricing source)",
-            self.max_rounds.value,
-            self.max_rounds.source.as_str(),
-            self.max_model_calls_per_round.value,
-            self.max_model_calls_per_round.source.as_str(),
-            self.max_output_tokens_per_round.value,
-            self.max_output_tokens_per_round.source.as_str(),
-            self.max_consecutive_same_failure.value,
-            self.max_consecutive_same_failure.source.as_str(),
-            self.max_active_seconds.value,
-            self.max_active_seconds.source.as_str(),
-        )
+        let mut text = format!(
+            "budget:\n  max_output_tokens: {} ({})",
+            self.max_output_tokens.value,
+            self.max_output_tokens.source.as_str(),
+        );
+        if !self.legacy_keys.is_empty() {
+            text.push_str(&format!(
+                "\n  ignored legacy budget keys: {}",
+                self.legacy_keys.join(", ")
+            ));
+        }
+        text
     }
 }
 
@@ -179,24 +149,64 @@ fn config_path(workspace: &Path) -> PathBuf {
 #[serde(deny_unknown_fields)]
 struct FileBudget {
     #[serde(default)]
-    test_fix: TestFixFile,
+    budget: BudgetFile,
     #[serde(default)]
-    workflow: WorkflowFile,
+    test_fix: LegacyTestFixFile,
+    #[serde(default)]
+    workflow: LegacyWorkflowFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TestFixFile {
+struct BudgetFile {
+    max_output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTestFixFile {
     max_rounds: Option<u64>,
     max_model_calls_per_round: Option<u64>,
     max_output_tokens_per_round: Option<u64>,
     max_consecutive_same_failure: Option<u64>,
 }
 
+impl LegacyTestFixFile {
+    fn collect_legacy(&self, legacy: &mut Vec<String>) {
+        for (name, value) in [
+            ("test_fix.max_rounds", self.max_rounds),
+            (
+                "test_fix.max_model_calls_per_round",
+                self.max_model_calls_per_round,
+            ),
+            (
+                "test_fix.max_output_tokens_per_round",
+                self.max_output_tokens_per_round,
+            ),
+            (
+                "test_fix.max_consecutive_same_failure",
+                self.max_consecutive_same_failure,
+            ),
+        ] {
+            if value.is_some() {
+                legacy.push(name.to_owned());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkflowFile {
+struct LegacyWorkflowFile {
     max_active_seconds: Option<u64>,
+}
+
+impl LegacyWorkflowFile {
+    fn collect_legacy(&self, legacy: &mut Vec<String>) {
+        if self.max_active_seconds.is_some() {
+            legacy.push("workflow.max_active_seconds".to_owned());
+        }
+    }
 }
 
 /// Budget configuration errors. Both variants are hard errors.
@@ -240,41 +250,66 @@ mod tests {
     fn defaults_are_used_without_a_file() {
         let workspace = temp_workspace();
         let budget = WorkflowBudget::load(&workspace).expect("defaults load");
-        assert_eq!(budget.max_rounds.value, u64::from(DEFAULT_MAX_ROUNDS));
-        assert_eq!(budget.max_rounds.source, BudgetSource::Default);
-        assert_eq!(budget.max_active_seconds.value, DEFAULT_MAX_ACTIVE_SECONDS);
+        assert_eq!(budget.max_output_tokens.value, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(budget.max_output_tokens.source, BudgetSource::Default);
+        assert!(budget.legacy_keys.is_empty());
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
-    fn file_overrides_only_present_fields() {
+    fn budget_overrides_the_default() {
+        let workspace = temp_workspace();
+        write_config(&workspace, "[budget]\nmax_output_tokens = 400\n");
+        let budget = WorkflowBudget::load(&workspace).expect("config loads");
+        assert_eq!(budget.max_output_tokens.value, 400);
+        assert_eq!(budget.max_output_tokens.source, BudgetSource::File);
+        assert!(budget.render().contains("max_output_tokens: 400 (file)"));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn legacy_keys_are_ignored_and_reported() {
         let workspace = temp_workspace();
         write_config(
             &workspace,
-            "[test_fix]\nmax_rounds = 4\n[workflow]\nmax_active_seconds = 120\n",
+            "[test_fix]\nmax_rounds = 4\nmax_model_calls_per_round = 8\nmax_output_tokens_per_round = 60000\nmax_consecutive_same_failure = 3\n[workflow]\nmax_active_seconds = 120\n",
         );
-        let budget = WorkflowBudget::load(&workspace).expect("config loads");
-        assert_eq!(budget.max_rounds.value, 4);
-        assert_eq!(budget.max_rounds.source, BudgetSource::File);
+        let budget = WorkflowBudget::load(&workspace).expect("legacy config loads");
+        assert_eq!(budget.max_output_tokens.value, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(
-            budget.max_model_calls_per_round.source,
-            BudgetSource::Default
+            budget.legacy_keys,
+            vec![
+                "test_fix.max_rounds".to_owned(),
+                "test_fix.max_model_calls_per_round".to_owned(),
+                "test_fix.max_output_tokens_per_round".to_owned(),
+                "test_fix.max_consecutive_same_failure".to_owned(),
+                "workflow.max_active_seconds".to_owned(),
+            ]
         );
-        assert_eq!(budget.max_active_seconds.value, 120);
+        let rendered = budget.render();
+        assert!(
+            rendered.contains("ignored legacy budget keys"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("test_fix.max_rounds"), "{rendered}");
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
     fn unknown_keys_are_rejected() {
         let workspace = temp_workspace();
-        write_config(&workspace, "[test_fix]\nmax_round = 4\n");
+        write_config(&workspace, "[budget]\nmax_output_tokenz = 4\n");
         let error = WorkflowBudget::load(&workspace).expect_err("unknown key is rejected");
         assert!(error.to_string().contains("unknown field"));
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
     fn zero_limits_are_rejected() {
         let workspace = temp_workspace();
-        write_config(&workspace, "[test_fix]\nmax_rounds = 0\n");
+        write_config(&workspace, "[budget]\nmax_output_tokens = 0\n");
         let error = WorkflowBudget::load(&workspace).expect_err("zero is rejected");
         assert!(error.to_string().contains("greater than zero"));
+        let _ = fs::remove_dir_all(workspace);
     }
 }

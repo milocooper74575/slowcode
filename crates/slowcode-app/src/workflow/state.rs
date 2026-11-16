@@ -508,6 +508,10 @@ pub struct BudgetState {
     pub model_calls: u64,
     #[serde(default)]
     pub tokens: u64,
+    /// Tokens counted against the current total budget. Workflows created
+    /// before the budget existed start at zero so history is not retroactive.
+    #[serde(default)]
+    pub enforced_tokens: u64,
     #[serde(default)]
     pub active_seconds: u64,
 }

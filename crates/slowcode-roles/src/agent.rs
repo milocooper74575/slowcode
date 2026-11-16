@@ -90,6 +90,9 @@ pub struct AgentSpec {
     pub approval: Arc<dyn ApprovalProvider>,
     pub extra_tools: Vec<ExtraToolSet>,
     pub install_workspace_instructions: bool,
+    /// Override the kernel's per-turn step ceiling for this agent.
+    /// `None` keeps the kernel default.
+    pub max_steps_per_turn: Option<usize>,
 }
 
 impl AgentSpec {
@@ -113,6 +116,7 @@ impl AgentSpec {
             approval: Arc::new(NoApprovalProvider),
             extra_tools: Vec::new(),
             install_workspace_instructions: false,
+            max_steps_per_turn: None,
         }
     }
 }
@@ -152,6 +156,7 @@ pub fn prepare(spec: AgentSpec) -> Result<PreparedAgent, AgentBuildError> {
         approval,
         extra_tools,
         install_workspace_instructions,
+        max_steps_per_turn,
     } = spec;
     let (tools, schemas) = open_registry(&workspace, registry, &skill_roots, read_only)?;
     let (tools, schemas) = compose_tools(tools, schemas, extra_tools)?;
@@ -160,6 +165,13 @@ pub fn prepare(spec: AgentSpec) -> Result<PreparedAgent, AgentBuildError> {
         .with_tools(schemas)?
         .with_approval_provider(approval)
         .with_plugin_policy(PluginPolicy::Deny);
+    let config = match max_steps_per_turn {
+        Some(steps) => {
+            let limits = config.limits().clone().with_max_steps_per_turn(steps)?;
+            config.with_limits(limits)
+        }
+        None => config,
+    };
     let config = if read_only {
         config
             .with_file_change_policy(FileChangePolicy::Deny)

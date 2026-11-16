@@ -43,6 +43,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         title: options.title,
         note: options.note,
         plan: options.plan,
+        console_errors: &[],
     })
     .map_err(|error| error.to_string())?;
 

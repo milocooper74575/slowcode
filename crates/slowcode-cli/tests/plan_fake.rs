@@ -54,8 +54,12 @@ struct FakeProvider {
 
 impl FakeProvider {
     fn new(text: &str) -> Self {
+        Self::with_attempts(vec![text_response(text)])
+    }
+
+    fn with_attempts(attempts: Vec<Vec<Result<StreamChunk, ProviderStreamError>>>) -> Self {
         Self {
-            attempts: Mutex::new(VecDeque::from([text_response(text)])),
+            attempts: Mutex::new(attempts.into()),
         }
     }
 }
@@ -120,6 +124,27 @@ fn text_response(text: &str) -> Vec<Result<StreamChunk, ProviderStreamError>> {
     ]
 }
 
+fn read_call_response(
+    file_path: &str,
+    index: usize,
+) -> Vec<Result<StreamChunk, ProviderStreamError>> {
+    let arguments = json!({ "file_path": file_path }).to_string();
+    let call_id = format!("call-{index}");
+    vec![
+        Ok(StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap()),
+        Ok(
+            StreamChunk::tool_call_delta(0, call_id.as_str(), Some("read".to_owned()), &arguments)
+                .unwrap(),
+        ),
+        Ok(StreamChunk::block_end(
+            0,
+            ContentBlock::tool_call(call_id.as_str(), "read", &arguments).unwrap(),
+        )
+        .unwrap()),
+        Ok(StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap()),
+    ]
+}
+
 #[tokio::test]
 async fn plan_writes_an_artifact_and_pauses() {
     let workspace = temp_workspace();
@@ -156,5 +181,41 @@ async fn plan_writes_an_artifact_and_pauses() {
     assert!(artifact.contains("未知域暂停"), "{artifact}");
     assert!(artifact.contains("add /plan command"), "{artifact}");
 
+    let _ = fs::remove_dir_all(Path::new(&workspace));
+}
+
+#[tokio::test]
+async fn plan_can_use_more_than_the_default_sixteen_steps() {
+    let workspace = temp_workspace();
+    let options = CliOptions {
+        workspace: workspace.clone(),
+        model: "fake-model".to_owned(),
+        plan: None,
+        max_tokens: None,
+        context_window: None,
+        read_only: false,
+        ask: false,
+        session: None,
+        resume: false,
+        prompt: None,
+    };
+    let mut attempts = Vec::new();
+    for index in 0..17 {
+        let name = format!("note-{index}.txt");
+        fs::write(workspace.join(&name), format!("note {index}\n")).expect("note is written");
+        attempts.push(read_call_response(&name, index));
+    }
+    attempts.push(text_response(PLAN));
+
+    run_plan_with_provider(
+        &options,
+        Arc::new(FakeProvider::with_attempts(attempts)),
+        "analyze the notes",
+    )
+    .await
+    .expect("plan succeeds past the old step limit");
+
+    let directory = workspace.join(".scratch/plans");
+    assert!(directory.is_dir(), "plan artifact is written");
     let _ = fs::remove_dir_all(Path::new(&workspace));
 }
