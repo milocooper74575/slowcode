@@ -11,8 +11,8 @@ mod text;
 pub mod workflow;
 
 pub use command::{
-    Command, CommandCompletion, LoginCommand, SessionCommand, command_specs, complete,
-    complete_answer, parse_command,
+    Command, CommandCompletion, SessionCommand, command_specs, complete, complete_answer,
+    parse_command,
 };
 pub use credentials::{
     API_KEY_ENV, CredentialError, CredentialSourceKind, CredentialStatus, WorkspaceCredentials,

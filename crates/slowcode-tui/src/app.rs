@@ -13,9 +13,9 @@ use ratatui::{
 };
 use slowcode_app::workflow::{ApprovalDecision, ApprovalRecord, ApprovalStatus, WorkflowStore};
 use slowcode_app::{
-    Command, CommandCompletion, CredentialSourceKind, CredentialStatus, LoginCommand, Runtime,
-    SessionCommand, command_specs, complete, complete_answer, credential_status, escape_terminal,
-    parse_command, remove_api_key, save_api_key,
+    Command, CommandCompletion, CredentialSourceKind, CredentialStatus, Runtime, SessionCommand,
+    command_specs, complete, complete_answer, credential_status, escape_terminal, parse_command,
+    remove_api_key, save_api_key,
 };
 use slowcode_feedback::{BundlePreview, BundleRequest, clip, preview, write_bundle};
 use slowcode_kernel::ui::{
@@ -1488,7 +1488,7 @@ impl App {
                     self.usage.output_tokens
                 )));
             }
-            Command::Login(mode) => self.handle_login(mode),
+            Command::Login => self.handle_login(),
             Command::Logout => self.handle_logout(),
             Command::Unknown(name) => {
                 self.push(MessageBlock::Error(format!("unknown command: {name}")));
@@ -1498,18 +1498,10 @@ impl App {
         KeyAction::none()
     }
 
-    fn handle_login(&mut self, mode: LoginCommand) {
+    fn handle_login(&mut self) {
         let status = credential_status(&self.workspace());
-        match mode {
-            LoginCommand::Show if status.configured() => {
-                self.push(MessageBlock::System(credential_report(&status)));
-                self.push(MessageBlock::System(
-                    "type /login key to replace the configured key".to_owned(),
-                ));
-            }
-            LoginCommand::Show => self.start_login(false),
-            LoginCommand::Key => self.start_login(status.configured()),
-        }
+        self.push(MessageBlock::System(credential_report(&status)));
+        self.start_login(status.configured());
     }
 
     fn start_login(&mut self, replacing: bool) {
@@ -2833,7 +2825,7 @@ fn command_help_text(name: &str, args: &str, description: &str) -> String {
             "\nexample: /mcp add ChromeDevTools/chrome-devtools-mcp\n         /mcp enable chrome-devtools\n         /mcp add fs npx -y @modelcontextprotocol/server-filesystem",
         ),
         "/login" => text.push_str(
-            "\nwithout an argument this reports the credential and prompts when none is configured\nsaves to the workspace .env with mode 0600\nexample: /login key",
+            "\nalways opens masked entry; the current source is shown first\nsaves to the workspace .env with mode 0600\nexample: /login",
         ),
         "/logout" => text.push_str("\nremoves DEEPSEEK_API_KEY from the workspace .env"),
         "/plan" => text.push_str("\nexample: /plan add a line-count summary to notes.txt"),
@@ -5749,7 +5741,7 @@ mod tests {
         let mut app = test_app().await;
         let workspace = app.workspace();
 
-        app.handle_command(Command::Login(LoginCommand::Key)).await;
+        app.handle_command(Command::Login).await;
         assert!(app.pending_login.is_some());
 
         let secret = "sk-test-secret-123";
@@ -5785,7 +5777,7 @@ mod tests {
         let mut app = test_app().await;
         let workspace = app.workspace();
 
-        app.handle_command(Command::Login(LoginCommand::Key)).await;
+        app.handle_command(Command::Login).await;
         app.composer = "two words".to_owned();
         app.composer_cursor = app.composer.len();
         app.submit().await;
@@ -5808,14 +5800,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_show_reports_the_workspace_env_source() {
+    async fn login_reports_the_source_and_opens_masked_entry() {
         let mut app = test_app().await;
         let workspace = app.workspace();
         std::fs::write(workspace.join(".env"), "DEEPSEEK_API_KEY=sk-existing\n").expect(".env");
 
-        app.handle_command(Command::Login(LoginCommand::Show)).await;
+        app.handle_command(Command::Login).await;
 
-        assert!(app.pending_login.is_none());
+        assert!(app.pending_login.is_some());
         assert!(
             app.messages.iter().any(|message| matches!(
                 message,
@@ -5825,12 +5817,20 @@ mod tests {
             "{:?}",
             app.messages
         );
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                message,
+                MessageBlock::Prompt(text) if text.contains("Paste a new key to replace it")
+            )),
+            "{:?}",
+            app.messages
+        );
     }
 
     #[tokio::test]
     async fn esc_cancels_credential_entry() {
         let mut app = test_app().await;
-        app.handle_command(Command::Login(LoginCommand::Key)).await;
+        app.handle_command(Command::Login).await;
         app.composer = "sk-half-typed".to_owned();
         app.composer_cursor = app.composer.len();
 
@@ -5844,5 +5844,32 @@ mod tests {
                     .expect(".env")
                     .contains("sk-half-typed")
         );
+    }
+
+    #[tokio::test]
+    async fn login_replacement_never_becomes_a_prompt() {
+        let mut app = test_app().await;
+        let workspace = app.workspace();
+        std::fs::write(workspace.join(".env"), "DEEPSEEK_API_KEY=sk-old\n").expect(".env");
+        let secret = "sk-replacement";
+
+        app.handle_command(Command::Login).await;
+        app.composer = secret.to_owned();
+        app.composer_cursor = secret.len();
+        app.submit().await;
+
+        assert!(app.pending_login.is_none());
+        assert!(!app.running);
+        assert!(app.history.is_empty());
+        assert!(
+            !app.messages.iter().any(
+                |message| matches!(message, MessageBlock::User(text) if text.contains(secret))
+            ),
+            "{:?}",
+            app.messages
+        );
+        let contents = std::fs::read_to_string(workspace.join(".env")).expect(".env");
+        assert!(contents.contains("DEEPSEEK_API_KEY=sk-replacement"));
+        assert!(!contents.contains("sk-old"));
     }
 }

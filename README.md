@@ -71,8 +71,9 @@ slowcode --workspace /path/to/project
 
 `/login` 会把 key 写进 workspace 的 `.env`（权限 `0600`，临时文件加 rename），
 输入过程以 `*` 遮蔽，key 不会出现在对话、日志或 shell history 里。当前进程立即
-生效，无需重启。`/login key` 可以替换已有 key，`/logout` 会删除 `.env` 里的
-那一行。
+生效，无需重启。已配置时再执行 `/login` 会先显示当前来源，然后直接进入遮蔽
+输入以替换 key；`/logout` 会删除 `.env` 里的那一行。key 只在 `/login` 的遮蔽
+输入中被接受，不会被当成普通任务发给模型。
 
 也可以继续用环境变量或手写 `.env`：
 
