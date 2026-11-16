@@ -1297,6 +1297,20 @@ mod tests {
             snapshot.journal.len() > 200,
             "plan turns are written to the durable journal"
         );
+        let journal = std::str::from_utf8(&snapshot.journal).expect("journal is UTF-8");
+        let event_types = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|value| value["type"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert!(
+            event_types.iter().any(|kind| kind == "assistant/message"),
+            "the durable journal contains the plan assistant message"
+        );
+        assert!(
+            event_types.iter().any(|kind| kind == "turn/end"),
+            "the durable journal closes the plan turn"
+        );
         runtime.shutdown().await.expect("runtime shuts down");
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_dir_all(workspace);

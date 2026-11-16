@@ -6010,6 +6010,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_assistant_message_marks_streamed_output_seen() {
+        let mut app = test_app().await;
+        app.running = true;
+        app.plan_started = Some(Instant::now());
+
+        app.handle_ui_event(UiEvent {
+            seq: 1,
+            time_ms: 0,
+            kind: UiEventKind::AssistantMessage {
+                turn: 1,
+                step: 1,
+                message: UiAssistantMessage {
+                    blocks: Vec::new(),
+                    text: "streamed plan".to_owned(),
+                    reasoning: String::new(),
+                    provider: "test".to_owned(),
+                    model: "test".to_owned(),
+                    usage: None,
+                },
+            },
+        });
+
+        assert!(app.plan_output_seen);
+        assert!(app.messages.iter().any(|message| {
+            matches!(message, MessageBlock::Assistant(text) if text == "streamed plan")
+        }));
+    }
+
+    #[tokio::test]
     async fn phase_progress_renders_the_active_phase() {
         let mut app = test_app().await;
         app.plan_phase = Some(slowcode_app::workflow::Phase::Interview);

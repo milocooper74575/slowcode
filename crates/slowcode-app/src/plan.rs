@@ -3152,6 +3152,7 @@ mod tests {
             ProviderStreamError,
         },
         session::ApprovalOutcome,
+        ui::{UiEventKind, UiMessageSource},
     };
     use slowcode_runtime::RunState;
 
@@ -5617,7 +5618,81 @@ validation: ok
             )),
             "the plan response is committed to the shared session"
         );
+        let replayed = session.replay_ui_events();
+        assert!(
+            replayed
+                .iter()
+                .any(|event| matches!(event.kind, UiEventKind::AssistantMessage { .. })),
+            "the assistant answer is replayable"
+        );
+        assert!(
+            !replayed.iter().any(|event| matches!(
+                event.kind,
+                UiEventKind::UserMessage {
+                    source: UiMessageSource::Human,
+                    ..
+                }
+            )),
+            "the generated plan prompt is not replayable as a human message"
+        );
         assert!(outcome.output.contains("## 证据包"));
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn sequential_plan_commands_keep_one_session() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::with_attempts(vec![
+            text_response(
+                "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+",
+            ),
+            text_response("Do the next step."),
+        ]));
+        let mut session = Some(Session::new("session-sequential").expect("session opens"));
+
+        run_command_with_session(
+            PlanCommand::Plan("count lines".to_owned()),
+            &config,
+            Arc::clone(&provider),
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect("plan succeeds");
+        let after_plan = session
+            .as_ref()
+            .expect("session returned after plan")
+            .messages()
+            .len();
+
+        let hint = run_command_with_session(
+            PlanCommand::Hint("what next".to_owned()),
+            &config,
+            provider,
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect("hint succeeds");
+
+        let session = session.expect("the session is returned");
+        assert_eq!(session.id().as_str(), "session-sequential");
+        assert!(
+            session.messages().len() > after_plan,
+            "the hint turn appends to the same session"
+        );
+        assert!(hint.output.contains("Do the next step"), "{}", hint.output);
         let _ = fs::remove_dir_all(&workspace);
     }
 }
