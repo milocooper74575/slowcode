@@ -465,4 +465,15 @@ mod tests {
         assert!(flat.contains("_ b"));
         assert!(flat.contains("[not a link"));
     }
+
+    #[test]
+    fn blockquotes_and_horizontal_rules_render_without_markers() {
+        let rendered = render("> quoted\n\n---", Color::Reset);
+        let flat = text(&rendered);
+        assert!(flat.contains("quoted"));
+        assert!(flat.contains("│"));
+        assert!(flat.contains("─"));
+        assert!(!flat.contains("> quoted"));
+        assert!(!flat.contains("---"));
+    }
 }

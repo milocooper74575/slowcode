@@ -6067,6 +6067,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase_progress_marks_blocked() {
+        let mut app = test_app().await;
+        app.plan_phase = Some(slowcode_app::workflow::Phase::Blocked);
+
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.draw_plan_phase(frame, area);
+            })
+            .expect("draw");
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("blocked"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn refresh_plan_phase_clears_without_an_active_workflow() {
+        let mut app = test_app().await;
+        app.plan_phase = Some(slowcode_app::workflow::Phase::Interview);
+        app.plan_workflow = Some("plan-1".to_owned());
+        app.running = false;
+
+        app.refresh_plan_phase();
+
+        assert!(app.plan_phase.is_none());
+        assert!(app.plan_workflow.is_none());
+    }
+
+    #[tokio::test]
     async fn plan_commands_refuse_to_start_while_running() {
         let mut app = test_app().await;
         app.running = true;

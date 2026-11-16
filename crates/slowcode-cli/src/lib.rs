@@ -1059,4 +1059,154 @@ mod tests {
         assert!(split_command("/planet").is_none());
         assert!(split_command("plan it").is_none());
     }
+
+    struct PlanProvider {
+        attempts: std::sync::Mutex<
+            std::collections::VecDeque<
+                Vec<
+                    Result<
+                        slowcode_kernel::model::StreamChunk,
+                        slowcode_kernel::provider::ProviderStreamError,
+                    >,
+                >,
+            >,
+        >,
+    }
+
+    impl PlanProvider {
+        fn new(text: &str) -> Self {
+            Self {
+                attempts: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                    text_response(text),
+                ])),
+            }
+        }
+    }
+
+    impl ModelProvider for PlanProvider {
+        fn prepare_call(
+            &self,
+            config: LlmCallConfig,
+        ) -> Result<
+            slowcode_kernel::provider::PreparedProviderCall,
+            slowcode_kernel::provider::ProviderPrepareError,
+        > {
+            let mut raw = config.raw().as_value().clone();
+            raw.as_object_mut()
+                .expect("call config is an object")
+                .insert("maxTokens".to_owned(), serde_json::json!(1_024));
+            let config = serde_json::from_value(raw).expect("max tokens produce a valid config");
+            Ok(slowcode_kernel::provider::PreparedProviderCall::new(
+                config,
+                slowcode_kernel::model::LlmCallConfigAdapterDefaults::default(),
+                Some(
+                    slowcode_kernel::model::NonNegativeSafeInteger::new(16_384)
+                        .expect("context window fits"),
+                ),
+            ))
+        }
+
+        fn preflight_request(
+            &self,
+            draft: slowcode_kernel::provider::ProviderRequestDraft<'_>,
+        ) -> Result<
+            slowcode_kernel::provider::PreparedRequestPreflight,
+            slowcode_kernel::provider::ProviderPreflightError,
+        > {
+            let prepared = self.prepare_call(draft.config().clone())?;
+            draft.finish(prepared, 1)
+        }
+
+        fn stream(
+            &self,
+            _request: slowcode_kernel::provider::ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> slowcode_kernel::provider::ProviderStream {
+            let chunks = self
+                .attempts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake provider has one scripted attempt");
+            Box::pin(futures_util::stream::iter(chunks))
+        }
+    }
+
+    fn text_response(
+        text: &str,
+    ) -> Vec<
+        Result<slowcode_kernel::model::StreamChunk, slowcode_kernel::provider::ProviderStreamError>,
+    > {
+        use slowcode_kernel::model::{ContentBlock, ContentBlockType, FinishReason, StreamChunk};
+        vec![
+            Ok(StreamChunk::block_start(0, ContentBlockType::Text).unwrap()),
+            Ok(StreamChunk::text_delta(0, text).unwrap()),
+            Ok(StreamChunk::block_end(0, ContentBlock::text(text).unwrap()).unwrap()),
+            Ok(StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn repl_plan_command_reuses_the_role_session() {
+        let workspace = std::env::temp_dir().join(format!(
+            "slowcode-cli-plan-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let call = LlmCallConfig::new(DEEPSEEK_PROVIDER, "deepseek-flash").unwrap();
+        let config = RoleSessionConfig {
+            workspace: workspace.clone(),
+            call,
+            read_only: false,
+            base_system_prompt: "test".to_owned(),
+        };
+        let mut session = RoleSession::new(
+            config,
+            Arc::new(PlanProvider::new(
+                "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+",
+            )),
+            RoleName::Driver,
+        )
+        .await
+        .expect("role session starts");
+        let session_id = session.session().id().as_str().to_owned();
+        let options = CliOptions {
+            workspace: workspace.clone(),
+            model: "deepseek-flash".to_owned(),
+            plan: None,
+            max_tokens: None,
+            context_window: None,
+            read_only: false,
+            ask: false,
+            session: None,
+            resume: false,
+            prompt: None,
+        };
+
+        let outcome = run_plan_command_with_optional_session(
+            slowcode_app::plan::PlanCommand::Plan("count lines".to_owned()),
+            &options,
+            None,
+            session.provider(),
+            Some(&mut session),
+        )
+        .await
+        .expect("plan succeeds");
+
+        assert_eq!(session.session().id().as_str(), session_id);
+        assert!(outcome.output.contains("## 证据包"));
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
 }
