@@ -241,8 +241,8 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         .title
         .clone()
         .filter(|title| !title.trim().is_empty())
-        .or_else(|| analysis.title.clone())
         .or_else(|| derive_title(request.note.as_deref()))
+        .or_else(|| analysis.title.clone())
         .unwrap_or_else(|| "slowcode session feedback".to_owned());
     let title = redact(&title, workspace.as_deref());
     let note = request
@@ -1164,6 +1164,25 @@ mod tests {
         journal
     }
 
+    fn titled_journal() -> String {
+        format!(
+            concat!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"createdAt\":1792466172940,",
+                "\"cwd\":\"/tmp/example-project\"}}\n",
+                "{{\"type\":\"request/header\",\"seq\":0,\"time\":1,\"data\":{{\"header\":",
+                "{{\"config\":{{\"model\":\"deepseek-flash\",\"provider\":\"deepseek-official\"}}}}}}}}\n",
+                "{{\"type\":\"session/title\",\"seq\":1,\"time\":2,\"data\":{{\"title\":\"测试\"}}}}\n",
+                "{{\"type\":\"user/message\",\"seq\":2,\"time\":3,\"data\":{{\"content\":[",
+                "{{\"type\":\"text\",\"text\":\"测试\"}}]}}}}\n",
+                "{{\"type\":\"assistant/message\",\"seq\":3,\"time\":4,\"data\":{{\"message\":",
+                "{{\"content\":[{{\"type\":\"text\",\"text\":\"ready\"}}]}}}}}}\n",
+                "{{\"type\":\"turn/end\",\"seq\":4,\"time\":5,\"data\":{{\"reason\":",
+                "{{\"kind\":\"completed\"}},\"turn\":1}}}}\n"
+            ),
+            id = SESSION_ID
+        )
+    }
+
     #[test]
     fn writes_a_complete_bundle_with_redaction_and_manifest() {
         let base = temp_dir("complete");
@@ -1445,6 +1464,25 @@ mod tests {
         let title = derive_title(Some(&long)).expect("title");
         assert_eq!(title.chars().count(), 63);
         assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn free_text_drives_the_title_before_the_session_title() {
+        let base = temp_dir("title");
+        let out = base.join("out");
+        let journal = titled_journal();
+        let mut request = request(&out, journal.as_bytes());
+        request.title = None;
+        request.note = Some("the shell call was interrupted".to_owned());
+
+        assert_eq!(
+            preview(&request).unwrap().title,
+            "the shell call was interrupted"
+        );
+
+        request.title = Some("explicit title".to_owned());
+        assert_eq!(preview(&request).unwrap().title, "explicit title");
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
