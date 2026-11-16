@@ -23,17 +23,24 @@ slowcode 不是让 AI 多写代码。它在关键节点停下来，把创造空�
 
 ### 安装预编译包
 
-macOS 与 Linux 用户不需要安装 Rust。下载 GitHub Release 中的
-`slowcode-<target>.tar.gz`，或使用安装脚本：
+macOS 与 Linux 用户不需要安装 Rust，也不提供 dmg/pkg。直接运行安装脚本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/milocooper74575/slowcode/main/install.sh | sh
+```
+
+想先检查脚本再运行，可以下载到本地：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/milocooper74575/slowcode/main/install.sh -o install.sh
+less install.sh
 sh install.sh
+```
 
-# 固定版本
+固定版本或自定义安装目录，通过环境变量传给脚本：
+
+```bash
 SLOWCODE_VERSION=v0.1.0 sh install.sh
-
-# 自定义安装目录，默认 ~/.local/bin
 SLOWCODE_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
 
@@ -48,7 +55,8 @@ fork 或镜像可以用 `SLOWCODE_REPO=owner/slowcode` 覆盖仓库。
 
 Windows 原生包暂未提供。
 
-macOS 预编译包当前未做 Apple 签名与 notarization。如果 Gatekeeper 拦截，
+macOS 预编译包当前未做 Apple 签名与 notarization。通过 `curl` 安装不会带上
+Gatekeeper 的 quarantine 属性，所以终端里通常可以直接运行。如果系统仍拦截，
 可以在系统设置中允许，或改为从源码构建。签名会在拿到证书后补上。
 
 ### 从源码构建

@@ -2,6 +2,7 @@
 # Install a prebuilt slowcode binary from GitHub Releases.
 #
 # Usage:
+#   curl -fsSL https://raw.githubusercontent.com/milocooper74575/slowcode/main/install.sh | sh
 #   sh install.sh
 #   SLOWCODE_VERSION=v0.1.0 sh install.sh
 #   SLOWCODE_INSTALL_DIR="$HOME/bin" sh install.sh
