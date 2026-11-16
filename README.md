@@ -59,6 +59,25 @@ macOS 预编译包当前未做 Apple 签名与 notarization。通过 `curl` 安�
 Gatekeeper 的 quarantine 属性，所以终端里通常可以直接运行。如果系统仍拦截，
 可以在系统设置中允许，或改为从源码构建。签名会在拿到证书后补上。
 
+### 卸载
+
+卸载只删除二进制，不会动 workspace 里的会话与工作流数据：
+
+```bash
+sh install.sh --uninstall
+
+# 或直接删除，默认安装目录是 ~/.local/bin
+rm ~/.local/bin/slowcode
+```
+
+如果装到了自定义目录，卸载时传入同一个 `SLOWCODE_INSTALL_DIR`：
+
+```bash
+SLOWCODE_INSTALL_DIR="$HOME/bin" sh install.sh --uninstall
+```
+
+workspace 内的 `.slowcode/` 与 `.scratch/` 需要手动删除。
+
 ### 从源码构建
 
 从源码构建需要 Rust 1.88 或更高。

@@ -7,6 +7,8 @@
 #   SLOWCODE_VERSION=v0.1.0 sh install.sh
 #   SLOWCODE_INSTALL_DIR="$HOME/bin" sh install.sh
 #   SLOWCODE_BASE_URL=http://localhost:8000 sh install.sh
+#   sh install.sh --uninstall
+#   SLOWCODE_UNINSTALL=1 sh install.sh
 #
 # Supported targets: Linux x86_64/aarch64, macOS x86_64/arm64.
 set -eu
@@ -15,6 +17,22 @@ repo="${SLOWCODE_REPO:-milocooper74575/slowcode}"
 
 version="${SLOWCODE_VERSION:-latest}"
 install_dir="${SLOWCODE_INSTALL_DIR:-$HOME/.local/bin}"
+
+uninstall="${SLOWCODE_UNINSTALL:-}"
+case "${1:-}" in
+  --uninstall|-u) uninstall=1 ;;
+esac
+
+if [ -n "$uninstall" ]; then
+  if [ -e "${install_dir}/slowcode" ]; then
+    rm -f "${install_dir}/slowcode"
+    echo "removed ${install_dir}/slowcode"
+  else
+    echo "nothing to remove at ${install_dir}/slowcode"
+  fi
+  echo "note: session data under .slowcode/ and .scratch/ is left untouched"
+  exit 0
+fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
