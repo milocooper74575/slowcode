@@ -236,10 +236,12 @@ fn write_private(path: &Path, contents: &str) -> Result<(), CredentialError> {
         .and_then(|name| name.to_str())
         .unwrap_or(".env");
     let temporary = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    // A leftover from a crashed run would block create_new; it is never live.
+    let _ = fs::remove_file(&temporary);
 
     let result = (|| {
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
