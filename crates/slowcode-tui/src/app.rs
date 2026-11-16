@@ -26,6 +26,7 @@ use slowcode_mcp::{
     McpTrustStore, parse_add_request,
 };
 use slowcode_skills::{InstallOptions, InstallPreview, SkillInstaller, SkillScope};
+use slowcode_update::UpdateInfo;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -64,6 +65,8 @@ pub enum AppEvent {
         result: Result<Vec<String>, String>,
     },
     McpRefreshed(Result<String, String>),
+    UpdateChecked(Result<Option<UpdateInfo>, String>),
+    UpdateFinished(Result<String, String>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,6 +252,11 @@ struct PendingLogin {
     replacing: bool,
 }
 
+/// Update confirmation opened by `/update`.
+struct PendingUpdate {
+    info: UpdateInfo,
+}
+
 #[derive(Debug)]
 struct SkillInstallRequest {
     path: String,
@@ -310,6 +318,9 @@ pub struct App {
     pending_feedback: Option<PendingFeedback>,
     pending_login: Option<PendingLogin>,
     pending_mcp: Option<PendingMcpInstall>,
+    pending_update: Option<PendingUpdate>,
+    available_update: Option<UpdateInfo>,
+    update_check_requested: bool,
     mcp_busy: bool,
     running: bool,
     cancel: Option<CancellationToken>,
@@ -356,6 +367,9 @@ impl App {
             pending_feedback: None,
             pending_login: None,
             pending_mcp: None,
+            pending_update: None,
+            available_update: None,
+            update_check_requested: false,
             mcp_busy: false,
             running: false,
             cancel: None,
@@ -516,6 +530,40 @@ impl App {
                     Err(error) => self.push(MessageBlock::Error(format!("mcp reload: {error}"))),
                 }
             }
+            AppEvent::UpdateChecked(result) => {
+                let requested = std::mem::take(&mut self.update_check_requested);
+                match result {
+                    Ok(Some(info)) => {
+                        let first_notice = self.available_update.is_none();
+                        self.available_update = Some(info.clone());
+                        if self.pending_update.is_none() {
+                            if requested {
+                                self.prompt_update(info);
+                            } else if first_notice {
+                                self.push_system(info.prompt_line());
+                            }
+                        }
+                    }
+                    Ok(None) if requested => {
+                        self.push_system(format!(
+                            "slowcode is up to date ({})",
+                            slowcode_update::Version::current()
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) if requested => {
+                        self.push_error(format!("update check failed: {error}"));
+                    }
+                    Err(_) => {}
+                }
+            }
+            AppEvent::UpdateFinished(result) => match result {
+                Ok(message) => {
+                    self.available_update = None;
+                    self.push_system(message);
+                }
+                Err(error) => self.push_error(format!("update failed: {error}")),
+            },
         }
     }
 
@@ -1075,6 +1123,23 @@ impl App {
             return;
         }
 
+        if let Some(pending) = self.pending_update.take() {
+            match parse_yes_no(input) {
+                YesNoReply::Yes => self.start_update_install(pending.info),
+                YesNoReply::No => {
+                    self.push(MessageBlock::System("update cancelled".to_owned()));
+                }
+                YesNoReply::Invalid => {
+                    self.messages.push(MessageBlock::System(
+                        "reply y to update, n to cancel".to_owned(),
+                    ));
+                    self.scroll_to_bottom();
+                    self.pending_update = Some(pending);
+                }
+            }
+            return;
+        }
+
         if let Some(pending) = self.pending_skill.take() {
             match parse_yes_no(input) {
                 YesNoReply::Yes => {
@@ -1271,6 +1336,10 @@ impl App {
             Command::Skills(argument) => self.handle_skills(argument.as_deref()).await,
             Command::Mcp(argument) => self.handle_mcp(argument.as_deref()).await,
             Command::Feedback(argument) => self.handle_feedback(&argument).await,
+            Command::Update => {
+                self.handle_update();
+                KeyAction::none()
+            }
             Command::Quit => self.request_quit(),
             Command::Plan(_)
             | Command::Answer(_)
@@ -1502,6 +1571,63 @@ impl App {
         let status = credential_status(&self.workspace());
         self.push(MessageBlock::System(credential_report(&status)));
         self.start_login(status.configured());
+    }
+
+    fn handle_update(&mut self) {
+        if self.pending_update.is_some() {
+            self.push_system("reply y to update, n to cancel".to_owned());
+            return;
+        }
+        match self.available_update.clone() {
+            Some(info) if info.is_available() => self.prompt_update(info),
+            _ => {
+                if self.update_check_requested {
+                    self.push_system("still checking for updates".to_owned());
+                    return;
+                }
+                self.push_system("checking for updates".to_owned());
+                self.update_check_requested = true;
+                let tx = self.app_tx.clone();
+                tokio::spawn(async move {
+                    let result = slowcode_update::check_from_env()
+                        .await
+                        .map(|info| info.is_available().then_some(info))
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::UpdateChecked(result));
+                });
+            }
+        }
+    }
+
+    fn prompt_update(&mut self, info: UpdateInfo) {
+        self.messages.push(MessageBlock::Prompt(format!(
+            "Update slowcode {} -> {}? [y/n]",
+            info.current, info.latest
+        )));
+        self.scroll_to_bottom();
+        self.pending_update = Some(PendingUpdate { info });
+    }
+
+    fn start_update_install(&mut self, info: UpdateInfo) {
+        self.push_system(format!("downloading slowcode {}...", info.latest));
+        let tx = self.app_tx.clone();
+        tokio::spawn(async move {
+            let result = slowcode_update::install_from_env()
+                .await
+                .map(|outcome| match outcome {
+                    slowcode_update::InstallOutcome::UpToDate { current } => {
+                        format!("slowcode is up to date ({current})")
+                    }
+                    slowcode_update::InstallOutcome::Updated { path, old, new } => format!(
+                        "updated {} ({} -> {}); restart to use it",
+                        path.display(),
+                        old,
+                        new
+                    ),
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::UpdateFinished(result));
+        });
     }
 
     fn start_login(&mut self, replacing: bool) {
@@ -2828,6 +2954,9 @@ fn command_help_text(name: &str, args: &str, description: &str) -> String {
             "\nalways opens masked entry; the current source is shown first\nsaves to the workspace .env with mode 0600\nexample: /login",
         ),
         "/logout" => text.push_str("\nremoves DEEPSEEK_API_KEY from the workspace .env"),
+        "/update" => text.push_str(
+            "\nchecks the latest release, then asks before downloading and replacing the binary\nthe model cannot trigger it; pass --check to `slowcode update` to only report\nexample: /update",
+        ),
         "/plan" => text.push_str("\nexample: /plan add a line-count summary to notes.txt"),
         _ => {}
     }
@@ -4051,11 +4180,72 @@ mod tests {
         let all = help_text(None);
         assert!(all.contains("commands"));
         assert!(all.contains("/model"));
+        assert!(all.contains("/update"));
         assert!(all.contains("PgUp/PgDn"));
 
         let model = help_text(Some("model"));
         assert!(model.contains("usage: /model [name]"));
         assert!(model.contains("/model deepseek-v4-pro"));
+        assert!(help_text(Some("update")).contains("the model cannot trigger it"));
+    }
+
+    fn update_info(latest: &str) -> slowcode_update::UpdateInfo {
+        slowcode_update::UpdateInfo {
+            current: slowcode_update::Version::current(),
+            latest: slowcode_update::Version::parse(latest).expect("version"),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_update_notice_is_one_system_line_and_not_repeated() {
+        let mut app = test_app().await;
+        let before = app.messages.len();
+        let info = update_info("99.0.0");
+
+        app.handle_app_event(AppEvent::UpdateChecked(Ok(Some(info.clone()))));
+
+        assert_eq!(app.messages.len(), before + 1);
+        assert!(matches!(
+            app.messages.last(),
+            Some(MessageBlock::System(text))
+                if text.contains("update available: 99.0.0")
+                    && text.contains("type /update")
+        ));
+
+        app.handle_app_event(AppEvent::UpdateChecked(Ok(Some(info))));
+        assert_eq!(app.messages.len(), before + 1, "notice is not repeated");
+    }
+
+    #[tokio::test]
+    async fn update_prompt_requires_confirmation_and_can_be_cancelled() {
+        let mut app = test_app().await;
+        app.available_update = Some(update_info("99.0.0"));
+
+        app.handle_command(Command::Update).await;
+
+        assert!(app.pending_update.is_some());
+        assert!(matches!(
+            app.messages.last(),
+            Some(MessageBlock::Prompt(text))
+                if text.contains("Update slowcode") && text.contains("[y/n]")
+        ));
+
+        app.respond_to_prompt("maybe").await;
+        assert!(
+            app.pending_update.is_some(),
+            "invalid reply keeps the prompt"
+        );
+
+        app.respond_to_prompt("n").await;
+        assert!(app.pending_update.is_none());
+        assert!(matches!(
+            app.messages.last(),
+            Some(MessageBlock::System(text)) if text == "update cancelled"
+        ));
+        assert!(
+            app.available_update.is_some(),
+            "cancelling keeps the cached info"
+        );
     }
 
     #[test]
@@ -4203,7 +4393,7 @@ mod tests {
 
     #[test]
     fn rendered_help_contains_commands_and_keys() {
-        let backend = TestBackend::new(100, 30);
+        let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {

@@ -19,6 +19,7 @@ pub enum Command {
     Skills(Option<String>),
     Mcp(Option<String>),
     Feedback(String),
+    Update,
     Quit,
     Plan(String),
     Answer(String),
@@ -110,6 +111,11 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         name: "/feedback",
         args: "[--title TEXT] [--note TEXT] [--plan PATH] [text]",
         description: "write an issue-ready feedback bundle for this session",
+    },
+    CommandSpec {
+        name: "/update",
+        args: "",
+        description: "check for a newer release, then update after confirmation",
     },
     CommandSpec {
         name: "/plan",
@@ -322,6 +328,7 @@ fn argument_candidates(command: &str) -> &'static [&'static str] {
             "skills",
             "mcp",
             "feedback",
+            "update",
             "plan",
             "answer",
             "scaffold",
@@ -379,6 +386,7 @@ const COMMAND_TABLE: &[(&str, CommandParser)] = &[
     ("/skills", parse_skills),
     ("/mcp", parse_mcp),
     ("/feedback", parse_feedback),
+    ("/update", parse_update),
     ("/quit", parse_quit),
     ("/exit", parse_quit),
     ("/plan", parse_plan),
@@ -463,6 +471,10 @@ fn parse_mcp(rest: &str) -> Command {
 
 fn parse_feedback(rest: &str) -> Command {
     Command::Feedback(rest.to_owned())
+}
+
+fn parse_update(_rest: &str) -> Command {
+    Command::Update
 }
 
 fn parse_quit(_rest: &str) -> Command {
@@ -557,6 +569,7 @@ mod tests {
             Some(Command::Model(Some("deepseek-v4-pro".to_owned())))
         );
         assert_eq!(parse_command("/cache"), Some(Command::Cache));
+        assert_eq!(parse_command("/update"), Some(Command::Update));
         assert_eq!(parse_command("/quit"), Some(Command::Quit));
         assert_eq!(parse_command("/exit"), Some(Command::Quit));
     }

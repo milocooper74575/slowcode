@@ -83,6 +83,7 @@ async fn run_inner(
     let runtime = Arc::new(tokio::sync::Mutex::new(started.runtime));
     let mut events = started.events;
     let app_tx_for_mcp = app_tx.clone();
+    let app_tx_for_update = app_tx.clone();
     let mut app = App::new(
         Arc::clone(&runtime),
         session_id,
@@ -91,6 +92,13 @@ async fn run_inner(
         history,
         app_tx,
     );
+    // Startup awareness is best effort: release builds check after the first
+    // frame, debug builds and opt-outs skip it, and every failure is silent.
+    tokio::spawn(async move {
+        if let Ok(Some(info)) = slowcode_update::startup_check_from_env().await {
+            let _ = app_tx_for_update.send(AppEvent::UpdateChecked(Ok(Some(info))));
+        }
+    });
     if McpConfig::load(&workspace)
         .map(|config| !config.servers.is_empty())
         .unwrap_or(false)
