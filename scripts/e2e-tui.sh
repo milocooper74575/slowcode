@@ -187,7 +187,9 @@ step role-driver "role: driver"
 send "/cache"
 step cache "cache: 0 read"
 send "/login"
-step login "DEEPSEEK_API_KEY is set"
+step login "DEEPSEEK_API_KEY is configured"
+send_raw $'\033'
+step login-cancel "credential entry cancelled"
 send "/context"
 step context "AGENTS.md"
 step context-system "System prompt"
@@ -327,7 +329,7 @@ check() {
 }
 
 check "slowcode"
-check "Shift+Enter newline"
+check "Shift+Enter/Ctrl-J newline"
 
 if [ -f "$WORKSPACE/.slowcode/skills/demo/SKILL.md" ]; then
   echo "PASS installed skill file"

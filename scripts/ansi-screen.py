@@ -80,6 +80,10 @@ class Screen:
 
 
 def apply_csi(screen: Screen, params: str, final: str) -> None:
+    # Keyboard protocol commands use private markers such as CSI > 1 u.
+    # They do not affect the visible grid, so ignore them.
+    if params[:1] in (">", "<", "="):
+        return
     private = params.startswith("?")
     if private:
         params = params[1:]
