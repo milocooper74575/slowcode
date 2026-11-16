@@ -5,13 +5,15 @@
 
 mod app;
 mod approval;
+mod markdown;
 
 use std::{io::stdout, sync::Arc, time::Duration};
 
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream,
+        Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -117,6 +119,8 @@ async fn run_inner(
         });
     }
     let mut event_stream = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -136,6 +140,9 @@ async fn run_inner(
                 if let Some(app_event) = app_event {
                     app.handle_app_event(app_event);
                 }
+            }
+            _ = tick.tick() => {
+                app.handle_tick();
             }
             event = event_stream.next() => {
                 match event {
@@ -186,6 +193,12 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>, TuiEr
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // Not every terminal supports the kitty keyboard protocol. Failure is
+    // harmless: Ctrl-J remains the fallback newline shortcut.
+    let _ = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let backend = CrosstermBackend::new(stdout());
     let mut terminal =
         Terminal::new(backend).map_err(|error| TuiError::Terminal(error.to_string()))?;
@@ -196,6 +209,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>, TuiEr
 fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> Result<(), TuiError> {
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

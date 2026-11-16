@@ -1,6 +1,6 @@
 //! TUI state, rendering and key handling.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -11,6 +11,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
+use slowcode_app::plan::PlanOutcome;
 use slowcode_app::workflow::{ApprovalDecision, ApprovalRecord, ApprovalStatus, WorkflowStore};
 use slowcode_app::{
     Command, CommandCompletion, CredentialSourceKind, CredentialStatus, Runtime, SessionCommand,
@@ -58,7 +59,7 @@ impl KeyAction {
 #[derive(Debug)]
 pub enum AppEvent {
     TurnFinished(Result<(), String>),
-    PlanFinished(Result<String, String>),
+    PlanFinished(Result<PlanOutcome, String>),
     McpResolved(Result<McpServerConfig, String>),
     McpTested {
         server: McpServerConfig,
@@ -334,6 +335,11 @@ pub struct App {
     had_turn: bool,
     handoff_running: bool,
     quit_after_turn: bool,
+    plan_phase: Option<slowcode_app::workflow::Phase>,
+    plan_workflow: Option<String>,
+    plan_started: Option<Instant>,
+    plan_expects_assistant: bool,
+    plan_output_seen: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 }
 
@@ -383,6 +389,11 @@ impl App {
             had_turn: false,
             handoff_running: false,
             quit_after_turn: false,
+            plan_phase: None,
+            plan_workflow: None,
+            plan_started: None,
+            plan_expects_assistant: false,
+            plan_output_seen: false,
             app_tx,
         };
         for event in history {
@@ -481,14 +492,31 @@ impl App {
                 self.cancel = None;
                 self.pending_approval = None;
                 self.state = RunState::Idle;
+                let output_seen = std::mem::take(&mut self.plan_output_seen);
+                let expects_assistant = std::mem::take(&mut self.plan_expects_assistant);
+                self.plan_started = None;
+                self.assistant_live = None;
+                self.reasoning_live = None;
                 match result {
-                    Ok(output) => {
-                        if !output.trim().is_empty() {
-                            self.push(MessageBlock::System(output));
+                    Ok(outcome) => {
+                        if !output_seen && !outcome.output.trim().is_empty() {
+                            if expects_assistant {
+                                self.push(MessageBlock::Assistant(outcome.output));
+                            } else {
+                                self.push(MessageBlock::System(outcome.output));
+                            }
+                        }
+                        if let Some(workflow_id) = &outcome.workflow_id {
+                            self.plan_workflow = Some(workflow_id.clone());
+                        }
+                        self.refresh_plan_phase();
+                        if expects_assistant {
+                            self.push_system(format!("[plan saved to {}]", outcome.path.display()));
                         }
                     }
                     Err(error) => {
                         self.state = RunState::Error;
+                        self.refresh_plan_phase();
                         self.push(MessageBlock::Error(error));
                     }
                 }
@@ -614,12 +642,18 @@ impl App {
                 self.reasoning_live = None;
             }
             UiEventKind::AssistantTextDelta { text, .. } => {
+                if self.plan_started.is_some() {
+                    self.plan_output_seen = true;
+                }
                 self.append_stream_text(LiveKind::Assistant, &text, true);
             }
             UiEventKind::AssistantReasoningDelta { text, .. } => {
                 self.append_stream_text(LiveKind::Reasoning, &text, false);
             }
             UiEventKind::AssistantMessage { message, .. } => {
+                if self.plan_started.is_some() {
+                    self.plan_output_seen = true;
+                }
                 replace_live(
                     &mut self.messages,
                     &mut self.assistant_live,
@@ -708,7 +742,19 @@ impl App {
 
     fn handle_lifecycle_event(&mut self, kind: UiEventKind) {
         match kind {
-            UiEventKind::TurnEnd { reason, .. } => self.finish_turn(reason),
+            UiEventKind::TurnEnd { reason, .. } => {
+                if self.plan_started.is_some() {
+                    // A Plan command can run several model turns. The command
+                    // owns the busy state; PlanFinished closes it.
+                    self.assistant_live = None;
+                    self.reasoning_live = None;
+                    if !matches!(reason, UiTurnEnd::Error { .. }) {
+                        self.state = RunState::Streaming;
+                    }
+                } else {
+                    self.finish_turn(reason);
+                }
+            }
             UiEventKind::RetryScheduled {
                 retry,
                 delay_ms,
@@ -1042,6 +1088,10 @@ impl App {
         self.scroll_to_bottom();
 
         if let Some(command) = command {
+            if is_plan_command(&command) {
+                self.messages.push(MessageBlock::User(input));
+                self.stick_to_bottom();
+            }
             return self.handle_command(command).await;
         }
         if self.running {
@@ -1310,6 +1360,16 @@ impl App {
     fn start_plan(&mut self, command: slowcode_app::plan::PlanCommand) {
         let label = command.label();
         let is_plan = matches!(command, slowcode_app::plan::PlanCommand::Plan(_));
+        let expects_assistant = command.uses_model();
+        self.plan_started = Some(Instant::now());
+        self.plan_phase = self
+            .active_phase()
+            .or_else(|| is_plan.then_some(slowcode_app::workflow::Phase::Classify));
+        self.plan_workflow = self.active_workflow_id();
+        self.plan_expects_assistant = expects_assistant;
+        self.plan_output_seen = false;
+        self.assistant_live = None;
+        self.reasoning_live = None;
         self.running = true;
         self.state = RunState::Streaming;
         let cancel = CancellationToken::new();
@@ -1322,13 +1382,6 @@ impl App {
             let result = runtime
                 .run_plan_command(command, cancel)
                 .await
-                .map(|outcome| {
-                    let mut text = outcome.output;
-                    if is_plan {
-                        text.push_str(&format!("\n\n[plan saved to {}]", outcome.path.display()));
-                    }
-                    text
-                })
                 .map_err(|error| error.to_string());
             let _ = tx.send(AppEvent::PlanFinished(result));
         });
@@ -1483,6 +1536,34 @@ impl App {
             .ok()
             .flatten()
             .map(|state| state.phase)
+    }
+
+    fn active_workflow_id(&self) -> Option<String> {
+        WorkflowStore::new(&self.workspace())
+            .load_active()
+            .ok()
+            .flatten()
+            .map(|state| state.workflow_id)
+    }
+
+    fn refresh_plan_phase(&mut self) {
+        match WorkflowStore::new(&self.workspace()).load_active() {
+            Ok(Some(state)) => {
+                self.plan_phase = Some(state.phase);
+                self.plan_workflow = Some(state.workflow_id);
+            }
+            Ok(None) if !self.running => {
+                self.plan_phase = None;
+                self.plan_workflow = None;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_tick(&mut self) {
+        if self.plan_phase.is_some() {
+            self.refresh_plan_phase();
+        }
     }
 
     async fn ensure_plan_role(&mut self, command: &Command) -> bool {
@@ -2635,13 +2716,14 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let composer_height = composer_height(&self.composer);
+        let footer_height = if self.plan_phase.is_some() { 2 } else { 1 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(composer_height),
-                Constraint::Length(1),
+                Constraint::Length(footer_height),
             ])
             .split(area);
 
@@ -2744,6 +2826,18 @@ impl App {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+        let footer_area = if self.plan_phase.is_some() && area.height > 1 {
+            let phase = Rect::new(area.x, area.y, area.width, 1);
+            self.draw_plan_phase(frame, phase);
+            Rect::new(
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                area.height.saturating_sub(1),
+            )
+        } else {
+            area
+        };
         let hint = if self.handoff_running {
             "writing HANDOFF.md  Ctrl-C quit"
         } else if self.recovered_approval.is_some() {
@@ -2759,10 +2853,10 @@ impl App {
         } else if self.running {
             "Esc interrupt  PgUp/PgDn scroll  Ctrl-C quit"
         } else {
-            "Shift+Enter newline  PgUp/PgDn scroll  Ctrl-C quit"
+            "Shift+Enter/Ctrl-J newline  PgUp/PgDn scroll  Ctrl-C quit"
         };
-        let progress = self.context_progress(hint.chars().count(), area.width);
-        let width = area.width as usize;
+        let progress = self.context_progress(hint.chars().count(), footer_area.width);
+        let width = footer_area.width as usize;
         let left = hint.chars().count();
         let right = progress.chars().count();
         let padding = width.saturating_sub(left + right).max(1);
@@ -2771,7 +2865,48 @@ impl App {
             Span::raw(" ".repeat(padding)),
             Span::styled(progress, Style::default().fg(Color::DarkGray)),
         ]);
-        frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
+        frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), footer_area);
+    }
+
+    fn draw_plan_phase(&self, frame: &mut Frame, area: Rect) {
+        let Some(current) = self.plan_phase else {
+            return;
+        };
+        let mut spans = vec![Span::styled("phase ", Style::default().fg(Color::DarkGray))];
+        for (index, phase) in PHASE_ORDER.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" > ", Style::default().fg(Color::DarkGray)));
+            }
+            let style = if *phase == current {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if phase_index(*phase) < phase_index(current) {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(phase.as_str(), style));
+        }
+        if matches!(current, slowcode_app::workflow::Phase::Blocked) {
+            spans.push(Span::styled(
+                "  blocked",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(started) = self.plan_started {
+            spans.push(Span::styled(
+                format!("  {:.1}s", started.elapsed().as_secs_f64()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(workflow) = &self.plan_workflow {
+            spans.push(Span::styled(
+                format!("  {}", short_session(workflow)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn context_progress(&self, left: usize, width: u16) -> String {
@@ -2811,9 +2946,7 @@ fn block_lines(block: &MessageBlock) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match block {
         MessageBlock::User(text) => push_user_text(&mut lines, text, Color::Cyan),
-        MessageBlock::Assistant(text) => {
-            push_text_aligned(&mut lines, text, Color::Reset, Alignment::Left);
-        }
+        MessageBlock::Assistant(text) => lines.extend(crate::markdown::render(text, Color::Reset)),
         MessageBlock::Reasoning(text) => {
             lines.push(Line::from(Span::styled(
                 "thinking",
@@ -3008,6 +3141,25 @@ fn phase_role(phase: slowcode_app::workflow::Phase) -> slowcode_roles::RoleName 
         | Phase::Done
         | Phase::Blocked => slowcode_roles::RoleName::Navigator,
     }
+}
+
+const PHASE_ORDER: [slowcode_app::workflow::Phase; 9] = [
+    slowcode_app::workflow::Phase::Classify,
+    slowcode_app::workflow::Phase::Interview,
+    slowcode_app::workflow::Phase::Reclassify,
+    slowcode_app::workflow::Phase::Review,
+    slowcode_app::workflow::Phase::Scaffold,
+    slowcode_app::workflow::Phase::AwaitUser,
+    slowcode_app::workflow::Phase::TestFix,
+    slowcode_app::workflow::Phase::Distill,
+    slowcode_app::workflow::Phase::Done,
+];
+
+fn phase_index(phase: slowcode_app::workflow::Phase) -> usize {
+    PHASE_ORDER
+        .iter()
+        .position(|candidate| *candidate == phase)
+        .unwrap_or(usize::MAX)
 }
 
 fn role_switch_allowed(
@@ -3607,6 +3759,26 @@ fn command_needs_credential(command: &Command) -> bool {
     )
 }
 
+fn is_plan_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Plan(_)
+            | Command::Answer(_)
+            | Command::Scaffold
+            | Command::Continue
+            | Command::Test
+            | Command::Fix
+            | Command::Execute
+            | Command::Distill(_)
+            | Command::Approve
+            | Command::Status(_)
+            | Command::Next
+            | Command::Workflow(_)
+            | Command::Reclassify(_)
+            | Command::Hint(_)
+    )
+}
+
 fn composer_view(
     composer: &str,
     cursor: usize,
@@ -3855,7 +4027,9 @@ fn parse_approval_reply(input: &str) -> ApprovalReply {
 }
 
 fn is_newline_key(key: &KeyEvent) -> bool {
-    (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT))
+    (key.code == KeyCode::Enter
+        && (key.modifiers.contains(KeyModifiers::SHIFT)
+            || key.modifiers.contains(KeyModifiers::CONTROL)))
         || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
@@ -5759,6 +5933,52 @@ mod tests {
             app.messages.last(),
             Some(MessageBlock::Error(text)) if text == "cancelled"
         ));
+    }
+
+    #[tokio::test]
+    async fn plan_finished_appends_assistant_output_when_nothing_streamed() {
+        let mut app = test_app().await;
+        app.running = true;
+        app.plan_expects_assistant = true;
+
+        app.handle_app_event(AppEvent::PlanFinished(Ok(PlanOutcome {
+            path: std::path::PathBuf::from(".scratch/plans/p.md"),
+            output: "## Plan\n\nbody".to_owned(),
+            workflow_id: None,
+        })));
+
+        assert!(!app.running);
+        assert!(app.messages.iter().any(|message| {
+            matches!(message, MessageBlock::Assistant(text) if text.contains("## Plan"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn phase_progress_renders_the_active_phase() {
+        let mut app = test_app().await;
+        app.plan_phase = Some(slowcode_app::workflow::Phase::Interview);
+        app.plan_workflow = Some("plan-1".to_owned());
+        app.plan_started = Some(Instant::now());
+
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.draw_plan_phase(frame, area);
+            })
+            .expect("draw");
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("classify"), "{content}");
+        assert!(content.contains("interview"), "{content}");
+        assert!(content.contains("phase"), "{content}");
     }
 
     #[tokio::test]
