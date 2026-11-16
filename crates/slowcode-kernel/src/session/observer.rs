@@ -16,12 +16,14 @@ use crate::model::{ContentBlockKind, ContextForm, MessageSourceKind, StreamChunk
 
 use super::{
     ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionTrigger, EventKind, EventSeq,
-    RetryNumber, SessionEvent, StepId, SurfaceOp, TodoItem, ToolFailure, TurnEndCancelCause,
-    TurnEndReason, TurnId, UnixMillis,
+    MAX_SESSION_EVENTS, RetryNumber, SessionEvent, StepId, SurfaceOp, TodoItem, ToolFailure,
+    TurnEndCancelCause, TurnEndReason, TurnId, UnixMillis,
 };
 
-const SOURCE_BITMAP_WORDS: usize = 64;
-const MAX_SOURCE_BITMAP_CAPACITY: usize = 128;
+// One word covers 64 event sequences. A durable session caps at
+// MAX_SESSION_EVENTS (16_384) events, so the bitmap must cover the same span.
+pub(crate) const SOURCE_BITMAP_WORDS: usize = MAX_SESSION_EVENTS / u64::BITS as usize;
+pub(crate) const MAX_SOURCE_BITMAP_CAPACITY: usize = SOURCE_BITMAP_WORDS * 2;
 const MAX_INDEXED_ASSISTANT_BLOCKS: usize = 128;
 const MAX_INDEXED_ASSISTANT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UI_OPAQUE_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -1363,10 +1365,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CommittedUiEvent, CommittedUiKind, MAX_UI_IDENTITY_BYTES, MAX_UI_OPAQUE_PAYLOAD_BYTES,
-        SourceSeqBitmap, UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent,
-        UiCompactionError, UiIdentity, UiTurnEndReason, UiUserSource, opaque_payload,
-        try_ui_identity, try_ui_text,
+        CommittedUiEvent, CommittedUiKind, MAX_SESSION_EVENTS, MAX_UI_IDENTITY_BYTES,
+        MAX_UI_OPAQUE_PAYLOAD_BYTES, SourceSeqBitmap, UiAssistantBlock, UiAssistantBlockKind,
+        UiAssistantContent, UiCompactionError, UiIdentity, UiTurnEndReason, UiUserSource,
+        opaque_payload, try_ui_identity, try_ui_text,
     };
     use crate::session::{EventSeq, RetryNumber, StepId, TurnId, UnixMillis, codec::decode_event};
 
@@ -1684,5 +1686,20 @@ mod tests {
                 ..
             } if target.get() == 9
         ));
+    }
+
+    #[test]
+    fn source_bitmap_covers_a_full_session_event_span() {
+        let sources = (0..MAX_SESSION_EVENTS)
+            .map(|value| EventSeq::new(value as u64).unwrap())
+            .collect::<Vec<_>>();
+        let bitmap = SourceSeqBitmap::from_sources(&sources).expect("full session span fits");
+        assert!(bitmap.contains(EventSeq::new((MAX_SESSION_EVENTS - 1) as u64).unwrap()));
+
+        let out_of_range = [
+            EventSeq::new(0).unwrap(),
+            EventSeq::new(MAX_SESSION_EVENTS as u64).unwrap(),
+        ];
+        assert!(SourceSeqBitmap::from_sources(&out_of_range).is_err());
     }
 }

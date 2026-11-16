@@ -74,9 +74,10 @@ pub use title::{
 };
 
 pub(crate) use observer::{
-    CommittedUiEvent, CommittedUiKind, CommittedUiReceiver, SourceSeqBitmap, UiAssistantBlockKind,
-    UiAssistantContent, UiIdentity, UiObserverAttachError, UiOpaquePayload, UiTokenUsage,
-    UiTurnEndCancelCause, UiTurnEndReason, UiUserSource,
+    CommittedUiEvent, CommittedUiKind, CommittedUiReceiver, MAX_SOURCE_BITMAP_CAPACITY,
+    SOURCE_BITMAP_WORDS, SourceSeqBitmap, UiAssistantBlockKind, UiAssistantContent, UiIdentity,
+    UiObserverAttachError, UiOpaquePayload, UiTokenUsage, UiTurnEndCancelCause, UiTurnEndReason,
+    UiUserSource,
 };
 #[cfg(test)]
 pub(crate) use observer::{UiAssistantBlock, UiCompactionError, UiToolFailure};

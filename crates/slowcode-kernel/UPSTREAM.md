@@ -67,6 +67,13 @@ include those JSON fixtures by relative path.
 - Bounded `SourceSeqBitmap::from_sources` by the bitmap's own 4_096-source
   capacity instead of `MAX_SESSION_EVENTS` in `session/observer.rs`. The raised
   session limit exposed an out-of-bounds index in that check.
+- `session/observer.rs`: raised `SOURCE_BITMAP_WORDS` from 64 to
+  `MAX_SESSION_EVENTS / 64` so one assistant surface can reference every event
+  in a full session. The previous 4_096-sequence span faulted the UI observer
+  and aborted long `/plan` turns with `AGENT_OBSERVER_UNAVAILABLE`. Test:
+  `source_bitmap_covers_a_full_session_event_span`. The existing phase7 bitmap
+  tests now assert against the exported capacity constants instead of the old
+  64-word allocation.
 - `session/store.rs`: added the public `SessionStore::open_new_session` and
   `SessionStore::resume_session` seams plus `new_session_id` and
   `validate_session_id`. These wrap the existing crate-private prepare and

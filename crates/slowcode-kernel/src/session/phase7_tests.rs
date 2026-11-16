@@ -323,9 +323,9 @@ fn source_bitmap_maps_word_edges_and_has_a_fixed_allocation() {
     let bitmap = SourceSeqBitmap::from_sources(&sources).unwrap();
 
     assert_eq!(bitmap.base_for_test(), EventSeq::new(50_000).unwrap());
-    assert_eq!(bitmap.word_len_for_test(), 64);
-    assert!(bitmap.word_capacity_for_test() <= 128);
-    assert!(bitmap.allocated_bytes_for_test() <= 1_024);
+    assert_eq!(bitmap.word_len_for_test(), super::SOURCE_BITMAP_WORDS);
+    assert!(bitmap.word_capacity_for_test() <= super::MAX_SOURCE_BITMAP_CAPACITY);
+    assert!(bitmap.allocated_bytes_for_test() <= 4_096);
     for source in sources {
         assert!(bitmap.contains(source));
     }
@@ -339,14 +339,18 @@ fn source_bitmap_rejects_a_span_larger_than_one_provider_attempt() {
     assert!(
         SourceSeqBitmap::from_sources(&[
             EventSeq::new(50_000).unwrap(),
-            EventSeq::new(54_096).unwrap(),
+            EventSeq::new(50_000 + super::MAX_SESSION_EVENTS as u64).unwrap(),
         ])
         .is_err()
     );
-    assert!(SourceSeqBitmap::capacity_is_acceptable_for_test(128));
-    assert!(!SourceSeqBitmap::capacity_is_acceptable_for_test(129));
-    let mut overallocated = Vec::with_capacity(129);
-    overallocated.resize(64, 0_u64);
+    assert!(SourceSeqBitmap::capacity_is_acceptable_for_test(
+        super::MAX_SOURCE_BITMAP_CAPACITY
+    ));
+    assert!(!SourceSeqBitmap::capacity_is_acceptable_for_test(
+        super::MAX_SOURCE_BITMAP_CAPACITY + 1
+    ));
+    let mut overallocated = Vec::with_capacity(super::MAX_SOURCE_BITMAP_CAPACITY + 1);
+    overallocated.resize(super::SOURCE_BITMAP_WORDS, 0_u64);
     assert!(SourceSeqBitmap::from_words_for_test(overallocated).is_err());
 }
 
