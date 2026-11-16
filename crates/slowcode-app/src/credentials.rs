@@ -409,6 +409,48 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_maximum_key_length_and_embedded_equals_signs() {
+        let workspace = temp_workspace("length");
+        let longest = "k".repeat(MAX_API_KEY_BYTES);
+        save_api_key(&workspace, &longest).expect("maximum length");
+        assert_eq!(
+            workspace_key(&workspace.join(".env")).as_deref(),
+            Some(longest.as_str())
+        );
+
+        save_api_key(&workspace, "sk-a=b").expect("embedded equals");
+        assert_eq!(
+            workspace_key(&workspace.join(".env")).as_deref(),
+            Some("sk-a=b")
+        );
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn reports_io_errors_without_touching_the_file() {
+        let workspace = temp_workspace("io");
+        let env_path = workspace.join(".env");
+        fs::write(&env_path, [0xff, 0xfe, 0x00]).expect("non-utf8 seed");
+
+        assert!(matches!(
+            save_api_key(&workspace, "sk-key"),
+            Err(CredentialError::Io(_))
+        ));
+        assert!(matches!(
+            remove_api_key(&workspace),
+            Err(CredentialError::Io(_))
+        ));
+        assert_eq!(fs::read(&env_path).expect("unchanged"), [0xff, 0xfe, 0x00]);
+
+        let missing = workspace.join("does-not-exist");
+        assert!(matches!(
+            save_api_key(&missing, "sk-key"),
+            Err(CredentialError::Io(_))
+        ));
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
     fn workspace_env_is_read_before_the_process_environment() {
         let workspace = temp_workspace("source");
         fs::write(workspace.join(".env"), "DEEPSEEK_API_KEY=sk-file\n").expect("seed");
