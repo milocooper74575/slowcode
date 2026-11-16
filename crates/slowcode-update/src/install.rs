@@ -8,6 +8,7 @@ use std::{
     fs,
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use flate2::read::GzDecoder;
@@ -63,8 +64,10 @@ pub async fn install(request: &InstallRequest<'_>) -> Result<InstallOutcome, Upd
     if cfg!(windows) {
         return Err(UpdateError::UnsupportedSelfReplace);
     }
-    let exe_path = request.exe_path.clone();
-    refuse_package_manager(&exe_path)?;
+    refuse_package_manager(&request.exe_path)?;
+    // Replace the real file when the installed path is a symlink, so the link
+    // itself survives the update.
+    let exe_path = fs::canonicalize(&request.exe_path).unwrap_or_else(|_| request.exe_path.clone());
 
     let release = request.transport.latest_release().await?;
     if !release.version.is_newer_than(&request.current) {
@@ -156,7 +159,14 @@ fn replace_executable(exe_path: &Path, binary: &[u8]) -> Result<(), UpdateError>
     let directory = exe_path
         .parent()
         .ok_or_else(|| UpdateError::not_writable(Path::new(".")))?;
-    let temporary = directory.join(format!(".slowcode-update-{}.tmp", std::process::id()));
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".slowcode-update-{}.{sequence}.tmp",
+        std::process::id()
+    ));
+    // A leftover from a crashed update would block create_new; it is never live.
+    let _ = fs::remove_file(&temporary);
     let result = (|| {
         let mut file =
             create_executable(&temporary).map_err(|error| map_write_error(error, directory))?;
@@ -186,7 +196,7 @@ fn map_write_error(error: io::Error, directory: &Path) -> UpdateError {
 
 fn create_executable(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -384,7 +394,7 @@ mod tests {
             .expect("install");
         match outcome {
             InstallOutcome::Updated { path, old, new } => {
-                assert_eq!(path, exe);
+                assert_eq!(path, fs::canonicalize(&exe).expect("canonical exe"));
                 assert_eq!(old.to_string(), "0.1.0");
                 assert_eq!(new.to_string(), "0.2.0");
             }

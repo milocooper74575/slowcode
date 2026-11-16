@@ -8,6 +8,7 @@ use std::{
     fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -62,7 +63,9 @@ pub fn write(path: &Path, check: &CachedCheck) -> Result<(), UpdateError> {
     let temporary = temporary_path(path);
     let result = (|| {
         let bytes = serde_json::to_vec(check)?;
-        let mut file = fs::File::create(&temporary)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
@@ -75,11 +78,13 @@ pub fn write(path: &Path, check: &CachedCheck) -> Result<(), UpdateError> {
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "update-check.json".to_owned());
-    path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
+    path.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()))
 }
 
 /// Current Unix seconds. Before the epoch, zero.

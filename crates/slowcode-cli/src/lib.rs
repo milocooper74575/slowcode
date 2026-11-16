@@ -68,7 +68,6 @@ Commands:
   /execute                 Execute only 可执行 tasks
   /distill <explanation>   Record a Teach-back and produce an understanding-gap report
   /role [navigator|driver] Show or switch the REPL role without losing the session
-  /update                  Check for a newer release, then update after confirmation
 ";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
