@@ -704,11 +704,11 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let errors = analysis.turn_reasons.get("error").copied().unwrap_or(0)
-        + analysis.turn_reasons.get("aborted").copied().unwrap_or(0);
+    let errors = analysis.turn_reasons.get("error").copied().unwrap_or(0);
+    let aborted = analysis.turn_reasons.get("aborted").copied().unwrap_or(0);
     let usage = |key: &str| analysis.usage.get(key).copied().unwrap_or(0);
     issue.push_str(&format!(
-        "\n## 会话摘要\n\n- events: {}\n- turns: {} ({})\n- user messages: {}\n- assistant messages: {}\n- tool calls: {} ({})\n- errors: {}\n- tokens: input {}, output {}, cache read {}, reasoning {}\n",
+        "\n## 会话摘要\n\n- events: {}\n- turns: {} ({})\n- user messages: {}\n- assistant messages: {}\n- tool calls: {} ({})\n- errors: {}, aborted: {}\n- tokens: input {}, output {}, cache read {}, reasoning {}\n",
         analysis.event_count,
         turns,
         reason_text,
@@ -717,6 +717,7 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
         analysis.tool_calls,
         tools,
         errors,
+        aborted,
         usage("inputTokens"),
         usage("outputTokens"),
         usage("cacheReadTokens"),
@@ -1380,6 +1381,25 @@ mod tests {
             issue.contains("- [turn] `TURN_X` (turn 1): turn failed without a message"),
             "{issue}"
         );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn aborted_turns_are_not_counted_as_errors() {
+        let base = temp_dir("aborted");
+        let out = base.join("out");
+        let journal = journal().replace("{\"kind\":\"completed\"}", "{\"kind\":\"aborted\"}");
+        let outcome = write_bundle(request(&out, journal.as_bytes())).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        assert!(issue.contains("- errors: 0, aborted: 1"), "{issue}");
+        assert!(issue.contains("turns: 1 (aborted x1)"), "{issue}");
+        assert!(issue.contains("## 关键错误\n\n- none"), "{issue}");
+        let metadata: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(metadata["turnReasons"]["aborted"], 1);
+        assert_eq!(metadata["errors"].as_array().unwrap().len(), 0);
         let _ = fs::remove_dir_all(base);
     }
 
