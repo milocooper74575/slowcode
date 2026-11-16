@@ -1074,11 +1074,14 @@ mod tests {
     }
 
     impl PlanProvider {
-        fn new(text: &str) -> Self {
+        fn new(texts: &[&str]) -> Self {
             Self {
-                attempts: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
-                    text_response(text),
-                ])),
+                attempts: std::sync::Mutex::new(
+                    texts
+                        .iter()
+                        .map(|text| text_response(text))
+                        .collect::<std::collections::VecDeque<_>>(),
+                ),
             }
         }
     }
@@ -1166,7 +1169,7 @@ mod tests {
         };
         let mut session = RoleSession::new(
             config,
-            Arc::new(PlanProvider::new(
+            Arc::new(PlanProvider::new(&[
                 "\
 ## 证据包
 - read src/main.rs
@@ -1176,7 +1179,8 @@ mod tests {
 |---|---|---|---|---|---|---|---|
 | 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
 ",
-            )),
+                "normal answer after plan",
+            ])),
             RoleName::Driver,
         )
         .await
@@ -1207,6 +1211,20 @@ mod tests {
 
         assert_eq!(session.session().id().as_str(), session_id);
         assert!(outcome.output.contains("## 证据包"));
+        let message = Message::user(
+            "user-1",
+            vec![ContentBlock::text("next").expect("content block")],
+            MessageSource::user().expect("user source"),
+        )
+        .expect("user message");
+        let outcome = session
+            .run_turn(message, CancellationToken::new())
+            .await
+            .expect("normal turn succeeds after plan");
+        assert!(
+            slowcode_app::outcome_text(&outcome).contains("normal answer after plan"),
+            "the restored agent serves the next turn"
+        );
         let _ = std::fs::remove_dir_all(&workspace);
     }
 }

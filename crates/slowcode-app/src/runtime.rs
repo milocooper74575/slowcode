@@ -1317,6 +1317,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_then_normal_turn_keeps_the_session() {
+        let _guard = HOME_LOCK.lock().await;
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            text_response(
+                "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+",
+            ),
+            text_response("next answer"),
+        ]));
+        let (mut runtime, _events, home, workspace) =
+            runtime_with_provider("plan-then-turn", provider).await;
+        let id = runtime.session_id().to_owned();
+
+        runtime
+            .run_plan_command(
+                PlanCommand::Plan("count lines".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("plan succeeds");
+        let outcome = runtime
+            .run_turn("next".to_owned(), CancellationToken::new())
+            .await
+            .expect("normal turn succeeds after plan");
+
+        assert_eq!(runtime.session_id(), id);
+        assert!(
+            crate::outcome_text(&outcome).contains("next answer"),
+            "the restored role agent serves the next turn"
+        );
+        runtime.shutdown().await.expect("runtime shuts down");
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn reinstalling_mcp_closes_the_previous_executor_once() {
         let _guard = HOME_LOCK.lock().await;
         let (mut runtime, home, workspace) = runtime_with_temp_home("reinstall").await;

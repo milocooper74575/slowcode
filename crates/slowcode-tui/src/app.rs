@@ -6039,6 +6039,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_turn_end_does_not_clear_the_busy_state() {
+        let mut app = test_app().await;
+        app.running = true;
+        app.plan_started = Some(Instant::now());
+
+        app.handle_ui_event(UiEvent {
+            seq: 1,
+            time_ms: 0,
+            kind: UiEventKind::TurnEnd {
+                turn: 1,
+                reason: UiTurnEnd::Completed,
+            },
+        });
+
+        assert!(app.running, "the plan command still owns the busy state");
+        assert!(matches!(app.state, RunState::Streaming));
+    }
+
+    #[tokio::test]
     async fn phase_progress_renders_the_active_phase() {
         let mut app = test_app().await;
         app.plan_phase = Some(slowcode_app::workflow::Phase::Interview);
