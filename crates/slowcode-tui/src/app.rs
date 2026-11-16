@@ -472,6 +472,7 @@ impl App {
                 if let Err(error) = result {
                     self.state = RunState::Error;
                     self.push(MessageBlock::Error(format!("turn failed: {error}")));
+                    self.push_feedback_hint();
                 }
             }
             AppEvent::PlanFinished(result) => {
@@ -735,13 +736,17 @@ impl App {
         if let UiTurnEnd::Error { code, message } = reason {
             self.state = RunState::Error;
             self.push(MessageBlock::Error(format!("{code}: {message}")));
-            self.push_background(MessageBlock::System(
-                "if this is a slowcode bug, run /feedback to write a bundle; the journal's error events are included automatically".to_owned(),
-            ));
+            self.push_feedback_hint();
         }
         self.pending_approval = None;
         self.assistant_live = None;
         self.reasoning_live = None;
+    }
+
+    fn push_feedback_hint(&mut self) {
+        self.push_background(MessageBlock::System(
+            "if this is a slowcode bug, run /feedback to write a bundle; the journal's error events are included automatically".to_owned(),
+        ));
     }
 
     fn handle_compaction_event(&mut self, kind: UiEventKind) {
@@ -4582,6 +4587,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_failure_also_points_at_feedback() {
+        let mut app = test_app().await;
+        app.running = true;
+
+        app.handle_app_event(AppEvent::TurnFinished(Err(
+            "tool executor failed".to_owned()
+        )));
+
+        assert!(!app.running);
+        assert_eq!(app.state, RunState::Error);
+        assert!(matches!(
+            &app.messages[app.messages.len() - 2],
+            MessageBlock::Error(text) if text == "turn failed: tool executor failed"
+        ));
+        assert!(matches!(
+            app.messages.last(),
+            Some(MessageBlock::System(text)) if text.contains("/feedback")
+        ));
+    }
+
+    #[tokio::test]
     async fn compaction_retry_approval_and_todo_events_append_expected_notes() {
         let mut app = test_app().await;
         let before = app.messages.len();
@@ -5149,7 +5175,16 @@ mod tests {
         assert!(out_dir.join("metadata.json").is_file());
         assert!(out_dir.join("manifest.json").is_file());
         let issue = std::fs::read_to_string(out_dir.join("issue.md")).expect("issue");
-        assert!(issue.contains("the plan never paused"), "{issue}");
+        let actual = issue.split("## 实际").nth(1).expect("actual section");
+        assert!(actual.contains("the plan never paused"), "{issue}");
+        let expected = issue
+            .split("## 期望")
+            .nth(1)
+            .expect("expected section")
+            .split("## 实际")
+            .next()
+            .expect("expected body");
+        assert!(!expected.contains("the plan never paused"), "{issue}");
         assert!(issue.contains("complete: `true`"), "{issue}");
         let manifest = std::fs::read_to_string(out_dir.join("manifest.json")).expect("manifest");
         assert!(manifest.contains("\"complete\": true"), "{manifest}");
