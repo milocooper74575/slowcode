@@ -5177,6 +5177,8 @@ mod tests {
             prompt.contains("feedback bundle: the plan never paused"),
             "{prompt}"
         );
+        assert!(prompt.contains("actual: the plan never paused"), "{prompt}");
+        assert!(!prompt.contains("note:"), "{prompt}");
         assert!(prompt.contains("reply y to write"), "{prompt}");
         assert!(!out_dir.exists(), "nothing is written before confirmation");
 
@@ -5606,6 +5608,11 @@ mod tests {
         );
         assert!(help_text(Some("plan")).contains("/plan add a line-count summary"));
         assert!(help_text(Some("session")).contains("/session switch session-<uuid>"));
+        assert!(
+            help_text(Some("feedback")).contains("describes what actually happened"),
+            "{}",
+            help_text(Some("feedback"))
+        );
         assert_eq!(
             help_text(Some("bogus")),
             "unknown command: bogus\ntry /help"

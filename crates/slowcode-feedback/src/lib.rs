@@ -1164,6 +1164,24 @@ mod tests {
         journal
     }
 
+    fn fallback_error_journal() -> String {
+        format!(
+            concat!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"createdAt\":1792466172940,",
+                "\"cwd\":\"/tmp/example-project\"}}\n",
+                "{{\"type\":\"request/header\",\"seq\":0,\"time\":1,\"data\":{{\"header\":",
+                "{{\"config\":{{\"model\":\"deepseek-flash\",\"provider\":\"deepseek-official\"}}}}}}}}\n",
+                "{{\"type\":\"user/message\",\"seq\":1,\"time\":2,\"data\":{{\"content\":[",
+                "{{\"type\":\"text\",\"text\":\"run the shell\"}}]}}}}\n",
+                "{{\"type\":\"tool/result\",\"seq\":2,\"time\":3,\"data\":{{\"error\":",
+                "{{\"code\":\"TOOL_X\",\"name\":\"BoomError\"}},\"turn\":1,\"step\":2}}}}\n",
+                "{{\"type\":\"turn/end\",\"seq\":3,\"time\":4,\"data\":{{\"reason\":",
+                "{{\"error\":{{\"code\":\"TURN_X\"}},\"kind\":\"error\"}},\"turn\":1}}}}\n"
+            ),
+            id = SESSION_ID
+        )
+    }
+
     fn titled_journal() -> String {
         format!(
             concat!(
@@ -1341,6 +1359,26 @@ mod tests {
                 .iter()
                 .all(|error| !error["message"].as_str().unwrap().contains("sk-")),
             "{metadata}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn errors_without_text_use_their_codes_and_names() {
+        let base = temp_dir("errors-fallback");
+        let out = base.join("out");
+        let journal = fallback_error_journal();
+        let outcome = write_bundle(request(&out, journal.as_bytes())).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        assert!(
+            issue.contains("- [tool] `TOOL_X` (turn 1 step 2): BoomError"),
+            "{issue}"
+        );
+        assert!(
+            issue.contains("- [turn] `TURN_X` (turn 1): turn failed without a message"),
+            "{issue}"
         );
         let _ = fs::remove_dir_all(base);
     }
