@@ -5,6 +5,7 @@
 //! token streaming.
 
 pub mod feedback;
+pub mod update;
 
 use std::{
     error::Error,
@@ -39,6 +40,7 @@ Usage:
   slowcode [OPTIONS]                 Start the TUI
   slowcode run [OPTIONS] PROMPT...   Run one headless task
   slowcode repl [OPTIONS]            Start the line-based REPL
+  slowcode update [--check]          Check for or install a newer release
   slowcode feedback SESSION-ID       Write an issue-ready feedback bundle
   slowcode [OPTIONS] [PROMPT...]     Legacy headless form
 
@@ -66,6 +68,7 @@ Commands:
   /execute                 Execute only 可执行 tasks
   /distill <explanation>   Record a Teach-back and produce an understanding-gap report
   /role [navigator|driver] Show or switch the REPL role without losing the session
+  /update                  Check for a newer release, then update after confirmation
 ";
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -20,6 +20,7 @@ slowcode-feedback = { path = "../slowcode-feedback" }
 slowcode-kernel = { workspace = true }
 slowcode-roles = { workspace = true }
 slowcode-tui = { path = "../slowcode-tui" }
+slowcode-update = { path = "../slowcode-update" }
 tokio = { version = "1.53", features = ["macros", "rt", "io-std", "io-util"] }
 tokio-util = "0.7"
 

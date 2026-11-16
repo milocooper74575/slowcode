@@ -23,6 +23,7 @@ slowcode-kernel = { workspace = true }
 slowcode-mcp = { path = "../slowcode-mcp" }
 slowcode-roles = { workspace = true }
 slowcode-skills = { path = "../slowcode-skills" }
+slowcode-update = { path = "../slowcode-update" }
 thiserror = "2.0"
 tokio = { version = "1.53", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"

@@ -2134,6 +2134,7 @@ dependencies = [
  "slowcode-kernel",
  "slowcode-roles",
  "slowcode-tui",
+ "slowcode-update",
  "tokio",
  "tokio-util",
 ]
@@ -2265,6 +2266,7 @@ dependencies = [
  "slowcode-mcp",
  "slowcode-roles",
  "slowcode-skills",
+ "slowcode-update",
  "thiserror",
  "tokio",
  "tokio-util",

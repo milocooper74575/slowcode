@@ -37,6 +37,22 @@ async fn main() -> ExitCode {
                 Err(error) => usage_error(error),
             }
         }
+        "update" => {
+            args.remove(0);
+            match slowcode_cli::update::parse_update_args(args) {
+                Ok(mode) => match slowcode_cli::update::run(mode).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("error: {error}\n\n{}", slowcode_cli::update::UPDATE_USAGE);
+                    ExitCode::from(2)
+                }
+            }
+        }
         "feedback" => {
             args.remove(0);
             match slowcode_cli::feedback::run(args) {
