@@ -377,17 +377,17 @@ impl App {
             app.push(MessageBlock::System(
                 "slowcode TUI. Type a task, or /help for commands.".to_owned(),
             ));
-            let status = credential_status(&app.workspace());
-            if !status.configured() {
-                app.push(MessageBlock::System(format!(
-                    "no DeepSeek API key is configured. Type /login to enter one; it is saved to {} and never printed.",
-                    status.env_path.display()
-                )));
-            }
         } else {
             app.push(MessageBlock::System(format!(
                 "resumed session: {}",
                 app.session_id
+            )));
+        }
+        let status = credential_status(&app.workspace());
+        if !status.configured() {
+            app.push(MessageBlock::System(format!(
+                "no DeepSeek API key is configured. Type /login to enter one; it is saved to {} and never printed.",
+                status.env_path.display()
             )));
         }
         app.context_window = app
