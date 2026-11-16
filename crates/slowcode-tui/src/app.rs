@@ -1599,7 +1599,7 @@ impl App {
             return true;
         }
         self.push(MessageBlock::Error(format!(
-            "no DeepSeek API key is configured. Type /login to enter one; it is saved to {} and never printed.",
+            "cannot start a turn: no DeepSeek API key is configured. Type /login to enter one; it is saved to {} and never printed.",
             status.env_path.display()
         )));
         false
@@ -5761,6 +5761,7 @@ mod tests {
         assert!(app.composer.is_empty());
         let contents = std::fs::read_to_string(workspace.join(".env")).expect(".env");
         assert!(contents.contains("DEEPSEEK_API_KEY=sk-test-secret-123"));
+        assert!(app.history.iter().all(|entry| !entry.contains(secret)));
         assert!(
             !app.messages.iter().any(|message| match message {
                 MessageBlock::System(text)
@@ -5777,6 +5778,33 @@ mod tests {
         app.handle_command(Command::Logout).await;
         let contents = std::fs::read_to_string(workspace.join(".env")).expect(".env");
         assert!(!contents.contains("DEEPSEEK_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_key_keeps_the_entry_open_for_a_retry() {
+        let mut app = test_app().await;
+        let workspace = app.workspace();
+
+        app.handle_command(Command::Login(LoginCommand::Key)).await;
+        app.composer = "two words".to_owned();
+        app.composer_cursor = app.composer.len();
+        app.submit().await;
+
+        assert!(app.pending_login.is_some());
+        assert!(matches!(
+            app.messages.last(),
+            Some(MessageBlock::Error(text)) if text.contains("not saved")
+        ));
+        assert!(!workspace.join(".env").exists());
+
+        app.composer = "sk-retry-works".to_owned();
+        app.composer_cursor = app.composer.len();
+        app.submit().await;
+
+        assert!(app.pending_login.is_none());
+        let contents = std::fs::read_to_string(workspace.join(".env")).expect(".env");
+        assert!(contents.contains("DEEPSEEK_API_KEY=sk-retry-works"));
+        assert!(app.history.iter().all(|entry| !entry.contains("two words")));
     }
 
     #[tokio::test]

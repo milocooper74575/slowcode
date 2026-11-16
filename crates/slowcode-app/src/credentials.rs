@@ -347,6 +347,49 @@ mod tests {
     }
 
     #[test]
+    fn ignores_comments_and_empty_assignments() {
+        let workspace = temp_workspace("parse");
+        fs::write(
+            workspace.join(".env"),
+            "# DEEPSEEK_API_KEY=commented\nDEEPSEEK_API_KEY=\nexport DEEPSEEK_API_KEY = 'sk-quoted'\n",
+        )
+        .expect("seed");
+
+        assert_eq!(
+            workspace_key(&workspace.join(".env")).as_deref(),
+            Some("sk-quoted")
+        );
+        save_api_key(&workspace, "sk-new").expect("save");
+        let contents = fs::read_to_string(workspace.join(".env")).expect("read");
+        assert!(contents.contains("# DEEPSEEK_API_KEY=commented"));
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.starts_with("DEEPSEEK_API_KEY="))
+                .count(),
+            1
+        );
+        assert!(contents.contains("DEEPSEEK_API_KEY=sk-new"));
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn preserves_crlf_lines_while_replacing_the_key() {
+        let workspace = temp_workspace("crlf");
+        fs::write(
+            workspace.join(".env"),
+            "A=1\r\nDEEPSEEK_API_KEY=sk-old\r\nB=2\r\n",
+        )
+        .expect("seed");
+
+        save_api_key(&workspace, "sk-new").expect("save");
+
+        let contents = fs::read_to_string(workspace.join(".env")).expect("read");
+        assert_eq!(contents, "A=1\r\nB=2\r\nDEEPSEEK_API_KEY=sk-new\n");
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
     fn rejects_unusable_keys() {
         let workspace = temp_workspace("invalid");
         assert!(matches!(
