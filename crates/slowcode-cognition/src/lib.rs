@@ -1,0 +1,1912 @@
+//! Plan phases, cognitive task allocation, and plan artifact rendering.
+
+/// The four Plan phases. This milestone runs Explore and Navigate, then pauses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanPhase {
+    Explore,
+    Navigate,
+    Execute,
+    Distill,
+}
+
+impl PlanPhase {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explore => "Explore",
+            Self::Navigate => "Navigate",
+            Self::Execute => "Execute",
+            Self::Distill => "Distill",
+        }
+    }
+}
+
+/// How much of a task the user must own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CognitiveAttribute {
+    Known,
+    SemiKnown,
+    Unknown,
+}
+
+impl CognitiveAttribute {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Known => "已知域",
+            Self::SemiKnown => "半已知域",
+            Self::Unknown => "未知域",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        if value.contains("半已知") {
+            Self::SemiKnown
+        } else if value.contains("未知") {
+            Self::Unknown
+        } else if value.contains("已知") {
+            Self::Known
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Whether a task may enter Execute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionState {
+    Executable,
+    NeedsDecision,
+    NeedsUserImplementation,
+}
+
+impl ExecutionState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Executable => "可执行",
+            Self::NeedsDecision => "待决策",
+            Self::NeedsUserImplementation => "待用户实现",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.contains("可执行") {
+            Some(Self::Executable)
+        } else if value.contains("待决策") {
+            Some(Self::NeedsDecision)
+        } else if value.contains("待用户实现") {
+            Some(Self::NeedsUserImplementation)
+        } else {
+            None
+        }
+    }
+}
+
+/// One row of the cognitive task allocation table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CognitiveTask {
+    pub task: String,
+    pub attribute: CognitiveAttribute,
+    pub basis: String,
+    pub execution_state: Option<ExecutionState>,
+    pub agent_action: String,
+    pub user_role: String,
+    pub minimum_path: String,
+    pub acceptance: String,
+}
+
+/// One semi-known question from the Plan output.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QuestionDraft {
+    pub task: String,
+    pub prompt: String,
+    pub options: Vec<String>,
+    pub recommendation: Option<String>,
+    pub reason: String,
+    pub criteria: String,
+}
+
+pub const QUESTION_COLUMNS: [&str; 6] = ["任务", "问题", "选项", "推荐", "推荐理由", "判定标准"];
+
+pub const REQUIRED_COLUMNS: [&str; 8] = [
+    "任务",
+    "认知属性",
+    "判定依据",
+    "执行状态",
+    "Agent 行为",
+    "用户角色",
+    "最小深度链路",
+    "验收",
+];
+
+pub const PLAN_SYSTEM_PROMPT: &str = "\
+You are slowcode's navigator. Work in read-only mode.
+
+Phase 1 Explore: inspect the available files, generate up to three candidate approaches, and collect evidence. Do not modify files or run shell commands.
+
+Phase 2 Navigate: produce a cognitive task allocation table. Classify every task by cognitive gap, not by task difficulty or size.
+
+- 已知域: you can produce the core logic or decision from the repository, the conversation, and general knowledge, and you can cite repository evidence.
+- 半已知域: a known pattern exists, but a domain trade-off or a user decision is required before implementation. A semi-known task is not executable until that decision is recorded and the task is reclassified.
+- 未知域: the core logic or decision depends on domain knowledge, values, or constraints that are not in the repository or conversation, and only the user can supply them.
+
+When uncertain, classify upward: 未知域 over 半已知域 over 已知域.
+
+Every row must include a 判定依据 cell. For 已知域, cite a file, API, or existing pattern. If you cannot cite one, downgrade the task.
+
+Every row must also include an 执行状态 cell:
+- 可执行: only for 已知域 with no unresolved decision.
+- 待决策: for 半已知域, or for a 已知域 task blocked by an unresolved decision. Name the blocking decision in Agent 行为.
+- 待用户实现: only for 未知域.
+
+Only 已知域 / 可执行 rows may enter Execute. Never mark a 半已知域 row as 可执行. A 半已知域 must first be decided and reclassified. A 已知域 task that depends on an unresolved decision is 待决策 until that decision is recorded.
+
+For every task whose 执行状态 is 待决策 and whose 认知属性 is not 未知域, add one row to a `## 半已知域问题` table with the exact columns:
+任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准
+
+- 任务 must match the task text exactly.
+- 问题 must end with `？`.
+- 选项 uses ` / ` between 2 or 3 options.
+- 推荐 must be one of the options.
+- 判定标准 states what the answer must cover.
+- One question per task in the first round. Do not ask follow-up questions yet.
+
+Unknown-domain questions are generated by the system. Do not add unknown-domain rows to the question table.
+
+For every 未知域 task, do not implement it. Describe the minimum-depth path, the scaffold the agent will provide, the blank core the user must implement, and the acceptance criterion.
+
+For unknown-domain tasks, still describe the minimum-depth path, the scaffold, and the blank core in the task table.
+
+Required output structure:
+1. `## 证据包` with the candidate approaches and evidence.
+2. `## 认知任务分配表` followed by a Markdown table with these exact columns: 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收
+3. `## 半已知域问题` with the question table when any non-unknown task is 待决策. Omit it when there are no such tasks.
+
+Stop after the table and pause. Do not start Execute.";
+
+#[must_use]
+pub fn plan_user_prompt(task: &str) -> String {
+    format!(
+        "任务：{task}\n\n先执行 Explore，再执行 Navigate。输出证据包与认知任务分配表，然后暂停。"
+    )
+}
+
+/// Render a repair prompt: the contract header, one bullet per reason, then
+/// the expected answer shape.
+fn render_repair_prompt(header: &str, footer: &str, reasons: &[String]) -> String {
+    let mut prompt = String::from(header);
+    for reason in reasons {
+        prompt.push_str("- ");
+        prompt.push_str(reason);
+        prompt.push('\n');
+    }
+    prompt.push_str(footer);
+    prompt
+}
+
+#[must_use]
+pub fn repair_prompt(reasons: &[String]) -> String {
+    render_repair_prompt(
+        "Your previous answer does not satisfy the /plan contract. Fix these problems:\n",
+        "\nReturn only the complete corrected answer. It must include `## 证据包`, `## 认知任务分配表` with the exact required columns including 判定依据 and 执行状态, and `## 半已知域问题` with one question for every non-unknown 待决策 task.",
+        reasons,
+    )
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlanValidation {
+    pub reasons: Vec<String>,
+}
+
+impl PlanValidation {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.reasons.is_empty()
+    }
+}
+
+#[must_use]
+pub fn validate_plan_output(output: &str) -> PlanValidation {
+    let mut reasons = Vec::new();
+
+    if !output.contains("证据包") {
+        reasons.push("missing `## 证据包` section".to_owned());
+    }
+
+    if find_header_line(output).is_none() {
+        reasons.push(format!(
+            "missing the cognitive task table header with columns: {}",
+            REQUIRED_COLUMNS.join(" | ")
+        ));
+    } else {
+        let tasks = parse_task_table(output);
+        if tasks.is_empty() {
+            reasons.push("the cognitive task table has no task rows".to_owned());
+        }
+        for task in &tasks {
+            if task.basis.trim().is_empty() || task.basis.trim() == "-" {
+                reasons.push(format!("task `{}` is missing 判定依据", task.task));
+            }
+            let allowed = match task.attribute {
+                CognitiveAttribute::Known => {
+                    &[ExecutionState::Executable, ExecutionState::NeedsDecision][..]
+                }
+                CognitiveAttribute::SemiKnown => &[ExecutionState::NeedsDecision][..],
+                CognitiveAttribute::Unknown => &[ExecutionState::NeedsUserImplementation][..],
+            };
+            match task.execution_state {
+                None => reasons.push(format!(
+                    "task `{}` has an invalid 执行状态; expected one of {}",
+                    task.task,
+                    allowed
+                        .iter()
+                        .map(|state| state.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                Some(state) if !allowed.contains(&state) => reasons.push(format!(
+                    "task `{}` has 执行状态 {} but 认知属性 {} allows only {}",
+                    task.task,
+                    state.as_str(),
+                    task.attribute.as_str(),
+                    allowed
+                        .iter()
+                        .map(|state| state.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                Some(_) => {}
+            }
+        }
+        let questions = parse_question_table(output);
+        reasons.extend(validate_question_table(&tasks, &questions).reasons);
+    }
+
+    PlanValidation { reasons }
+}
+
+/// Parse the optional `## 半已知域问题` table.
+#[must_use]
+pub fn parse_question_table(output: &str) -> Vec<QuestionDraft> {
+    let body = section_body(output, "半已知域问题");
+    let mut lines = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with('|'));
+    let Some(header_line) = lines.next() else {
+        return Vec::new();
+    };
+    let header = table_cells(header_line);
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|cell| cell.trim() == name)
+            .or_else(|| header.iter().position(|cell| cell.contains(name)))
+    };
+    let (
+        Some(task_col),
+        Some(prompt_col),
+        Some(options_col),
+        Some(recommendation_col),
+        Some(reason_col),
+        Some(criteria_col),
+    ) = (
+        column("任务"),
+        column("问题"),
+        column("选项"),
+        column("推荐"),
+        column("推荐理由"),
+        column("判定标准"),
+    )
+    else {
+        return Vec::new();
+    };
+    let maximum = [
+        task_col,
+        prompt_col,
+        options_col,
+        recommendation_col,
+        reason_col,
+        criteria_col,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+
+    let mut questions = Vec::new();
+    for line in lines {
+        let cells = table_cells(line);
+        if cells
+            .iter()
+            .all(|cell| cell.chars().all(|ch| ch == '-' || ch == ':'))
+        {
+            continue;
+        }
+        if cells.len() <= maximum {
+            continue;
+        }
+        let options = cells[options_col]
+            .split(['/', '|', '｜', '、'])
+            .map(str::trim)
+            .filter(|option| !option.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let recommendation = cells[recommendation_col].trim();
+        questions.push(QuestionDraft {
+            task: cells[task_col].clone(),
+            prompt: cells[prompt_col].clone(),
+            options,
+            recommendation: (!recommendation.is_empty()
+                && recommendation != "-"
+                && !recommendation.eq_ignore_ascii_case("none"))
+            .then(|| recommendation.to_owned()),
+            reason: cells[reason_col].clone(),
+            criteria: cells[criteria_col].clone(),
+        });
+    }
+    questions
+}
+
+/// Validate the question table against the task table.
+#[must_use]
+pub fn validate_question_table(
+    tasks: &[CognitiveTask],
+    questions: &[QuestionDraft],
+) -> PlanValidation {
+    let mut reasons = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for question in questions {
+        if !seen.insert(question.task.clone()) {
+            reasons.push(format!(
+                "task `{}` has more than one first-round question",
+                question.task
+            ));
+        }
+        let Some(task) = tasks.iter().find(|task| task.task == question.task) else {
+            reasons.push(format!(
+                "question references unknown task `{}`",
+                question.task
+            ));
+            continue;
+        };
+        if task.attribute == CognitiveAttribute::Unknown {
+            reasons.push(format!(
+                "unknown-domain task `{}` must not have a model question; it is generated by the system",
+                task.task
+            ));
+        }
+        if task.execution_state == Some(ExecutionState::Executable) {
+            reasons.push(format!(
+                "executable task `{}` must not have a question",
+                task.task
+            ));
+        }
+        if question.prompt.trim().is_empty()
+            || !(question.prompt.trim().ends_with('？') || question.prompt.trim().ends_with('?'))
+        {
+            reasons.push(format!(
+                "question for `{}` must end with `？`",
+                question.task
+            ));
+        }
+        if !(2..=3).contains(&question.options.len()) {
+            reasons.push(format!(
+                "question for `{}` must have 2 or 3 options",
+                question.task
+            ));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        for option in &question.options {
+            if !unique.insert(option) {
+                reasons.push(format!(
+                    "question for `{}` repeats option `{option}`",
+                    question.task
+                ));
+            }
+        }
+        if let Some(recommendation) = &question.recommendation
+            && !question.options.contains(recommendation)
+        {
+            reasons.push(format!(
+                "recommendation `{recommendation}` for `{}` is not one of the options",
+                question.task
+            ));
+        }
+        if question.reason.trim().is_empty() || question.reason.trim() == "-" {
+            reasons.push(format!(
+                "question for `{}` is missing 推荐理由",
+                question.task
+            ));
+        }
+        if question.criteria.trim().is_empty() || question.criteria.trim() == "-" {
+            reasons.push(format!(
+                "question for `{}` is missing 判定标准",
+                question.task
+            ));
+        }
+    }
+    for task in tasks {
+        if task.execution_state == Some(ExecutionState::NeedsDecision)
+            && task.attribute != CognitiveAttribute::Unknown
+            && !seen.contains(&task.task)
+        {
+            reasons.push(format!(
+                "task `{}` is 待决策 but has no question",
+                task.task
+            ));
+        }
+    }
+    PlanValidation { reasons }
+}
+
+#[must_use]
+pub fn parse_task_table(output: &str) -> Vec<CognitiveTask> {
+    let Some(header_line) = find_header_line(output) else {
+        return Vec::new();
+    };
+    let header = table_cells(header_line);
+    let column = |name: &str| header.iter().position(|cell| cell.contains(name));
+
+    let (
+        Some(task_col),
+        Some(attribute_col),
+        Some(basis_col),
+        Some(status_col),
+        Some(action_col),
+        Some(role_col),
+        Some(path_col),
+        Some(acceptance_col),
+    ) = (
+        column("任务"),
+        column("认知属性"),
+        column("判定依据"),
+        column("执行状态"),
+        column("Agent 行为"),
+        column("用户角色"),
+        column("最小深度链路"),
+        column("验收"),
+    )
+    else {
+        return Vec::new();
+    };
+
+    let mut rows = Vec::new();
+    let mut after_header = false;
+    for line in output.lines() {
+        if !after_header {
+            if line.trim() == header_line.trim() {
+                after_header = true;
+            }
+            continue;
+        }
+        if !line.trim_start().starts_with('|') {
+            if rows.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let cells = table_cells(line);
+        if cells
+            .iter()
+            .all(|cell| cell.chars().all(|ch| ch == '-' || ch == ':'))
+        {
+            continue;
+        }
+        if cells.len()
+            <= [
+                task_col,
+                attribute_col,
+                basis_col,
+                status_col,
+                action_col,
+                role_col,
+                path_col,
+                acceptance_col,
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+        {
+            continue;
+        }
+        rows.push(CognitiveTask {
+            task: cells[task_col].clone(),
+            attribute: CognitiveAttribute::parse(&cells[attribute_col]),
+            basis: cells[basis_col].clone(),
+            execution_state: ExecutionState::parse(&cells[status_col]),
+            agent_action: cells[action_col].clone(),
+            user_role: cells[role_col].clone(),
+            minimum_path: cells[path_col].clone(),
+            acceptance: cells[acceptance_col].clone(),
+        });
+    }
+    rows
+}
+
+fn section_body<'a>(output: &'a str, heading: &str) -> &'a str {
+    let Some((_, rest)) = output.split_once(heading) else {
+        return "";
+    };
+    let rest = rest.trim_start();
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    rest[..end].trim()
+}
+
+fn find_header_line(output: &str) -> Option<&str> {
+    output.lines().find(|line| {
+        let cells = table_cells(line);
+        !cells.is_empty()
+            && REQUIRED_COLUMNS
+                .iter()
+                .all(|required| cells.iter().any(|cell| cell.contains(required)))
+    })
+}
+
+fn table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return Vec::new();
+    }
+    let inner = trimmed.trim_matches('|');
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut characters = inner.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' && characters.peek() == Some(&'|') {
+            characters.next();
+            current.push('|');
+        } else if character == '|' {
+            cells.push(current.trim().to_owned());
+            current.clear();
+        } else {
+            current.push(character);
+        }
+    }
+    cells.push(current.trim().to_owned());
+    cells
+}
+
+#[must_use]
+pub fn artifact_slug(task: &str) -> String {
+    let mut slug = String::new();
+    for character in task.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if (character.is_whitespace() || character == '-' || character == '_')
+            && !slug.ends_with('-')
+        {
+            slug.push('-');
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "plan".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
+#[must_use]
+pub fn render_artifact(
+    task: &str,
+    model: &str,
+    workspace: &str,
+    created_at_unix: u64,
+    output: &str,
+    validation: &PlanValidation,
+) -> String {
+    let validation_status = if validation.is_valid() {
+        "ok"
+    } else {
+        "failed"
+    };
+    let mut artifact = format!(
+        "---\nkind: plan\ncreated_at_unix: {created_at_unix}\nmodel: {model}\nworkspace: {workspace}\nstatus: paused\nphases: Explore, Navigate\nvalidation: {validation_status}\n---\n\n# Plan: {task}\n\n## Agent output\n\n{output}\n"
+    );
+    if !validation.is_valid() {
+        artifact.push_str("\n## Validation failures\n\n");
+        for reason in &validation.reasons {
+            artifact.push_str("- ");
+            artifact.push_str(reason);
+            artifact.push('\n');
+        }
+    }
+    artifact
+}
+
+pub const DECISION_COLUMNS: [&str; 4] = ["任务", "用户决策", "新认知属性", "新执行状态"];
+pub const SCAFFOLD_COLUMNS: [&str; 4] = ["任务", "文件", "留空位置", "验收命令"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecisionRecord {
+    pub task: String,
+    pub decision: String,
+    pub new_attribute: CognitiveAttribute,
+    pub new_execution_state: Option<ExecutionState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScaffoldEntry {
+    pub task: String,
+    pub file: String,
+    pub blank_core: String,
+    pub acceptance_command: String,
+}
+
+fn allowed_states(attribute: CognitiveAttribute) -> &'static [ExecutionState] {
+    match attribute {
+        CognitiveAttribute::Known => &[ExecutionState::Executable, ExecutionState::NeedsDecision],
+        CognitiveAttribute::SemiKnown => &[ExecutionState::NeedsDecision],
+        CognitiveAttribute::Unknown => &[ExecutionState::NeedsUserImplementation],
+    }
+}
+
+#[must_use]
+pub fn parse_decision_tables(output: &str) -> Vec<DecisionRecord> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut records = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let header = table_cells(lines[index]);
+        if header.is_empty()
+            || !DECISION_COLUMNS
+                .iter()
+                .all(|required| header.iter().any(|cell| cell.contains(required)))
+        {
+            index += 1;
+            continue;
+        }
+        let column = |name: &str| header.iter().position(|cell| cell.contains(name));
+        let (Some(task_col), Some(decision_col), Some(attribute_col), Some(state_col)) = (
+            column("任务"),
+            column("用户决策"),
+            column("新认知属性"),
+            column("新执行状态"),
+        ) else {
+            index += 1;
+            continue;
+        };
+        let max_column = [task_col, decision_col, attribute_col, state_col]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        index += 1;
+        while index < lines.len() {
+            let cells = table_cells(lines[index]);
+            if cells.is_empty() {
+                break;
+            }
+            if cells
+                .iter()
+                .all(|cell| cell.chars().all(|ch| ch == '-' || ch == ':'))
+            {
+                index += 1;
+                continue;
+            }
+            if cells.len() > max_column {
+                records.push(DecisionRecord {
+                    task: cells[task_col].clone(),
+                    decision: cells[decision_col].clone(),
+                    new_attribute: CognitiveAttribute::parse(&cells[attribute_col]),
+                    new_execution_state: ExecutionState::parse(&cells[state_col]),
+                });
+            }
+            index += 1;
+        }
+    }
+    records
+}
+
+#[must_use]
+pub fn validate_decisions(decisions: &[DecisionRecord]) -> PlanValidation {
+    let mut reasons = Vec::new();
+    if decisions.is_empty() {
+        reasons.push("no decision rows were found".to_owned());
+    }
+    for decision in decisions {
+        let allowed = allowed_states(decision.new_attribute);
+        match decision.new_execution_state {
+            None => reasons.push(format!(
+                "decision for `{}` has an invalid 新执行状态",
+                decision.task
+            )),
+            Some(state) if !allowed.contains(&state) => reasons.push(format!(
+                "decision for `{}` sets 新认知属性 {} with 新执行状态 {}; allowed: {}",
+                decision.task,
+                decision.new_attribute.as_str(),
+                state.as_str(),
+                allowed
+                    .iter()
+                    .map(|state| state.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Some(_) => {}
+        }
+    }
+    PlanValidation { reasons }
+}
+
+pub fn apply_decisions(
+    tasks: &[CognitiveTask],
+    decisions: &[DecisionRecord],
+) -> Result<Vec<CognitiveTask>, String> {
+    let mut effective = tasks.to_vec();
+    for decision in decisions {
+        let Some(task) = effective.iter_mut().find(|task| task.task == decision.task) else {
+            return Err(format!(
+                "decision references unknown task: {}",
+                decision.task
+            ));
+        };
+        let Some(state) = decision.new_execution_state else {
+            return Err(format!(
+                "decision for `{}` has an invalid execution state",
+                decision.task
+            ));
+        };
+        task.attribute = decision.new_attribute;
+        task.execution_state = Some(state);
+    }
+    Ok(effective)
+}
+
+fn tasks_in_state(tasks: &[CognitiveTask], state: ExecutionState) -> Vec<CognitiveTask> {
+    tasks
+        .iter()
+        .filter(|task| task.execution_state == Some(state))
+        .cloned()
+        .collect()
+}
+
+#[must_use]
+pub fn executable_tasks(tasks: &[CognitiveTask]) -> Vec<CognitiveTask> {
+    tasks_in_state(tasks, ExecutionState::Executable)
+}
+
+#[must_use]
+pub fn scaffold_tasks(tasks: &[CognitiveTask]) -> Vec<CognitiveTask> {
+    tasks_in_state(tasks, ExecutionState::NeedsUserImplementation)
+}
+
+#[must_use]
+pub fn parse_scaffold_manifest(output: &str) -> Vec<ScaffoldEntry> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let header = table_cells(lines[index]);
+        if header.is_empty()
+            || !SCAFFOLD_COLUMNS
+                .iter()
+                .all(|required| header.iter().any(|cell| cell.contains(required)))
+        {
+            index += 1;
+            continue;
+        }
+        let column = |name: &str| header.iter().position(|cell| cell.contains(name));
+        let (Some(task_col), Some(file_col), Some(blank_col), Some(acceptance_col)) = (
+            column("任务"),
+            column("文件"),
+            column("留空位置"),
+            column("验收命令"),
+        ) else {
+            index += 1;
+            continue;
+        };
+        let max_column = [task_col, file_col, blank_col, acceptance_col]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        index += 1;
+        while index < lines.len() {
+            let cells = table_cells(lines[index]);
+            if cells.is_empty() {
+                break;
+            }
+            if cells
+                .iter()
+                .all(|cell| cell.chars().all(|ch| ch == '-' || ch == ':'))
+            {
+                index += 1;
+                continue;
+            }
+            if cells.len() > max_column {
+                entries.push(ScaffoldEntry {
+                    task: cells[task_col].clone(),
+                    file: cells[file_col].clone(),
+                    blank_core: cells[blank_col].clone(),
+                    acceptance_command: cells[acceptance_col].clone(),
+                });
+            }
+            index += 1;
+        }
+    }
+    entries
+}
+
+#[must_use]
+pub fn append_section(artifact: &str, heading: &str, body: &str) -> String {
+    format!(
+        "{}\n\n## {heading}\n\n{}\n",
+        artifact.trim_end(),
+        body.trim()
+    )
+}
+
+#[must_use]
+pub fn set_artifact_status(artifact: &str, status: &str) -> String {
+    let mut output = String::new();
+    let mut in_frontmatter = false;
+    for (index, line) in artifact.lines().enumerate() {
+        if index == 0 && line == "---" {
+            in_frontmatter = true;
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+        if in_frontmatter && line == "---" {
+            in_frontmatter = false;
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+        if in_frontmatter && line.starts_with("status:") {
+            output.push_str(&format!("status: {status}\n"));
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+#[must_use]
+pub fn render_task_bullets(tasks: &[CognitiveTask]) -> String {
+    tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "- 任务：{}\n  认知属性：{}\n  执行状态：{}\n  判定依据：{}\n  最小深度链路：{}\n  验收：{}",
+                task.task,
+                task.attribute.as_str(),
+                task.execution_state
+                    .map(ExecutionState::as_str)
+                    .unwrap_or("未知"),
+                task.basis,
+                task.minimum_path,
+                task.acceptance
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub const ANSWER_SYSTEM_PROMPT: &str = "\
+You are slowcode's navigator. The plan artifact, the current question, and the user's answer are provided.
+
+First judge whether the answer covers the question's 判定标准. Produce a `## 回答判定` table with exactly these columns:
+问题 | 结论 | 缺口
+
+- 问题 is the question id, for example q-1.
+- 结论 is sufficient or insufficient.
+- 缺口 is empty when sufficient, and a concrete missing item when insufficient.
+
+Only when 结论 is sufficient, also produce a `## 决策记录` table with exactly these columns:
+任务 | 用户决策 | 新认知属性 | 新执行状态
+
+Rules for the decision table:
+- Use the exact task text from the plan.
+- New 认知属性 is 已知域, 半已知域, or 未知域.
+- New 执行状态 is 可执行, 待决策, or 待用户实现.
+- A 半已知域 task becomes 已知域 / 可执行 only if the answer fully resolves the decision and the remaining work is mechanical and evidence-backed.
+- A 已知域 task blocked by a decision becomes 可执行 once the decision is recorded.
+- An 未知域 task becomes 已知域 / 可执行 only if the answer supplies the missing core knowledge. Otherwise keep 待用户实现.
+- Do not change tasks the answer does not touch.
+
+If the answer is insufficient, return only the `## 回答判定` table. Do not change any task.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnswerVerdictKind {
+    Sufficient,
+    Insufficient,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnswerVerdict {
+    pub question: String,
+    pub verdict: AnswerVerdictKind,
+    pub gap: String,
+}
+
+/// Parse the `## 回答判定` table.
+#[must_use]
+pub fn parse_answer_verdict(output: &str) -> Option<AnswerVerdict> {
+    let body = section_body(output, "回答判定");
+    let mut lines = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with('|'));
+    let header_line = lines.next()?;
+    let header = table_cells(header_line);
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|cell| cell.trim() == name)
+            .or_else(|| header.iter().position(|cell| cell.contains(name)))
+    };
+    let (question_col, verdict_col, gap_col) = (column("问题")?, column("结论")?, column("缺口")?);
+    for line in lines {
+        let cells = table_cells(line);
+        if cells.len()
+            <= [question_col, verdict_col, gap_col]
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+        {
+            continue;
+        }
+        let verdict = match cells[verdict_col].trim().to_ascii_lowercase().as_str() {
+            "sufficient" => AnswerVerdictKind::Sufficient,
+            "insufficient" => AnswerVerdictKind::Insufficient,
+            _ => continue,
+        };
+        return Some(AnswerVerdict {
+            question: cells[question_col].trim().to_owned(),
+            verdict,
+            gap: cells[gap_col].trim().to_owned(),
+        });
+    }
+    None
+}
+
+/// Validate the verdict for one question id.
+#[must_use]
+pub fn validate_answer_verdict(output: &str, question_id: &str) -> PlanValidation {
+    let mut reasons = Vec::new();
+    let Some(verdict) = parse_answer_verdict(output) else {
+        return PlanValidation {
+            reasons: vec!["missing a valid `## 回答判定` table".to_owned()],
+        };
+    };
+    let actual = verdict.question.trim().trim_start_matches('#');
+    if actual != question_id {
+        reasons.push(format!(
+            "回答判定 is for `{actual}` but the current question is `{question_id}`"
+        ));
+    }
+    if verdict.verdict == AnswerVerdictKind::Insufficient && verdict.gap.is_empty() {
+        reasons.push("回答判定 is insufficient but 缺口 is empty".to_owned());
+    }
+    PlanValidation { reasons }
+}
+
+#[must_use]
+pub fn question_answer_user_prompt(
+    plan: &str,
+    question_id: &str,
+    prompt: &str,
+    options: &[String],
+    criteria: &str,
+    answer: &str,
+) -> String {
+    format!(
+        "## Plan artifact\n\n{plan}\n\n## Current question\n\nid: {question_id}\nquestion: {prompt}\noptions: {}\ncriteria: {criteria}\n\n## User answer\n\n{answer}",
+        options.join(" / ")
+    )
+}
+
+#[must_use]
+pub fn answer_verdict_repair_prompt(reasons: &[String]) -> String {
+    render_repair_prompt(
+        "Your previous answer does not satisfy the /answer contract. Fix these problems:\n",
+        "\nReturn the corrected response. It must start with a `## 回答判定` table with columns 问题 | 结论 | 缺口. When the verdict is sufficient, also include a valid `## 决策记录` table.",
+        reasons,
+    )
+}
+
+pub const SCAFFOLD_SYSTEM_PROMPT: &str = "\
+You are slowcode's driver. Work inside the workspace. For each task listed, create the minimum-depth scaffold:
+- a source file with the function or type signatures and docstring,
+- a blank core marked TODO(user), exactly once per core file,
+- an acceptance test derived from the task's 验收,
+- no implementation of the core logic.
+
+Use write and edit. Do not run shell. Do not touch tasks that are not listed. Do not modify .scratch/plans, Cargo.toml, or other project or test configuration. Every file you create or modify must appear in the manifest.
+
+Return a `## Scaffold manifest` table with exactly these columns:
+任务 | 文件 | 留空位置 | 验收命令
+
+List one file per row. If a task needs multiple files, use one row per file. Mark the blank core location in 留空位置.";
+
+pub const EXECUTE_SYSTEM_PROMPT: &str = "\
+You are slowcode's driver. Execute only the tasks listed as 可执行. Do not touch 待决策 or 待用户实现 tasks. Keep changes minimal. Run acceptance checks with bash. Do not modify .scratch/plans.
+
+Return a `## Execution report` table with exactly these columns:
+任务 | 结果 | 证据";
+
+pub const FIX_SYSTEM_PROMPT: &str = "\
+You are slowcode's driver in the TestFix phase. The system ran the fixed test contract and gave you the exact failures. Fix only known regressions in the task implementation. Do not modify test files, fixtures, framework files, or test configuration. Do not run the test command; the system owns it.
+
+Classify every listed failure with exactly one kind:
+- known_regression: the implementation is wrong and you can fix it now
+- test_contract_error: the test contract itself is wrong and must be regenerated
+- unknown_gap: the failure exposes a concept or rule missing from the repository and from your knowledge
+- environment: the failure comes from the environment, not from code
+- flaky: the failure did not reproduce or is nondeterministic
+
+Return a `## 失败分类` table with exactly these columns:
+失败 | 分类 | 证据
+
+Use the exact failure names from the run. For unknown_gap, state what concept or constraint is missing and why it cannot be inferred from existing code. Evidence must be concrete, not `-`.";
+
+/// Accepted `/fix` failure kinds.
+pub const FAILURE_KINDS: &[&str] = &[
+    "known_regression",
+    "test_contract_error",
+    "unknown_gap",
+    "environment",
+    "flaky",
+];
+
+/// One row of the `## 失败分类` table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureClassification {
+    pub failure: String,
+    pub kind: String,
+    pub evidence: String,
+}
+
+/// Parse the `## 失败分类` table. Malformed rows are dropped so validation can
+/// report them by name.
+#[must_use]
+pub fn parse_failure_classifications(output: &str) -> Vec<FailureClassification> {
+    let body = section_body(output, "失败分类");
+    let mut lines = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with('|'));
+    let Some(header_line) = lines.next() else {
+        return Vec::new();
+    };
+    let header = table_cells(header_line);
+    let column = |name: &str| header.iter().position(|cell| cell.trim() == name);
+    let (Some(failure_col), Some(kind_col), Some(evidence_col)) =
+        (column("失败"), column("分类"), column("证据"))
+    else {
+        return Vec::new();
+    };
+    let maximum = failure_col.max(kind_col).max(evidence_col);
+    let mut rows = Vec::new();
+    for line in lines {
+        let cells = table_cells(line);
+        if cells.len() <= maximum
+            || cells
+                .iter()
+                .all(|cell| cell.chars().all(|ch| ch == '-' || ch == ':'))
+        {
+            continue;
+        }
+        rows.push(FailureClassification {
+            failure: cells[failure_col].trim().to_owned(),
+            kind: cells[kind_col].trim().to_owned(),
+            evidence: cells[evidence_col].trim().to_owned(),
+        });
+    }
+    rows
+}
+
+/// Validate the classification table against the failures the system ran.
+#[must_use]
+pub fn validate_failure_classifications(
+    output: &str,
+    expected_failures: &[String],
+) -> PlanValidation {
+    let mut reasons = Vec::new();
+    let body = section_body(output, "失败分类");
+    if body.is_empty() {
+        reasons.push("missing `## 失败分类` section".to_owned());
+    }
+    let rows = parse_failure_classifications(output);
+    if rows.is_empty() && !body.is_empty() {
+        reasons.push("`## 失败分类` must be a table with columns 失败 | 分类 | 证据".to_owned());
+    }
+
+    let expected: std::collections::BTreeSet<&str> =
+        expected_failures.iter().map(String::as_str).collect();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for row in &rows {
+        if !expected.contains(row.failure.as_str()) {
+            reasons.push(format!(
+                "classification names unknown failure `{}`",
+                row.failure
+            ));
+        }
+        if !seen.insert(row.failure.as_str()) {
+            reasons.push(format!("failure `{}` is classified twice", row.failure));
+        }
+        if !FAILURE_KINDS.contains(&row.kind.as_str()) {
+            reasons.push(format!(
+                "failure `{}` has unknown kind `{}`",
+                row.failure, row.kind
+            ));
+        }
+        if row.evidence.is_empty() || row.evidence == "-" {
+            reasons.push(format!("failure `{}` is missing evidence", row.failure));
+        }
+        if row.kind == "unknown_gap" && row.evidence.chars().count() < 12 {
+            reasons.push(format!(
+                "unknown_gap for `{}` needs a concrete missing-concept explanation",
+                row.failure
+            ));
+        }
+    }
+    for failure in &expected {
+        if !seen.contains(failure) {
+            reasons.push(format!("failure `{failure}` has no classification"));
+        }
+    }
+    PlanValidation { reasons }
+}
+
+#[must_use]
+pub fn failure_classification_repair_prompt(reasons: &[String]) -> String {
+    render_repair_prompt(
+        "Your previous /fix response does not satisfy the failure-classification contract. Fix these problems:\n",
+        "\nReturn the corrected response. It must contain a `## 失败分类` table with columns 失败 | 分类 | 证据 and one row per failure from the test run. Kinds: known_regression, test_contract_error, unknown_gap, environment, flaky.",
+        reasons,
+    )
+}
+
+#[must_use]
+pub fn fix_user_prompt(artifact: &str, run_evidence: &str) -> String {
+    format!(
+        "## Plan artifact\n\n{artifact}\n\n## Last test run\n\n{run_evidence}\n\nFix the failures you can, then classify every one."
+    )
+}
+
+pub const DISTILL_SYSTEM_PROMPT: &str = "\
+You are slowcode's cognitive auditor. The user explained their implementation. Produce an understanding-gap report:
+- what is clear,
+- what is vague,
+- which boundary cases are unexplained,
+- one follow-up question.
+
+Start the report with `## 理解漏洞报告`, then include these level-3 sections in order, each with non-empty content:
+### 清晰
+### 模糊
+### 未覆盖边界
+### 追问
+
+The 追问 section must contain one concrete question ending with `?` or `？`.
+
+Do not judge the code itself. Return only the report.";
+
+#[must_use]
+pub fn answer_user_prompt(plan: &str, answer: &str) -> String {
+    format!("## Plan artifact\n\n{plan}\n\n## User answer\n\n{answer}")
+}
+
+fn task_list_user_prompt(plan: &str, heading: &str, tasks: &[CognitiveTask]) -> String {
+    format!(
+        "## Plan artifact\n\n{plan}\n\n## {heading}\n\n{}",
+        render_task_bullets(tasks)
+    )
+}
+
+#[must_use]
+pub fn scaffold_user_prompt(plan: &str, tasks: &[CognitiveTask]) -> String {
+    task_list_user_prompt(plan, "Tasks to scaffold", tasks)
+}
+
+#[must_use]
+pub fn execute_user_prompt(plan: &str, tasks: &[CognitiveTask]) -> String {
+    task_list_user_prompt(plan, "Executable tasks", tasks)
+}
+
+#[must_use]
+pub fn distill_user_prompt(plan: &str, explanation: &str) -> String {
+    format!("## Plan artifact\n\n{plan}\n\n## User explanation\n\n{explanation}")
+}
+
+pub const HINT_SYSTEM_PROMPT: &str = "\
+You are slowcode's navigator in hint mode. The user asked for a hint inside an active Plan workflow.
+Stay read-only. Give the smallest useful next step, one clarifying question, or the evidence to inspect.
+Do not write files, run tests, or change the workflow phase. Return only a short hint.";
+
+#[must_use]
+pub fn hint_user_prompt(plan: &str, question: &str) -> String {
+    format!("## Plan artifact\n\n{plan}\n\n## Hint request\n\n{question}")
+}
+
+/// Required heading of a Teach-back report.
+pub const DISTILL_REPORT_HEADING: &str = "## 理解漏洞报告";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DistillValidation {
+    pub reasons: Vec<String>,
+}
+
+impl DistillValidation {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.reasons.is_empty()
+    }
+}
+
+/// Validate the structure of a Teach-back understanding-gap report.
+///
+/// The report must start with [`DISTILL_REPORT_HEADING`] and cover the four
+/// required categories. Both level-3 headings and `- 类别：内容` bullets are
+/// accepted so the validator does not reject a clear report over formatting.
+#[must_use]
+pub fn validate_distill_output(output: &str) -> DistillValidation {
+    let mut reasons = Vec::new();
+    if !output.trim_start().starts_with(DISTILL_REPORT_HEADING) {
+        reasons.push(format!("must start with `{DISTILL_REPORT_HEADING}`"));
+    }
+
+    let sections = [
+        ("清晰", &["清晰"][..]),
+        ("模糊", &["模糊"][..]),
+        ("未覆盖边界", &["未覆盖边界", "未覆盖"][..]),
+        ("追问", &["追问"][..]),
+    ];
+    for (name, aliases) in sections {
+        match section_text(output, aliases) {
+            None => reasons.push(format!("missing `{name}` section")),
+            Some(text) if text.trim().is_empty() => {
+                reasons.push(format!("`{name}` section is empty"));
+            }
+            Some(_) => {}
+        }
+    }
+
+    if let Some(text) = section_text(output, &["追问"])
+        && !text.contains('?')
+        && !text.contains('？')
+    {
+        reasons.push("`追问` section must contain one concrete question".to_owned());
+    }
+
+    DistillValidation { reasons }
+}
+
+/// Return the concrete follow-up question from a Teach-back report.
+///
+/// Callers must validate the report first. The returned text is the body of the
+/// `追问` section without its heading.
+#[must_use]
+pub fn distill_follow_up(output: &str) -> Option<String> {
+    section_text(output, &["追问"]).map(|text| text.trim().to_owned())
+}
+
+#[must_use]
+pub fn distill_repair_prompt(reasons: &[String]) -> String {
+    render_repair_prompt(
+        "Your previous answer does not satisfy the /distill contract. Fix these problems:\n",
+        "\nReturn only the complete corrected report. Start with `## 理解漏洞报告` and include `### 清晰`, `### 模糊`, `### 未覆盖边界`, and `### 追问`, each with non-empty content. The 追问 section must contain one concrete question.",
+        reasons,
+    )
+}
+
+/// Return the content of one category section.
+///
+/// A section is either a Markdown heading containing the label or a bullet
+/// whose text starts with `label:`. Heading content runs until the next
+/// heading.
+fn section_text(output: &str, labels: &[&str]) -> Option<String> {
+    let lines = output.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix('-')
+            .or_else(|| trimmed.strip_prefix('*'))
+        {
+            let rest = rest.trim_start();
+            if let Some(content) = strip_label(rest, labels) {
+                return Some(content.to_owned());
+            }
+        }
+        if trimmed.starts_with('#') && labels.iter().any(|label| trimmed.contains(label)) {
+            let mut content = Vec::new();
+            for next in &lines[index + 1..] {
+                let next = next.trim();
+                if next.starts_with('#') {
+                    break;
+                }
+                if !next.is_empty() {
+                    content.push(next);
+                }
+            }
+            return Some(content.join("\n"));
+        }
+    }
+    None
+}
+
+fn strip_label<'a>(text: &'a str, labels: &[&str]) -> Option<&'a str> {
+    for label in labels {
+        if let Some(rest) = text.strip_prefix(label) {
+            let rest = rest.trim_start();
+            if let Some(content) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('：')) {
+                return Some(content.trim());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cognitive_task(name: &str, state: Option<ExecutionState>) -> CognitiveTask {
+        CognitiveTask {
+            task: name.to_owned(),
+            attribute: CognitiveAttribute::Known,
+            basis: "basis".to_owned(),
+            execution_state: state,
+            agent_action: "implement".to_owned(),
+            user_role: "review".to_owned(),
+            minimum_path: "src/lib.rs".to_owned(),
+            acceptance: "tests pass".to_owned(),
+        }
+    }
+
+    #[test]
+    fn task_filters_cover_empty_and_mixed_states() {
+        assert!(executable_tasks(&[]).is_empty());
+        assert!(scaffold_tasks(&[]).is_empty());
+
+        let tasks = vec![
+            cognitive_task("execute", Some(ExecutionState::Executable)),
+            cognitive_task("decide", Some(ExecutionState::NeedsDecision)),
+            cognitive_task("scaffold", Some(ExecutionState::NeedsUserImplementation)),
+            cognitive_task("unknown", None),
+        ];
+
+        assert_eq!(
+            executable_tasks(&tasks)
+                .iter()
+                .map(|task| task.task.as_str())
+                .collect::<Vec<_>>(),
+            ["execute"]
+        );
+        assert_eq!(
+            scaffold_tasks(&tasks)
+                .iter()
+                .map(|task| task.task.as_str())
+                .collect::<Vec<_>>(),
+            ["scaffold"]
+        );
+    }
+
+    #[test]
+    fn task_list_prompts_share_layout_but_keep_their_headings() {
+        let tasks = vec![cognitive_task("execute", Some(ExecutionState::Executable))];
+
+        let scaffold = scaffold_user_prompt("PLAN", &tasks);
+        let execute = execute_user_prompt("PLAN", &tasks);
+
+        assert!(
+            scaffold.starts_with(
+                "## Plan artifact\n\nPLAN\n\n## Tasks to scaffold\n\n- 任务：execute\n"
+            )
+        );
+        assert!(
+            execute.starts_with(
+                "## Plan artifact\n\nPLAN\n\n## Executable tasks\n\n- 任务：execute\n"
+            )
+        );
+        assert_eq!(
+            execute_user_prompt("PLAN", &[]),
+            "## Plan artifact\n\nPLAN\n\n## Executable tasks\n\n"
+        );
+    }
+
+    const VALID: &str = "\
+## 证据包
+- 路径 A: read the input file.
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs 的 read 工具 | 可执行 | 自主执行 | 审查者 | read -> parse | 打印内容 |
+| 选择缓存策略 | 半已知域 | 仓库有缓存层，但策略未定 | 待决策 | 给出 A/B 与推荐 | 决策者 | 决策后实现 | 用户确认策略 |
+| 设计解析算法 | 未知域 | 仓库没有解析规则，只有用户知道 | 待用户实现 | 搭建脚手架 | 创造者 | parse 核心留空 | 通过示例测试 |
+
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |
+";
+
+    #[test]
+    fn accepts_valid_plan() {
+        let validation = validate_plan_output(VALID);
+        assert!(validation.is_valid(), "{:?}", validation.reasons);
+    }
+
+    #[test]
+    fn rejects_missing_table() {
+        let validation = validate_plan_output("## 证据包\nnothing here");
+        assert!(!validation.is_valid());
+    }
+
+    #[test]
+    fn parses_tasks_and_attributes() {
+        let tasks = parse_task_table(VALID);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].attribute, CognitiveAttribute::Known);
+        assert_eq!(tasks[0].basis, "src/main.rs 的 read 工具");
+        assert_eq!(tasks[0].execution_state, Some(ExecutionState::Executable));
+        assert_eq!(tasks[1].attribute, CognitiveAttribute::SemiKnown);
+        assert_eq!(
+            tasks[1].execution_state,
+            Some(ExecutionState::NeedsDecision)
+        );
+        assert_eq!(tasks[2].attribute, CognitiveAttribute::Unknown);
+        assert_eq!(tasks[2].task, "设计解析算法");
+        assert_eq!(
+            tasks[2].execution_state,
+            Some(ExecutionState::NeedsUserImplementation)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_basis() {
+        let output = VALID.replace("src/main.rs 的 read 工具", "-");
+        let validation = validate_plan_output(&output);
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("判定依据")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn rejects_semi_known_marked_executable() {
+        let output = VALID.replace("| 待决策 |", "| 可执行 |");
+        let validation = validate_plan_output(&output);
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("执行状态")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn accepts_known_blocked_by_decision() {
+        let output = VALID.replace("| 可执行 |", "| 待决策 |").replace(
+            "| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |",
+            "| 读取输入 | 缓存未定？ | A / B | A | 兼容 | 选一个 |\n| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |",
+        );
+        let validation = validate_plan_output(&output);
+        assert!(validation.is_valid(), "{:?}", validation.reasons);
+    }
+
+    #[test]
+    fn rejects_missing_semi_known_questions() {
+        let output = VALID.replace("## 半已知域问题", "## 其他");
+        let validation = validate_plan_output(&output);
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("has no question")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn parses_escaped_pipes_in_cells() {
+        let output = VALID.replace("src/main.rs 的 read 工具", "grep \\|fn \\|function 零命中");
+        let tasks = parse_task_table(&output);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].basis, "grep |fn |function 零命中");
+        assert_eq!(tasks[0].attribute, CognitiveAttribute::Known);
+        assert_eq!(tasks[0].execution_state, Some(ExecutionState::Executable));
+    }
+
+    const DECISIONS: &str = "\
+## 决策记录
+| 任务 | 用户决策 | 新认知属性 | 新执行状态 |
+|---|---|---|---|
+| 选择缓存策略 | 选 A | 已知域 | 可执行 |
+";
+
+    #[test]
+    fn parses_and_applies_decisions() {
+        let decisions = parse_decision_tables(DECISIONS);
+        assert_eq!(decisions.len(), 1);
+        assert!(validate_decisions(&decisions).is_valid());
+
+        let tasks = parse_task_table(VALID);
+        let effective = apply_decisions(&tasks, &decisions).expect("decisions apply");
+        assert_eq!(effective[1].attribute, CognitiveAttribute::Known);
+        assert_eq!(
+            effective[1].execution_state,
+            Some(ExecutionState::Executable)
+        );
+        assert_eq!(executable_tasks(&effective).len(), 2);
+        assert_eq!(scaffold_tasks(&effective).len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_decision_state() {
+        let invalid = DECISIONS.replace("| 可执行 |", "| 待用户实现 |");
+        let decisions = parse_decision_tables(&invalid);
+        assert!(!validate_decisions(&decisions).is_valid());
+    }
+
+    #[test]
+    fn rejects_decision_for_unknown_task() {
+        let invalid = DECISIONS.replace("选择缓存策略", "不存在的任务");
+        let decisions = parse_decision_tables(&invalid);
+        let tasks = parse_task_table(VALID);
+        assert!(apply_decisions(&tasks, &decisions).is_err());
+    }
+
+    #[test]
+    fn parses_scaffold_manifest() {
+        let output = "\
+## Scaffold manifest
+| 任务 | 文件 | 留空位置 | 验收命令 |
+|---|---|---|---|
+| 设计解析算法 | src/parse.rs | parse 核心 | cargo test parse |
+";
+        let entries = parse_scaffold_manifest(output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file, "src/parse.rs");
+        assert_eq!(entries[0].acceptance_command, "cargo test parse");
+    }
+
+    #[test]
+    fn parses_tables_without_outer_pipes() {
+        let output = "\
+## Scaffold manifest
+任务 | 文件 | 留空位置 | 验收命令
+---|---|---
+设计解析算法 | src/parse.rs | parse 核心 | cargo test parse
+";
+        let entries = parse_scaffold_manifest(output);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].task, "设计解析算法");
+        assert_eq!(entries[0].file, "src/parse.rs");
+    }
+
+    #[test]
+    fn slug_is_bounded_and_safe() {
+        assert_eq!(artifact_slug("Add a /plan command"), "add-a-plan-command");
+        assert_eq!(artifact_slug("中文任务"), "plan");
+    }
+
+    const DISTILL_REPORT: &str = "\
+## 理解漏洞报告
+
+### 清晰
+读取层与计数层分离。
+
+### 模糊
+CRLF 的处理。
+
+### 未覆盖边界
+空文件和没有尾随换行的文件。
+
+### 追问
+如果文件没有尾随换行，你的计数规则是什么？
+";
+
+    #[test]
+    fn accepts_structured_distill_report() {
+        let validation = validate_distill_output(DISTILL_REPORT);
+        assert!(validation.is_valid(), "{:?}", validation.reasons);
+    }
+
+    #[test]
+    fn accepts_bullet_style_distill_report() {
+        let output = "\
+## 理解漏洞报告
+- 清晰：读取层与计数层分离。
+- 模糊：CRLF 的处理。
+- 未覆盖：空文件。
+- 追问：没有尾随换行时如何计数？
+";
+        let validation = validate_distill_output(output);
+        assert!(validation.is_valid(), "{:?}", validation.reasons);
+    }
+
+    #[test]
+    fn extracts_the_distill_follow_up_question() {
+        assert_eq!(
+            distill_follow_up(DISTILL_REPORT).as_deref(),
+            Some("如果文件没有尾随换行，你的计数规则是什么？")
+        );
+        let bullet = "\
+## 理解漏洞报告
+- 清晰：读取层与计数层分离。
+- 模糊：CRLF 的处理。
+- 未覆盖：空文件。
+- 追问：没有尾随换行时如何计数？
+";
+        assert_eq!(
+            distill_follow_up(bullet).as_deref(),
+            Some("没有尾随换行时如何计数？")
+        );
+    }
+
+    #[test]
+    fn rejects_distill_report_without_heading() {
+        let output = DISTILL_REPORT.replace("## 理解漏洞报告", "理解漏洞");
+        assert!(!validate_distill_output(&output).is_valid());
+    }
+
+    #[test]
+    fn rejects_distill_report_with_empty_section() {
+        let output = DISTILL_REPORT.replace("CRLF 的处理。", "");
+        let validation = validate_distill_output(&output);
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("模糊")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn rejects_distill_report_without_a_question() {
+        let output = DISTILL_REPORT.replace(
+            "如果文件没有尾随换行，你的计数规则是什么？",
+            "需要确认计数规则。",
+        );
+        let validation = validate_distill_output(&output);
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("追问")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn plan_repair_prompt_lists_every_reason() {
+        let prompt = repair_prompt(&["missing table".to_owned(), "empty evidence".to_owned()]);
+        assert!(prompt.starts_with(
+            "Your previous answer does not satisfy the /plan contract. Fix these problems:\n"
+        ));
+        assert!(prompt.contains("- missing table\n- empty evidence\n"));
+        assert!(prompt.contains("Return only the complete corrected answer."));
+        assert!(prompt.contains("`## 证据包`"));
+    }
+
+    #[test]
+    fn distill_repair_prompt_lists_every_reason() {
+        let prompt = distill_repair_prompt(&["missing section".to_owned()]);
+        assert!(prompt.starts_with(
+            "Your previous answer does not satisfy the /distill contract. Fix these problems:\n"
+        ));
+        assert!(prompt.contains("- missing section\n"));
+        assert!(prompt.contains("Return only the complete corrected report."));
+        assert!(prompt.contains("`## 理解漏洞报告`"));
+    }
+
+    #[test]
+    fn repair_prompts_without_reasons_keep_their_framing() {
+        assert!(repair_prompt(&[]).contains("Return only the complete corrected answer."));
+        assert!(distill_repair_prompt(&[]).contains("Return only the complete corrected report."));
+    }
+
+    fn question_plan(question: &str) -> String {
+        format!(
+            "\
+## 证据包
+- read src/cache.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 选择缓存策略 | 半已知域 | src/cache.rs | 待决策 | 给出选项 | 决策者 | 决策后实现 | 用户确认 |
+
+{question}"
+        )
+    }
+
+    #[test]
+    fn parses_and_validates_a_question_table() {
+        let output = question_plan(
+            "\
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有接口兼容 | 必须二选一并说明兼容性 |
+",
+        );
+        let validation = validate_plan_output(&output);
+        assert!(validation.is_valid(), "{:?}", validation.reasons);
+        let questions = parse_question_table(&output);
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].options, vec!["A", "B"]);
+        assert_eq!(questions[0].recommendation.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn pending_decision_tasks_need_a_question() {
+        let output = question_plan("");
+        let validation = validate_plan_output(&output);
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("has no question")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn unknown_domain_questions_are_system_generated() {
+        let output = "\
+## 证据包
+- none
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 设计解析算法 | 未知域 | 仓库没有解析规则 | 待用户实现 | 搭建脚手架 | 创造者 | parse 核心留空 | 通过测试 |
+
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 设计解析算法 | 谁来写？ | A / B | A | 理由 | 标准 |
+";
+        let validation = validate_plan_output(output);
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("generated by the system")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn parses_sufficient_and_insufficient_verdicts() {
+        let sufficient = "\
+## 回答判定
+| 问题 | 结论 | 缺口 |
+|---|---|---|
+| q-1 | sufficient | |
+";
+        let verdict = parse_answer_verdict(sufficient).expect("verdict parses");
+        assert_eq!(verdict.verdict, AnswerVerdictKind::Sufficient);
+        assert!(validate_answer_verdict(sufficient, "q-1").is_valid());
+
+        let insufficient = "\
+## 回答判定
+| 问题 | 结论 | 缺口 |
+|---|---|---|
+| #q-2 | insufficient | 没有说明兼容性 |
+";
+        let verdict = parse_answer_verdict(insufficient).expect("verdict parses");
+        assert_eq!(verdict.verdict, AnswerVerdictKind::Insufficient);
+        assert!(validate_answer_verdict(insufficient, "q-2").is_valid());
+        assert!(!validate_answer_verdict(insufficient, "q-1").is_valid());
+    }
+
+    #[test]
+    fn insufficient_verdict_needs_a_gap() {
+        let output = "\
+## 回答判定
+| 问题 | 结论 | 缺口 |
+|---|---|---|
+| q-1 | insufficient | |
+";
+        assert!(!validate_answer_verdict(output, "q-1").is_valid());
+    }
+
+    #[test]
+    fn failure_classification_requires_every_failure_once() {
+        let output = "\
+## 失败分类
+| 失败 | 分类 | 证据 |
+|---|---|---|
+| value_is_two | known_regression | 实现返回 1，测试要求 2 |
+| parse_empty | unknown_gap | 仓库没有定义空输入规则，无法从现有代码推断 |
+";
+        let expected = vec!["value_is_two".to_owned(), "parse_empty".to_owned()];
+        assert!(validate_failure_classifications(output, &expected).is_valid());
+        let rows = parse_failure_classifications(output);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "known_regression");
+
+        let missing = "\
+## 失败分类
+| 失败 | 分类 | 证据 |
+|---|---|---|
+| value_is_two | known_regression | 实现返回 1 |
+";
+        let validation = validate_failure_classifications(missing, &expected);
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("parse_empty")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn failure_classification_rejects_unknown_kinds_and_thin_gaps() {
+        let output = "\
+## 失败分类
+| 失败 | 分类 | 证据 |
+|---|---|---|
+| value_is_two | guess | - |
+| parse_empty | unknown_gap | 不知道 |
+";
+        let expected = vec!["value_is_two".to_owned(), "parse_empty".to_owned()];
+        let validation = validate_failure_classifications(output, &expected);
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("unknown kind")),
+            "{:?}",
+            validation.reasons
+        );
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("missing evidence")),
+            "{:?}",
+            validation.reasons
+        );
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("missing-concept")),
+            "{:?}",
+            validation.reasons
+        );
+    }
+
+    #[test]
+    fn plan_phase_names_are_stable() {
+        let phases = [
+            PlanPhase::Explore,
+            PlanPhase::Navigate,
+            PlanPhase::Execute,
+            PlanPhase::Distill,
+        ];
+        assert_eq!(
+            phases.map(PlanPhase::as_str),
+            ["Explore", "Navigate", "Execute", "Distill"]
+        );
+    }
+}

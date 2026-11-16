@@ -1,0 +1,27 @@
+[package]
+name = "slowcode-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Linear CLI for the slowcode agent"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "slowcode"
+path = "src/main.rs"
+
+[dependencies]
+dotenvy = "0.15"
+serde_json = "1.0"
+slowcode-app = { path = "../slowcode-app" }
+slowcode-cognition = { workspace = true }
+slowcode-feedback = { path = "../slowcode-feedback" }
+slowcode-kernel = { workspace = true }
+slowcode-roles = { workspace = true }
+slowcode-tui = { path = "../slowcode-tui" }
+tokio = { version = "1.53", features = ["macros", "rt", "io-std", "io-util"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+futures-util = "0.3"

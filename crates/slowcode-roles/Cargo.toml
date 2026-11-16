@@ -1,0 +1,19 @@
+[package]
+name = "slowcode-roles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Role fibers and static role definitions for slowcode"
+license = "MIT"
+publish = false
+
+[dependencies]
+cordis-core = "0.6"
+slowcode-kernel = { workspace = true }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio-util = "0.7"
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread"] }

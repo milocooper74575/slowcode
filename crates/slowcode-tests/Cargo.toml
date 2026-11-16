@@ -1,0 +1,17 @@
+[package]
+name = "slowcode-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Cross-crate integration tests for slowcode"
+license = "MIT"
+publish = false
+
+[dev-dependencies]
+futures-util = "0.3"
+serde_json = "1.0"
+slowcode-kernel = { workspace = true }
+slowcode-roles = { workspace = true }
+slowcode-skills = { path = "../slowcode-skills" }
+tokio = { version = "1.53", features = ["macros", "rt", "time"] }
+tokio-util = "0.7"

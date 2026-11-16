@@ -1,0 +1,497 @@
+//! Deterministic resident-memory credits shared across model and Session owners.
+
+use std::{
+    fmt, io,
+    mem::{align_of, size_of},
+    ops::Deref,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+/// Product limit shared by one durable attempt and its pending journal data.
+pub(super) const MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Authoritative charged allocation retained by one model-visible surface.
+pub(super) const MAX_RESIDENT_SURFACE_STEADY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Old and candidate surfaces may coexist while one replacement is prepared.
+pub(super) const MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES: usize =
+    2 * MAX_RESIDENT_SURFACE_STEADY_BYTES;
+
+/// Non-surface validation facts such as the latest usage anchor.
+pub(super) const MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The old and candidate non-surface index may coexist during validation.
+pub(super) const MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES: usize =
+    2 * MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES;
+
+/// Complete old-plus-candidate validation-index high-water.
+#[cfg(test)]
+pub(super) const MAX_VALIDATION_INDEX_HIGH_WATER_BYTES: usize = 192 * 1024 * 1024;
+
+// The counter is deliberately conservative and deterministic instead of
+// depending on allocator-specific usable-size APIs. Every non-empty backing
+// allocation pays one fixed header and is rounded to a common heap alignment.
+const HEAP_ALLOCATION_OVERHEAD: usize = 32;
+const HEAP_ALIGNMENT: usize = 16;
+
+#[derive(Clone)]
+pub(super) struct ResidentCreditPool {
+    inner: Arc<ResidentCreditPoolInner>,
+}
+
+struct ResidentCreditPoolInner {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+pub(super) struct ResidentCreditLease {
+    pool: Arc<ResidentCreditPoolInner>,
+    bytes: usize,
+}
+
+impl fmt::Debug for ResidentCreditLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentCreditLease")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResidentCreditLimit {
+    maximum: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ChargedBytesError {
+    Limit(ResidentCreditLimit),
+    Capacity,
+}
+
+impl ResidentCreditLimit {
+    pub(super) fn maximum(self) -> usize {
+        self.maximum
+    }
+}
+
+impl ResidentCreditPool {
+    pub(super) fn for_durable_session() -> Self {
+        Self::with_limit(MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES)
+    }
+
+    pub(super) fn for_surface() -> Self {
+        Self::with_limit(MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES)
+    }
+
+    pub(super) fn for_index_other() -> Self {
+        Self::with_limit(MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(ResidentCreditPoolInner {
+                limit,
+                used: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    pub(super) fn try_acquire(
+        &self,
+        bytes: usize,
+    ) -> Result<ResidentCreditLease, ResidentCreditLimit> {
+        let maximum = self.inner.limit;
+        self.inner
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= maximum)
+            })
+            .map_err(|_| ResidentCreditLimit { maximum })?;
+        Ok(ResidentCreditLease {
+            pool: Arc::clone(&self.inner),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_limit_for_test(limit: usize) -> Self {
+        Self::with_limit(limit)
+    }
+
+    #[cfg(test)]
+    pub(super) fn used_for_test(&self) -> usize {
+        self.inner.used.load(Ordering::Acquire)
+    }
+}
+
+impl ResidentCreditLease {
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(super) fn shares_pool_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pool, &other.pool)
+    }
+
+    #[cfg(test)]
+    pub(super) fn belongs_to(&self, pool: &ResidentCreditPool) -> bool {
+        Arc::ptr_eq(&self.pool, &pool.inner)
+    }
+
+    /// Split already charged ownership without changing the pool total.
+    pub(super) fn split_off(&mut self, bytes: usize) -> Result<Self, ResidentCreditLimit> {
+        if bytes > self.bytes {
+            return Err(ResidentCreditLimit {
+                maximum: self.pool.limit,
+            });
+        }
+        self.bytes -= bytes;
+        Ok(Self {
+            pool: Arc::clone(&self.pool),
+            bytes,
+        })
+    }
+
+    /// Merge two unique leases from the same Session pool.
+    pub(super) fn merge(&mut self, mut other: Self) -> Result<(), ResidentCreditLimit> {
+        if !Arc::ptr_eq(&self.pool, &other.pool) {
+            return Err(ResidentCreditLimit {
+                maximum: self.pool.limit,
+            });
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .ok_or(ResidentCreditLimit {
+                maximum: self.pool.limit,
+            })?;
+        other.bytes = 0;
+        Ok(())
+    }
+}
+
+impl Drop for ResidentCreditLease {
+    fn drop(&mut self) {
+        let previous = self.pool.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes);
+    }
+}
+
+/// One byte buffer whose charged backing moves with its sole owner.
+pub(super) struct ChargedBytes {
+    bytes: Vec<u8>,
+    _lease: ResidentCreditLease,
+}
+
+impl ChargedBytes {
+    #[cfg(test)]
+    pub(super) fn try_new(
+        bytes: Vec<u8>,
+        pool: &ResidentCreditPool,
+    ) -> Result<Self, ResidentCreditLimit> {
+        let charge = byte_buffer_charge(bytes.capacity()).ok_or(ResidentCreditLimit {
+            maximum: pool.inner.limit,
+        })?;
+        let lease = pool.try_acquire(charge)?;
+        Ok(Self {
+            bytes,
+            _lease: lease,
+        })
+    }
+
+    /// Allocate a byte buffer only after its requested backing is charged.
+    pub(super) fn try_with_capacity(
+        capacity: usize,
+        pool: &ResidentCreditPool,
+    ) -> Result<Self, ChargedBytesError> {
+        let requested = byte_buffer_charge(capacity).ok_or(ChargedBytesError::Capacity)?;
+        let mut lease = pool
+            .try_acquire(requested)
+            .map_err(ChargedBytesError::Limit)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| ChargedBytesError::Capacity)?;
+        let actual = byte_buffer_charge(bytes.capacity()).ok_or(ChargedBytesError::Capacity)?;
+        match actual.cmp(&requested) {
+            std::cmp::Ordering::Greater => {
+                let extra = pool
+                    .try_acquire(actual - requested)
+                    .map_err(ChargedBytesError::Limit)?;
+                lease.merge(extra).map_err(ChargedBytesError::Limit)?;
+            }
+            std::cmp::Ordering::Less => {
+                drop(
+                    lease
+                        .split_off(requested - actual)
+                        .map_err(ChargedBytesError::Limit)?,
+                );
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        Ok(Self {
+            bytes,
+            _lease: lease,
+        })
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    #[cfg(test)]
+    pub(super) fn charge(&self) -> usize {
+        self._lease.bytes()
+    }
+
+    #[cfg(test)]
+    pub(super) fn allocation_for_test(&self) -> (*const u8, usize, usize) {
+        (self.bytes.as_ptr(), self.capacity(), self.charge())
+    }
+
+    /// Append only when the existing charged allocation is already large enough.
+    pub(super) fn extend_from_slice_in_place(&mut self, source: &[u8]) -> bool {
+        if self.capacity().saturating_sub(self.len()) < source.len() {
+            return false;
+        }
+        self.bytes.extend_from_slice(source);
+        true
+    }
+
+    pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.bytes.as_mut_slice()
+    }
+
+    pub(super) fn truncate(&mut self, len: usize) {
+        self.bytes.truncate(len);
+    }
+
+    pub(super) fn push_in_place(&mut self, byte: u8) -> bool {
+        if self.len() == self.capacity() {
+            return false;
+        }
+        self.bytes.push(byte);
+        true
+    }
+
+    /// Split physical bytes from their unique charge without changing the
+    /// pool total. The writer flight keeps the lease while the command owns
+    /// the bytes, so cancellation cannot release or duplicate either owner.
+    pub(super) fn into_parts(self) -> (Vec<u8>, ResidentCreditLease) {
+        let Self { bytes, _lease } = self;
+        (bytes, _lease)
+    }
+}
+
+impl io::Write for ChargedBytes {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if !self.extend_from_slice_in_place(buffer) {
+            return Err(io::Error::other("charged byte buffer capacity exceeded"));
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Deref for ChargedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes.as_slice()
+    }
+}
+
+/// Conservative charge for one `Vec<u8>` backing allocation.
+pub(super) fn byte_buffer_charge(capacity: usize) -> Option<usize> {
+    heap_allocation_charge(capacity, 1)
+}
+
+/// Conservative charge for one `String` backing allocation.
+pub(super) fn string_backing_charge(capacity: usize) -> Option<usize> {
+    heap_allocation_charge(capacity, 1)
+}
+
+/// Conservative charge for one `Vec<T>` backing allocation.
+pub(super) fn vec_backing_charge<T>(capacity: usize) -> Option<usize> {
+    if size_of::<T>() == 0 {
+        return Some(0);
+    }
+    let bytes = capacity.checked_mul(size_of::<T>())?;
+    heap_allocation_charge(bytes, align_of::<T>())
+}
+
+/// Conservative charge for one bounded hash-table backing allocation.
+///
+/// `std::collections::HashMap` does not expose its bucket/control allocation.
+/// The Session only uses this helper for tables reserved once to a fixed entry
+/// ceiling. Charging twice the next power-of-two entry count (with a small
+/// minimum) safely covers the load-factor slack plus one control byte per
+/// bucket without depending on allocator-specific usable-size APIs.
+pub(super) fn hash_table_backing_charge<T>(maximum_entries: usize) -> Option<usize> {
+    if maximum_entries == 0 {
+        return Some(0);
+    }
+    let buckets = maximum_entries
+        .checked_next_power_of_two()?
+        .checked_mul(2)?
+        .max(16);
+    let entries = buckets.checked_mul(size_of::<T>())?;
+    let controls = buckets.checked_add(16)?;
+    heap_allocation_charge(
+        entries.checked_add(controls)?,
+        align_of::<T>().max(align_of::<usize>()),
+    )
+}
+
+/// Conservative charge for the allocation that stores one `Arc<T>` inner.
+pub(super) fn arc_inner_charge<T>() -> Option<usize> {
+    let value_offset = round_up(2_usize.checked_mul(size_of::<usize>())?, align_of::<T>())?;
+    let allocation = value_offset.checked_add(size_of::<T>())?;
+    heap_allocation_charge(allocation, align_of::<T>().max(align_of::<usize>()))
+}
+
+/// Deterministic product charge for one allocation.
+///
+/// Stable Rust does not expose an allocator's actual size class. This policy
+/// therefore rounds by at least the common heap alignment and adds one fixed
+/// allowance for allocator metadata. It is deliberately conservative and is
+/// shared by every owner that participates in the 32 MiB Session budget.
+pub(super) fn heap_allocation_charge(size: usize, align: usize) -> Option<usize> {
+    if size == 0 {
+        return Some(0);
+    }
+    let align = align.max(HEAP_ALIGNMENT);
+    let rounded = round_up(size, align)?;
+    rounded.checked_add(HEAP_ALLOCATION_OVERHEAD)
+}
+
+fn round_up(value: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    value
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChargedBytes, MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES,
+        MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES, MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
+        MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES, MAX_RESIDENT_SURFACE_STEADY_BYTES,
+        MAX_VALIDATION_INDEX_HIGH_WATER_BYTES, ResidentCreditPool, arc_inner_charge,
+        byte_buffer_charge, hash_table_backing_charge, string_backing_charge, vec_backing_charge,
+    };
+
+    #[test]
+    fn resident_credit_exact_one_over_and_drop_are_atomic() {
+        let charge = byte_buffer_charge(64).unwrap();
+        assert_eq!(charge, 96);
+        let pool = ResidentCreditPool::with_limit_for_test(charge);
+        let lease = pool.try_acquire(charge).unwrap();
+        assert_eq!(pool.used_for_test(), charge);
+        let Err(error) = pool.try_acquire(1) else {
+            panic!("one byte over the resident limit must fail");
+        };
+        assert_eq!(error.maximum(), charge);
+        assert_eq!(pool.used_for_test(), charge);
+        drop(lease);
+        assert_eq!(pool.used_for_test(), 0);
+
+        let empty = pool.try_acquire(0).unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        drop(empty);
+    }
+
+    #[test]
+    fn byte_buffer_charge_handles_empty_alignment_and_overflow() {
+        assert_eq!(byte_buffer_charge(0), Some(0));
+        assert_eq!(byte_buffer_charge(1), Some(48));
+        assert_eq!(byte_buffer_charge(16), Some(48));
+        assert_eq!(byte_buffer_charge(17), Some(64));
+        assert_eq!(byte_buffer_charge(usize::MAX), None);
+    }
+
+    #[test]
+    fn typed_allocation_charges_use_capacity_and_alignment() {
+        assert_eq!(string_backing_charge(17), Some(64));
+        assert_eq!(vec_backing_charge::<u32>(4), Some(48));
+        assert_eq!(vec_backing_charge::<u32>(5), Some(64));
+        assert_eq!(vec_backing_charge::<()>(usize::MAX), Some(0));
+        assert!(arc_inner_charge::<u64>().is_some_and(|charge| charge >= 48));
+        assert_eq!(vec_backing_charge::<u64>(usize::MAX), None);
+        assert_eq!(hash_table_backing_charge::<(u64, u64)>(0), Some(0));
+        assert!(
+            hash_table_backing_charge::<(u64, u64)>(4_000)
+                .is_some_and(|charge| charge > 4_000 * std::mem::size_of::<(u64, u64)>())
+        );
+        assert_eq!(hash_table_backing_charge::<u64>(usize::MAX), None);
+    }
+
+    #[test]
+    fn surface_limits_are_separate_and_keep_the_frozen_high_water_relation() {
+        assert_eq!(MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_RESIDENT_SURFACE_STEADY_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES, 32 * 1024 * 1024);
+        assert_eq!(
+            MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES,
+            2 * MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES
+        );
+        assert_eq!(
+            MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES,
+            2 * MAX_RESIDENT_SURFACE_STEADY_BYTES
+        );
+        assert_eq!(
+            MAX_VALIDATION_INDEX_HIGH_WATER_BYTES,
+            MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES + 64 * 1024 * 1024
+        );
+
+        let attempt = ResidentCreditPool::for_durable_session();
+        let surface = ResidentCreditPool::for_surface();
+        let index_other = ResidentCreditPool::for_index_other();
+        let attempt_lease = attempt.try_acquire(1).unwrap();
+        let surface_lease = surface.try_acquire(1).unwrap();
+        let index_other_lease = index_other.try_acquire(1).unwrap();
+        assert!(attempt_lease.belongs_to(&attempt));
+        assert!(!attempt_lease.belongs_to(&surface));
+        assert!(surface_lease.belongs_to(&surface));
+        assert!(!surface_lease.belongs_to(&attempt));
+        assert!(index_other_lease.belongs_to(&index_other));
+        assert!(!index_other_lease.belongs_to(&attempt));
+    }
+
+    #[test]
+    fn resident_credit_split_merge_and_charged_capacity_preserve_the_total() {
+        let pool = ResidentCreditPool::with_limit_for_test(1024);
+        let mut whole = pool.try_acquire(512).unwrap();
+        let part = whole.split_off(128).unwrap();
+        assert_eq!(whole.bytes(), 384);
+        assert_eq!(part.bytes(), 128);
+        assert_eq!(pool.used_for_test(), 512);
+        whole.merge(part).unwrap();
+        assert_eq!(whole.bytes(), 512);
+        assert_eq!(pool.used_for_test(), 512);
+        drop(whole);
+        assert_eq!(pool.used_for_test(), 0);
+
+        let mut bytes = ChargedBytes::try_with_capacity(17, &pool).unwrap();
+        assert_eq!(
+            bytes.charge(),
+            byte_buffer_charge(bytes.capacity()).unwrap()
+        );
+        assert!(bytes.extend_from_slice_in_place(b"12345678901234567"));
+        assert!(!bytes.extend_from_slice_in_place(b"x"));
+        drop(bytes);
+        assert_eq!(pool.used_for_test(), 0);
+    }
+}

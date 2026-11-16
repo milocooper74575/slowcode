@@ -1,0 +1,30 @@
+# Rust build output
+/excerise/target/
+**/target/
+
+# LLVM coverage/profiling artifacts that can land in a crate directory
+*.profraw
+
+# macOS
+.DS_Store
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Private working material. These paths stay local and are never published.
+/docs/
+/.scratch/
+/.jcode/
+/excerise/
+/HANDOFF.md
+/skills-lock.json
+/feedback/
+
+# Local skill roots and lock files created while using slowcode on itself.
+/.slowcode/
+/.agents/
+
+# Quality-gate snapshots written by `ub` (ub-tools repo), never source.
+.metrics/

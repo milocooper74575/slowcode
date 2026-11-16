@@ -1,0 +1,6566 @@
+//! Bounded, cancellable Agent Loop joining sessions, providers, and tools.
+
+mod approval;
+mod assembler;
+mod compaction;
+mod error;
+mod job_notice;
+#[cfg(test)]
+mod model_selection_tests;
+#[cfg(test)]
+mod permission_preset_tests;
+#[cfg(test)]
+mod phase6_tests;
+#[cfg(test)]
+mod phase7_tests;
+mod repeat_tool_reminder;
+mod retry;
+#[cfg(test)]
+mod session_export_tests;
+#[cfg(test)]
+mod session_fork_tests;
+mod session_title;
+mod tool;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
+
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    entropy::EntropySource,
+    goal::{GoalWrapup, PreparedGoalMutation},
+    model::{
+        CallId, ContentBlock, ContentBlockKind, FinishReasonKind, JsonValue, LlmCallConfig,
+        LlmFailure, Message, MessageRole, MessageSource, MessageSourceKind, ReasoningEffortId,
+        StreamChunkKind, ToolSchema,
+    },
+    plan_mode::{PlanModeRuntime, PreparedPlanModeMutation},
+    provider::{
+        ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
+        ProviderRequest, ProviderRequestDraft, ProviderRequestError, RetryMode,
+    },
+    session::{
+        AppendError, AppendReceipt, ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome,
+        ApprovalRequestId, AttemptDisposition, AttemptResidentGuard, AttemptToken, BarrierError,
+        ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
+        LlmRetryStartedEvent, NewEvent, PROVIDER_TITLE_MAX_BYTES, PermissionPreset,
+        PreparedAttempt, RequestContext, RequestHeaderReason, RetryId, RetryNumber, Session,
+        SessionForkError, SessionForker, SessionId, SessionRawExportError, SessionReadError,
+        SessionReservation, StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure,
+        ToolResultPrunePassCause, TurnEndCancelCause, TurnEndReason, TurnId, normalize_title,
+    },
+    skill_roots::SkillRoots,
+    skills::{SkillRuntime, SkillRuntimeError},
+    time_context::TimeContextRuntime,
+    workspace_instructions::{WorkspaceInstructionError, WorkspaceInstructionRuntime},
+};
+
+pub(crate) use approval::{
+    ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPreviewKind, CanonicalPatchApproval,
+    ExactShellGrantIdentity,
+};
+pub use approval::{
+    ApprovalFuture, ApprovalPrompt, ApprovalPromptError, ApprovalProvider, ApprovalProviderError,
+    ApprovalRequest, FileChangePolicy, MAX_APPROVAL_PREVIEW_BYTES, MAX_APPROVAL_REASON_BYTES,
+    NoApprovalProvider, PluginPolicy, ShellPolicy,
+};
+pub use error::{
+    AgentBuildError, AgentLoopError, AgentReleaseError, AgentRuntimeError, AgentShutdownError,
+};
+pub(crate) use job_notice::{BackgroundJobNotice, JobNoticeInbox};
+pub(crate) use tool::GoalToolCaller;
+pub(crate) use tool::{
+    ActionContract, ActionDeclineReason, ToolActionControl, ToolActionDeclineFn, ToolActionOutcome,
+    ToolActionRunFn, ToolActionSetupControl, ToolActionSetupOutcome, ToolActionTurnStop,
+    ToolDispatchBinding,
+};
+pub use tool::{
+    MutationDeclineReason, NoTools, PreparedToolAction, PreparedToolActionSetup,
+    PreparedToolMutation, ToolClaimProfile, ToolCommitDisposition, ToolCommitFn, ToolCommitOutcome,
+    ToolDeclineFn, ToolExecutionFuture, ToolExecutionMode, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture,
+    ToolShutdownFuture,
+};
+
+use assembler::{AssembledAssistant, without_tool_calls};
+use compaction::{
+    CompactionOutcome, CompactionScope, compact_once, pressure_reached, retained_token_target,
+};
+use job_notice::{PendingJobNotice, messages_for_notices};
+use repeat_tool_reminder::RepeatToolReminder;
+use retry::{RetryDecision, decide, policy_key};
+use session_title::SessionTitleRuntime;
+
+pub const MAX_AGENT_STEPS_PER_TURN: usize = 64;
+pub const MAX_AGENT_ATTEMPTS_PER_TURN: usize = 64;
+pub const MAX_AGENT_RETRIES_PER_STEP: usize = 8;
+pub const MAX_AGENT_TOOL_CALLS_PER_STEP: usize = 64;
+pub const MAX_AGENT_TOOL_CALLS_PER_TURN: usize = 256;
+/// Maximum in-flight calls allowed for an explicitly parallel-safe group.
+pub const MAX_AGENT_PARALLEL_TOOL_CALLS: usize = MAX_AGENT_TOOL_CALLS_PER_STEP;
+pub const MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST: u64 = 1_000_000;
+pub const MAX_AGENT_REPORTED_OUTPUT_TOKENS: u64 = 4_000_000;
+pub const MAX_AGENT_TURN_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+pub const MAX_AGENT_TOOL_DURATION: Duration = Duration::from_secs(5 * 60);
+pub const MAX_AGENT_ACTION_PREPARATION_DURATION: Duration = Duration::from_secs(5);
+/// Extra time given to an already-started tool to observe cancellation and
+/// release its own resources. This is separate from the normal tool timeout.
+pub const MAX_AGENT_TOOL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+pub const MAX_AGENT_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
+pub const MAX_AGENT_TOOL_RESULT_BYTES: usize = 256 * 1024;
+/// Maximum compact event size promised by a sealed foreground action.
+pub const MAX_AGENT_ACTION_RESULT_EVENT_BYTES: usize = 128 * 1024;
+/// Session-event capacity protected before an irreversible mutation starts.
+pub const MAX_AGENT_COMMITTED_TOOL_RESULT_EVENT_BYTES: usize = 512 * 1024;
+const MAX_AGENT_GOAL_RESULT_EVENT_BYTES: usize = 16 * 1024;
+pub const MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_AGENT_FIXED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const AGENT_READY_WORK_BUDGET: usize = 32;
+
+/// Configurable limits that also remain below fixed process safety ceilings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentLimits {
+    max_steps_per_turn: usize,
+    max_attempts_per_turn: usize,
+    max_retries_per_step: usize,
+    max_tool_calls_per_step: usize,
+    max_tool_calls_per_turn: usize,
+    max_parallel_tool_calls: usize,
+    max_output_tokens_per_request: u64,
+    max_reported_output_tokens_per_turn: u64,
+    turn_duration: Duration,
+    tool_duration: Duration,
+    max_tool_argument_bytes: usize,
+    max_tool_result_bytes: usize,
+    max_tool_results_per_turn_bytes: usize,
+}
+
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            max_steps_per_turn: 16,
+            max_attempts_per_turn: 24,
+            max_retries_per_step: 8,
+            max_tool_calls_per_step: 16,
+            max_tool_calls_per_turn: 64,
+            max_parallel_tool_calls: 10,
+            max_output_tokens_per_request: MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST,
+            max_reported_output_tokens_per_turn: 1_000_000,
+            turn_duration: Duration::from_secs(30 * 60),
+            tool_duration: Duration::from_secs(30),
+            max_tool_argument_bytes: MAX_AGENT_TOOL_ARGUMENT_BYTES,
+            max_tool_result_bytes: MAX_AGENT_TOOL_RESULT_BYTES,
+            max_tool_results_per_turn_bytes: MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES,
+        }
+    }
+}
+
+impl AgentLimits {
+    pub fn with_max_steps_per_turn(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit("max_steps_per_turn", value, 1, MAX_AGENT_STEPS_PER_TURN)?;
+        self.max_steps_per_turn = value;
+        Ok(self)
+    }
+
+    pub fn with_max_attempts_per_turn(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_attempts_per_turn",
+            value,
+            1,
+            MAX_AGENT_ATTEMPTS_PER_TURN,
+        )?;
+        self.max_attempts_per_turn = value;
+        Ok(self)
+    }
+
+    pub fn with_max_retries_per_step(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit("max_retries_per_step", value, 0, MAX_AGENT_RETRIES_PER_STEP)?;
+        self.max_retries_per_step = value;
+        Ok(self)
+    }
+
+    pub fn with_max_tool_calls_per_step(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_tool_calls_per_step",
+            value,
+            0,
+            MAX_AGENT_TOOL_CALLS_PER_STEP,
+        )?;
+        self.max_tool_calls_per_step = value;
+        Ok(self)
+    }
+
+    pub fn with_max_tool_calls_per_turn(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_tool_calls_per_turn",
+            value,
+            0,
+            MAX_AGENT_TOOL_CALLS_PER_TURN,
+        )?;
+        self.max_tool_calls_per_turn = value;
+        Ok(self)
+    }
+
+    pub fn with_max_parallel_tool_calls(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_parallel_tool_calls",
+            value,
+            1,
+            MAX_AGENT_PARALLEL_TOOL_CALLS,
+        )?;
+        self.max_parallel_tool_calls = value;
+        Ok(self)
+    }
+
+    pub fn with_max_reported_output_tokens_per_turn(
+        mut self,
+        value: u64,
+    ) -> Result<Self, AgentBuildError> {
+        validate_u64_limit(
+            "max_reported_output_tokens_per_turn",
+            value,
+            1,
+            MAX_AGENT_REPORTED_OUTPUT_TOKENS,
+        )?;
+        self.max_reported_output_tokens_per_turn = value;
+        Ok(self)
+    }
+
+    pub fn with_max_output_tokens_per_request(
+        mut self,
+        value: u64,
+    ) -> Result<Self, AgentBuildError> {
+        validate_u64_limit(
+            "max_output_tokens_per_request",
+            value,
+            1,
+            MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST,
+        )?;
+        self.max_output_tokens_per_request = value;
+        Ok(self)
+    }
+
+    pub fn with_turn_duration(mut self, value: Duration) -> Result<Self, AgentBuildError> {
+        validate_duration("turn_duration", value, MAX_AGENT_TURN_DURATION)?;
+        self.turn_duration = value;
+        Ok(self)
+    }
+
+    pub fn with_tool_duration(mut self, value: Duration) -> Result<Self, AgentBuildError> {
+        validate_duration("tool_duration", value, MAX_AGENT_TOOL_DURATION)?;
+        self.tool_duration = value;
+        Ok(self)
+    }
+
+    pub fn with_max_tool_argument_bytes(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_tool_argument_bytes",
+            value,
+            1,
+            MAX_AGENT_TOOL_ARGUMENT_BYTES,
+        )?;
+        self.max_tool_argument_bytes = value;
+        Ok(self)
+    }
+
+    pub fn with_max_tool_result_bytes(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_tool_result_bytes",
+            value,
+            1,
+            MAX_AGENT_TOOL_RESULT_BYTES,
+        )?;
+        self.max_tool_result_bytes = value;
+        Ok(self)
+    }
+
+    pub fn with_max_tool_results_per_turn_bytes(
+        mut self,
+        value: usize,
+    ) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_tool_results_per_turn_bytes",
+            value,
+            1,
+            MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES,
+        )?;
+        self.max_tool_results_per_turn_bytes = value;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn max_steps_per_turn(&self) -> usize {
+        self.max_steps_per_turn
+    }
+
+    #[must_use]
+    pub fn max_attempts_per_turn(&self) -> usize {
+        self.max_attempts_per_turn
+    }
+
+    #[must_use]
+    pub fn max_retries_per_step(&self) -> usize {
+        self.max_retries_per_step
+    }
+
+    #[must_use]
+    pub fn max_tool_calls_per_step(&self) -> usize {
+        self.max_tool_calls_per_step
+    }
+
+    #[must_use]
+    pub fn max_tool_calls_per_turn(&self) -> usize {
+        self.max_tool_calls_per_turn
+    }
+
+    #[must_use]
+    pub fn max_parallel_tool_calls(&self) -> usize {
+        self.max_parallel_tool_calls
+    }
+
+    #[must_use]
+    pub fn max_reported_output_tokens_per_turn(&self) -> u64 {
+        self.max_reported_output_tokens_per_turn
+    }
+
+    #[must_use]
+    pub fn max_output_tokens_per_request(&self) -> u64 {
+        self.max_output_tokens_per_request
+    }
+
+    #[must_use]
+    pub fn turn_duration(&self) -> Duration {
+        self.turn_duration
+    }
+
+    #[must_use]
+    pub fn tool_duration(&self) -> Duration {
+        self.tool_duration
+    }
+}
+
+fn validate_usize_limit(
+    name: &'static str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), AgentBuildError> {
+    if !(minimum..=maximum).contains(&value) {
+        return Err(AgentBuildError::InvalidLimit {
+            name,
+            minimum: minimum as u64,
+            maximum: maximum as u64,
+            actual: value as u64,
+        });
+    }
+    Ok(())
+}
+
+fn validate_u64_limit(
+    name: &'static str,
+    value: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<(), AgentBuildError> {
+    if !(minimum..=maximum).contains(&value) {
+        return Err(AgentBuildError::InvalidLimit {
+            name,
+            minimum,
+            maximum,
+            actual: value,
+        });
+    }
+    Ok(())
+}
+
+fn validate_duration(
+    name: &'static str,
+    value: Duration,
+    maximum: Duration,
+) -> Result<(), AgentBuildError> {
+    if value.is_zero() || value > maximum {
+        return Err(AgentBuildError::InvalidLimit {
+            name,
+            minimum: 1,
+            maximum: maximum.as_millis().min(u128::from(u64::MAX)) as u64,
+            actual: value.as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+    }
+    Ok(())
+}
+
+/// Immutable request and safety configuration shared by every turn.
+#[derive(Clone)]
+pub struct AgentLoopConfig {
+    call: LlmCallConfig,
+    system: Option<String>,
+    plan_mode: Option<PlanModeRuntime>,
+    plan_policy: Option<String>,
+    tools: Vec<ToolSchema>,
+    limits: AgentLimits,
+    file_change_policy: FileChangePolicy,
+    shell_policy: ShellPolicy,
+    plugin_policy: PluginPolicy,
+    approval_provider: Arc<dyn ApprovalProvider>,
+}
+
+impl std::fmt::Debug for AgentLoopConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentLoopConfig")
+            .field("provider", &self.call.provider())
+            .field("model", &self.call.model())
+            .field("system_bytes", &self.system.as_ref().map_or(0, String::len))
+            .field(
+                "plan_policy_bytes",
+                &self.plan_policy.as_ref().map_or(0, String::len),
+            )
+            .field("tool_count", &self.tools.len())
+            .field("limits", &self.limits)
+            .field("file_change_policy", &self.file_change_policy)
+            .field("shell_policy", &self.shell_policy)
+            .field("plugin_policy", &self.plugin_policy)
+            .field("approval_provider_configured", &true)
+            .finish()
+    }
+}
+
+impl AgentLoopConfig {
+    #[must_use]
+    pub fn new(call: LlmCallConfig) -> Self {
+        Self {
+            call,
+            system: None,
+            plan_mode: None,
+            plan_policy: None,
+            tools: Vec::new(),
+            limits: AgentLimits::default(),
+            file_change_policy: FileChangePolicy::Ask,
+            shell_policy: ShellPolicy::Ask,
+            plugin_policy: PluginPolicy::Ask,
+            approval_provider: Arc::new(NoApprovalProvider),
+        }
+    }
+
+    pub fn with_system(mut self, system: impl Into<String>) -> Result<Self, AgentBuildError> {
+        let system = system.into();
+        self.system = (!system.is_empty()).then_some(system);
+        self.validate_fixed_request_size()?;
+        Ok(self)
+    }
+
+    pub fn with_tools(mut self, tools: Vec<ToolSchema>) -> Result<Self, AgentBuildError> {
+        if tools.len() > MAX_AGENT_TOOL_CALLS_PER_TURN {
+            return Err(AgentBuildError::TooManyTools {
+                maximum: MAX_AGENT_TOOL_CALLS_PER_TURN,
+                actual: tools.len(),
+            });
+        }
+        let mut names = BTreeSet::new();
+        if tools.iter().any(|tool| {
+            tool.name().is_empty()
+                || tool.name().len() > 256
+                || tool.name().chars().any(char::is_control)
+                || !names.insert(tool.name())
+        }) {
+            return Err(AgentBuildError::InvalidToolNames);
+        }
+        self.tools = tools;
+        self.validate_fixed_request_size()?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_plan_mode(
+        mut self,
+        runtime: PlanModeRuntime,
+        policy: impl Into<String>,
+    ) -> Result<Self, AgentBuildError> {
+        let policy = policy.into();
+        if policy.trim().is_empty() {
+            return Err(AgentBuildError::InvalidSystemPrompt);
+        }
+        self.plan_mode = Some(runtime);
+        self.plan_policy = Some(policy);
+        self.validate_fixed_request_size()?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_limits(mut self, limits: AgentLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    #[must_use]
+    pub fn with_file_change_approval(
+        mut self,
+        policy: FileChangePolicy,
+        provider: Arc<dyn ApprovalProvider>,
+    ) -> Self {
+        self.file_change_policy = policy;
+        self.approval_provider = provider;
+        self
+    }
+
+    #[must_use]
+    pub fn with_approval_provider(mut self, provider: Arc<dyn ApprovalProvider>) -> Self {
+        self.approval_provider = provider;
+        self
+    }
+
+    #[must_use]
+    pub fn with_file_change_policy(mut self, policy: FileChangePolicy) -> Self {
+        self.file_change_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_shell_policy(mut self, policy: ShellPolicy) -> Self {
+        self.shell_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugin_policy(mut self, policy: PluginPolicy) -> Self {
+        self.plugin_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn file_change_policy(&self) -> FileChangePolicy {
+        self.file_change_policy
+    }
+
+    #[must_use]
+    pub fn shell_policy(&self) -> ShellPolicy {
+        self.shell_policy
+    }
+
+    #[must_use]
+    pub fn plugin_policy(&self) -> PluginPolicy {
+        self.plugin_policy
+    }
+
+    #[must_use]
+    pub fn call(&self) -> &LlmCallConfig {
+        &self.call
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> &AgentLimits {
+        &self.limits
+    }
+
+    fn validate_fixed_request_size(&self) -> Result<(), AgentBuildError> {
+        let actual = self
+            .call
+            .raw()
+            .encoded_len()
+            .checked_add(self.system.as_ref().map_or(0, String::len))
+            .and_then(|total| {
+                total.checked_add(
+                    self.plan_policy
+                        .as_ref()
+                        .map_or(0, |policy| policy.len() + 2),
+                )
+            })
+            .and_then(|total| {
+                self.tools.iter().try_fold(total, |total, tool| {
+                    total.checked_add(tool.raw().encoded_len())
+                })
+            })
+            .unwrap_or(usize::MAX);
+        if actual > MAX_AGENT_FIXED_REQUEST_BYTES {
+            return Err(AgentBuildError::FixedRequestTooLarge {
+                maximum: MAX_AGENT_FIXED_REQUEST_BYTES,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn effective_system(&self) -> Result<Option<String>, ()> {
+        let active = self
+            .plan_mode
+            .as_ref()
+            .map(PlanModeRuntime::active)
+            .transpose()
+            .map_err(|_| ())?
+            .unwrap_or(false);
+        let Some(policy) = self.plan_policy.as_deref().filter(|_| active) else {
+            return Ok(self.system.clone());
+        };
+        let base = self.system.as_deref().unwrap_or_default();
+        let mut system = String::new();
+        system
+            .try_reserve_exact(base.len().saturating_add(policy.len()).saturating_add(2))
+            .map_err(|_| ())?;
+        if !base.is_empty() {
+            system.push_str(base);
+            system.push_str("\n\n");
+        }
+        system.push_str(policy);
+        Ok(Some(system))
+    }
+}
+
+/// Whether one submitted batch enters the loop or is rejected before a step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnProposal {
+    Enter(Vec<Message>),
+    Reject,
+}
+
+/// Kind prefix used by an injectable opaque-ID source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentIdKind {
+    Message,
+    Retry,
+    Approval,
+}
+
+impl AgentIdKind {
+    #[must_use]
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Retry => "retry",
+            Self::Approval => "approval",
+        }
+    }
+}
+
+/// Small trusted nondeterministic boundary used only for opaque IDs and retry jitter.
+///
+/// Both synchronous methods must return promptly and must not start detached
+/// work. Generated IDs are written to the session, so implementations must not
+/// include credentials or other unauthorized data.
+pub trait AgentRuntime: Send + Sync {
+    fn next_id(&self, kind: AgentIdKind) -> Result<String, AgentRuntimeError>;
+    fn sample_unit(&self) -> Result<f64, AgentRuntimeError>;
+}
+
+#[derive(Clone, Copy)]
+pub struct SystemAgentRuntime {
+    entropy: EntropySource,
+}
+
+impl Default for SystemAgentRuntime {
+    fn default() -> Self {
+        Self {
+            entropy: EntropySource::system(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SystemAgentRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SystemAgentRuntime").finish()
+    }
+}
+
+impl SystemAgentRuntime {
+    #[cfg(test)]
+    fn with_entropy_for_test(entropy: EntropySource) -> Self {
+        Self { entropy }
+    }
+}
+
+impl AgentRuntime for SystemAgentRuntime {
+    fn next_id(&self, kind: AgentIdKind) -> Result<String, AgentRuntimeError> {
+        let id = self
+            .entropy
+            .uuid_v4()
+            .map_err(|_| AgentRuntimeError::EntropyUnavailable)?;
+        Ok(format!("{}-{id}", kind.prefix()))
+    }
+
+    fn sample_unit(&self) -> Result<f64, AgentRuntimeError> {
+        let value = self
+            .entropy
+            .random_u128()
+            .map_err(|_| AgentRuntimeError::EntropyUnavailable)?;
+        Ok(value as f64 / u128::MAX as f64)
+    }
+}
+
+/// Counters and the exact reason committed by a finished turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnOutcome {
+    turn: TurnId,
+    turn_end_seq: EventSeq,
+    reason: TurnEndReason,
+    final_message: Option<Message>,
+    steps: usize,
+    attempts: usize,
+    retries: usize,
+    tool_calls: usize,
+    reported_output_tokens: u64,
+}
+
+impl TurnOutcome {
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(
+        turn: TurnId,
+        turn_end_seq: EventSeq,
+        tool_calls: usize,
+    ) -> Self {
+        Self {
+            turn,
+            turn_end_seq,
+            reason: TurnEndReason::Completed,
+            final_message: None,
+            steps: 0,
+            attempts: 0,
+            retries: 0,
+            tool_calls,
+            reported_output_tokens: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocked_for_test(turn: TurnId, turn_end_seq: EventSeq) -> Self {
+        Self {
+            turn,
+            turn_end_seq,
+            reason: TurnEndReason::Blocked,
+            final_message: None,
+            steps: 0,
+            attempts: 0,
+            retries: 0,
+            tool_calls: 0,
+            reported_output_tokens: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn turn(&self) -> TurnId {
+        self.turn
+    }
+
+    /// Sequence of the durable `turn/end` that closed this outcome.
+    #[must_use]
+    pub fn turn_end_seq(&self) -> EventSeq {
+        self.turn_end_seq
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &TurnEndReason {
+        &self.reason
+    }
+
+    /// Latest assistant message in this turn that contains non-empty text.
+    ///
+    /// The message is a shallow immutable handle, so callers do not need to
+    /// rescan or retain the complete session history to render final output.
+    #[must_use]
+    pub fn final_message(&self) -> Option<&Message> {
+        self.final_message.as_ref()
+    }
+
+    #[must_use]
+    pub fn steps(&self) -> usize {
+        self.steps
+    }
+
+    #[must_use]
+    pub fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    #[must_use]
+    pub fn retries(&self) -> usize {
+        self.retries
+    }
+
+    #[must_use]
+    pub fn tool_calls(&self) -> usize {
+        self.tool_calls
+    }
+
+    #[must_use]
+    pub fn reported_output_tokens(&self) -> u64 {
+        self.reported_output_tokens
+    }
+}
+
+/// User-facing result of one idle manual context reduction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualCompactionOutcome {
+    NoHistory,
+    Compacted {
+        history_items: usize,
+        shadowed_tokens: u64,
+    },
+    Unchanged,
+    Cancelled,
+    Failed,
+}
+
+/// User-facing result of one idle explicit Session-title refresh.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualTitleRefreshOutcome {
+    NoHistory,
+    Unchanged { title: String },
+    Refreshed { title: String },
+    Cancelled,
+    Failed,
+}
+
+/// User-facing result of one idle current-Session raw-log export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualSessionExportOutcome {
+    Exported { bytes: u64 },
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualSessionForkOutcome {
+    Forked {
+        child: SessionId,
+        seed_events: u64,
+        bytes: u64,
+    },
+    Unavailable,
+    Cancelled,
+    Failed,
+}
+
+/// Effective Session-local route shown after an idle model selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionModelSelection {
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<String>,
+}
+
+/// User-facing result of one side-effect-free idle model selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualModelSelectionOutcome {
+    Selected {
+        selection: SessionModelSelection,
+        changed: bool,
+    },
+    Unavailable,
+}
+
+/// Stateful owner of one session and its request-header lifecycle.
+pub struct AgentLoop {
+    session: Session,
+    provider: Arc<dyn ModelProvider>,
+    tools: Arc<dyn ToolExecutor>,
+    runtime: Arc<dyn AgentRuntime>,
+    config: AgentLoopConfig,
+    request_header_logged: bool,
+    exact_shell_grants: approval::ExactShellGrantStore,
+    pending_workspace_context: Option<Message>,
+    workspace_instructions: Option<WorkspaceInstructionRuntime>,
+    pending_skill_context: Option<Message>,
+    skills: Option<SkillRuntime>,
+    time_context: Option<TimeContextRuntime>,
+    pending_workspace_touches: Vec<String>,
+    repeat_tool_reminder: RepeatToolReminder,
+    job_notices: JobNoticeInbox,
+    session_titles: SessionTitleRuntime,
+    prepared_job_wake: Option<Vec<PendingJobNotice>>,
+    poisoned: bool,
+}
+
+impl AgentLoop {
+    pub fn new(
+        session: Session,
+        provider: Arc<dyn ModelProvider>,
+        tools: Arc<dyn ToolExecutor>,
+        config: AgentLoopConfig,
+    ) -> Result<Self, AgentBuildError> {
+        Self::with_runtime(
+            session,
+            provider,
+            tools,
+            Arc::new(SystemAgentRuntime::default()),
+            config,
+        )
+    }
+
+    pub fn with_runtime(
+        session: Session,
+        provider: Arc<dyn ModelProvider>,
+        tools: Arc<dyn ToolExecutor>,
+        runtime: Arc<dyn AgentRuntime>,
+        config: AgentLoopConfig,
+    ) -> Result<Self, AgentBuildError> {
+        Self::with_runtime_preserving_session(session, provider, tools, runtime, config)
+            .map_err(|(error, _session)| error)
+    }
+
+    /// CLI assembly seam that returns the still-owned Session when validation
+    /// fails. This matters for a resumed durable journal: the caller must run
+    /// its async shutdown instead of letting an error path synchronously join
+    /// the writer from `Drop` on Tokio's current thread.
+    pub(crate) fn new_preserving_session(
+        session: Session,
+        provider: Arc<dyn ModelProvider>,
+        tools: Arc<dyn ToolExecutor>,
+        config: AgentLoopConfig,
+    ) -> Result<Self, (AgentBuildError, Session)> {
+        Self::with_runtime_preserving_session(
+            session,
+            provider,
+            tools,
+            Arc::new(SystemAgentRuntime::default()),
+            config,
+        )
+    }
+
+    fn with_runtime_preserving_session(
+        session: Session,
+        provider: Arc<dyn ModelProvider>,
+        tools: Arc<dyn ToolExecutor>,
+        runtime: Arc<dyn AgentRuntime>,
+        config: AgentLoopConfig,
+    ) -> Result<Self, (AgentBuildError, Session)> {
+        if !session.state().pending_approvals().is_empty() {
+            return Err((AgentBuildError::UnresolvedApproval, session));
+        }
+        if session.state().open_turn().is_some() {
+            return Err((AgentBuildError::SessionNotIdle, session));
+        }
+        if session_has_unresolved_tool_calls(&session) {
+            return Err((AgentBuildError::UnresolvedToolCall, session));
+        }
+        if let Err(error) = config.validate_fixed_request_size() {
+            return Err((error, session));
+        }
+        let refinement_enabled = provider.supports_session_titles();
+        let session_titles = SessionTitleRuntime::new(
+            &session,
+            provider.clone(),
+            config.call.provider() == crate::provider::deepseek::DEEPSEEK_PROVIDER
+                || refinement_enabled,
+            refinement_enabled,
+        );
+        Ok(Self {
+            session,
+            provider,
+            tools,
+            runtime,
+            config,
+            request_header_logged: false,
+            exact_shell_grants: approval::ExactShellGrantStore::new(),
+            pending_workspace_context: None,
+            workspace_instructions: None,
+            pending_skill_context: None,
+            skills: None,
+            time_context: None,
+            pending_workspace_touches: Vec::new(),
+            repeat_tool_reminder: RepeatToolReminder::default(),
+            job_notices: JobNoticeInbox::new(),
+            session_titles,
+            prepared_job_wake: None,
+            poisoned: false,
+        })
+    }
+
+    #[must_use]
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// Mutable access to the durable session, used to flush before exporting a
+    /// read-only snapshot (slowcode feedback bundle).
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// Install one lower-authority context message after the next claimed input.
+    pub(crate) fn install_workspace_context(&mut self, context: Option<Message>) {
+        debug_assert!(
+            context
+                .as_ref()
+                .is_none_or(|message| message.validate_user_event().is_ok())
+        );
+        self.pending_workspace_context = context;
+    }
+
+    /// Install the same opened workspace capability used during assembly so
+    /// successful built-in file results can refresh guidance between steps.
+    pub fn install_workspace_instruction_runtime(&mut self, runtime: WorkspaceInstructionRuntime) {
+        self.workspace_instructions = Some(runtime);
+    }
+
+    /// Replace the approval provider for subsequent tool dispatches.
+    ///
+    /// The TUI installs a provider that routes requests to the renderer. The
+    /// provider is not persisted in the Session.
+    pub fn install_approval_provider(&mut self, provider: Arc<dyn ApprovalProvider>) {
+        self.config.approval_provider = provider;
+    }
+
+    /// Install the file and shell policies that route mutations through the
+    /// approval provider.
+    pub fn install_approval_policy(&mut self, file_change: FileChangePolicy, shell: ShellPolicy) {
+        self.config.file_change_policy = file_change;
+        self.config.shell_policy = shell;
+    }
+
+    /// Resolve the effective route without opening a request or reading credentials.
+    pub(crate) fn current_model_selection(&self) -> Option<SessionModelSelection> {
+        let prepared = self.provider.prepare_call(self.config.call.clone()).ok()?;
+        Some(selection_from_call(prepared.config()))
+    }
+
+    /// Return the effective narrow permission preset used by this Agent.
+    pub(crate) fn current_permission_preset(&self) -> Option<PermissionPreset> {
+        if self.config.shell_policy != ShellPolicy::Ask
+            || self.config.plugin_policy != PluginPolicy::Ask
+        {
+            return None;
+        }
+        match self.config.file_change_policy {
+            FileChangePolicy::Ask => Some(PermissionPreset::Ask),
+            FileChangePolicy::Allow => Some(PermissionPreset::AutoEdit),
+            FileChangePolicy::Deny => None,
+        }
+    }
+
+    /// Persist and then install a safe permission preset for later tools.
+    pub(crate) async fn select_permission_preset(
+        &mut self,
+        preset: PermissionPreset,
+    ) -> Result<bool, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if self.current_permission_preset() == Some(preset) {
+            return Ok(false);
+        }
+        self.session.materialize_if_needed().await?;
+        self.session
+            .append_settled(NewEvent::log(EventKind::permission_preset(preset)))
+            .await?;
+        self.config.file_change_policy = match preset {
+            PermissionPreset::Ask => FileChangePolicy::Ask,
+            PermissionPreset::AutoEdit => FileChangePolicy::Allow,
+        };
+        Ok(true)
+    }
+
+    /// Select the route consumed by the next model assembly.
+    ///
+    /// Like upstream `session.selectModel`, this is intentionally not durable
+    /// until a later request header consumes the choice.
+    pub(crate) fn select_model(
+        &mut self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<ManualModelSelectionOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        let requested = match LlmCallConfig::from_parts(
+            self.config.call.provider().to_owned(),
+            model.to_owned(),
+            reasoning_effort.map(ReasoningEffortId::new),
+            self.config.call.temperature(),
+            self.config.call.max_tokens(),
+            self.config.call.stop().map(<[String]>::to_vec),
+        ) {
+            Ok(requested) => requested,
+            Err(_) => return Ok(ManualModelSelectionOutcome::Unavailable),
+        };
+        let prepared = match self.provider.prepare_call(requested.clone()) {
+            Ok(prepared) => prepared,
+            Err(_) => return Ok(ManualModelSelectionOutcome::Unavailable),
+        };
+        // Host `selectModel` returns the resolved default effort. Preserve that
+        // exact choice rather than letting a later Provider-default change
+        // reinterpret an already accepted command.
+        let selected =
+            match requested.with_reasoning_effort_if_absent(prepared.config().reasoning_effort()) {
+                Ok(selected) => selected,
+                Err(_) => return Ok(ManualModelSelectionOutcome::Unavailable),
+            };
+        let mut candidate = self.config.clone();
+        candidate.call = selected.clone();
+        if candidate.validate_fixed_request_size().is_err() {
+            return Ok(ManualModelSelectionOutcome::Unavailable);
+        }
+        let changed = !self.config.call.equivalent_to(&selected);
+        if changed {
+            self.config.call = selected.clone();
+        }
+        Ok(ManualModelSelectionOutcome::Selected {
+            selection: selection_from_call(&selected),
+            changed,
+        })
+    }
+
+    /// Install the read-only project Skill runtime used for both catalog
+    /// context and the registry's model-facing loader.
+    pub(crate) fn install_skill_runtime(&mut self, runtime: SkillRuntime) {
+        self.skills = Some(runtime);
+    }
+
+    /// Install the Skill runtime from the opened workspace and the role's
+    /// extra roots.
+    ///
+    /// The extra roots are workspace-relative by construction, so this seam
+    /// cannot widen the workspace authority boundary.
+    pub fn install_skill_roots(
+        &mut self,
+        workspace: &Path,
+        roots: &SkillRoots,
+    ) -> std::io::Result<()> {
+        self.skills = Some(SkillRuntime::open(workspace, roots)?);
+        Ok(())
+    }
+
+    /// Install optional durable per-step clock context for this Agent process.
+    pub(crate) fn install_time_context(&mut self, runtime: TimeContextRuntime) {
+        self.time_context = Some(runtime);
+    }
+
+    /// Attach the exact process-local inbox owned by this Agent's tool registry.
+    pub(crate) fn install_job_notice_inbox(&mut self, inbox: JobNoticeInbox) {
+        self.job_notices = inbox;
+    }
+
+    pub(crate) fn job_notice_inbox(&self) -> JobNoticeInbox {
+        self.job_notices.clone()
+    }
+
+    /// Atomically claim one bounded idle completion wake for the terminal.
+    pub(crate) fn claim_job_notice_wake(&mut self) -> Result<Option<TurnProposal>, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if self.prepared_job_wake.is_some() {
+            return Err(AgentLoopError::Invariant(
+                "a background-job wake is already prepared",
+            ));
+        }
+        let Some(notices) = self.job_notices.claim_idle_wake() else {
+            return Ok(None);
+        };
+        match messages_for_notices(&notices, self.runtime.as_ref()) {
+            Ok(messages) => {
+                self.prepared_job_wake = Some(notices);
+                Ok(Some(TurnProposal::Enter(messages)))
+            }
+            Err(error) => {
+                self.job_notices.restore_claimed(notices);
+                Err(error)
+            }
+        }
+    }
+
+    /// Commit a local Goal command through the same durable Session owner.
+    pub(crate) async fn commit_goal_mutation(
+        &mut self,
+        mutation: PreparedGoalMutation,
+    ) -> Result<String, AgentLoopError> {
+        self.session.materialize_if_needed().await?;
+        let change = mutation.change().clone();
+        self.session
+            .append_settled(NewEvent::log(EventKind::goal_change(change)))
+            .await?;
+        mutation
+            .commit()
+            .map_err(|_| AgentLoopError::Invariant("committed Goal state was not installable"))
+    }
+
+    /// Commit an idle terminal Plan Mode change through the Session owner.
+    pub(crate) async fn commit_plan_mode_mutation(
+        &mut self,
+        mutation: PreparedPlanModeMutation,
+    ) -> Result<(), AgentLoopError> {
+        self.session.materialize_if_needed().await?;
+        self.session
+            .append_settled(NewEvent::log(EventKind::plan_mode(mutation.change())))
+            .await?;
+        mutation
+            .commit()
+            .map_err(|_| AgentLoopError::Invariant("committed Plan Mode state was not installable"))
+    }
+
+    /// Replace the current Session title with one explicit user-owned fact.
+    pub async fn rename_session_title(
+        &mut self,
+        raw_title: &str,
+    ) -> Result<Option<String>, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        let Some(title) = normalize_title(raw_title, PROVIDER_TITLE_MAX_BYTES) else {
+            return Ok(None);
+        };
+        self.session.materialize_if_needed().await?;
+        self.session_titles
+            .rename(&mut self.session, title)
+            .await
+            .map(Some)
+    }
+
+    /// Explicitly retry or unpin the current Session's first-prompt title.
+    pub(crate) async fn refresh_session_title(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<ManualTitleRefreshOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ManualTitleRefreshOutcome::Cancelled);
+        }
+        let state = self.session.state();
+        let Some((seq, text)) = state.session_title_first_prompt() else {
+            return Ok(ManualTitleRefreshOutcome::NoHistory);
+        };
+        let text = text.to_owned();
+        let config = self.config.call.clone();
+        self.session.materialize_if_needed().await?;
+        self.session_titles
+            .refresh(&mut self.session, &config, seq, text, cancellation)
+            .await
+    }
+
+    /// Flush and copy the current durable Session without opening a turn.
+    pub(crate) async fn export_session_log(
+        &mut self,
+        destination: File,
+        cancellation: CancellationToken,
+    ) -> Result<ManualSessionExportOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionExportOutcome::Cancelled);
+        }
+        self.session.materialize_if_needed().await?;
+        self.session_titles.collect_ready(&mut self.session).await;
+        match self.session.export_raw_to(destination, cancellation).await {
+            Ok(bytes) => Ok(ManualSessionExportOutcome::Exported { bytes }),
+            Err(SessionRawExportError::Cancelled) => Ok(ManualSessionExportOutcome::Cancelled),
+            Err(SessionRawExportError::Destination | SessionRawExportError::Unavailable) => {
+                Ok(ManualSessionExportOutcome::Failed)
+            }
+            Err(SessionRawExportError::Barrier(error)) => Err(error.into()),
+        }
+    }
+
+    /// Create one separately resumable child from a completed current-Session turn.
+    pub(crate) async fn fork_session(
+        &mut self,
+        forker: &SessionForker,
+        child: SessionId,
+        anchor: Option<EventSeq>,
+        cancellation: CancellationToken,
+    ) -> Result<ManualSessionForkOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionForkOutcome::Cancelled);
+        }
+        self.session.materialize_if_needed().await?;
+        self.session_titles.collect_ready(&mut self.session).await;
+        let source_title = self
+            .session
+            .state()
+            .session_title()
+            .map(|title| title.title().to_owned());
+        let prepared = match self
+            .session
+            .prepare_fork(anchor, cancellation.clone())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(SessionForkError::Unavailable) => {
+                return Ok(ManualSessionForkOutcome::Unavailable);
+            }
+            Err(SessionForkError::Cancelled) => return Ok(ManualSessionForkOutcome::Cancelled),
+            Err(SessionForkError::Destination | SessionForkError::Changed) => {
+                return Ok(ManualSessionForkOutcome::Failed);
+            }
+            Err(SessionForkError::Barrier(error)) => return Err(error.into()),
+        };
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionForkOutcome::Cancelled);
+        }
+        let seed_events = prepared.seed_events();
+        let parent = self.session.id().clone();
+        let mut target = match forker
+            .reserve(
+                parent,
+                child,
+                seed_events,
+                prepared.seed_ends_with_end_seed(),
+                source_title,
+            )
+            .await
+        {
+            Ok(target) => target,
+            Err(_) => return Ok(ManualSessionForkOutcome::Failed),
+        };
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionForkOutcome::Cancelled);
+        }
+        let plan = match target.take_write_plan() {
+            Ok(plan) => plan,
+            Err(_) => return Ok(ManualSessionForkOutcome::Failed),
+        };
+        let bytes = match self
+            .session
+            .write_fork(
+                prepared,
+                plan.destination,
+                plan.header_line,
+                plan.suffix,
+                cancellation,
+            )
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(SessionForkError::Unavailable) => {
+                return Ok(ManualSessionForkOutcome::Unavailable);
+            }
+            Err(SessionForkError::Cancelled) => return Ok(ManualSessionForkOutcome::Cancelled),
+            Err(SessionForkError::Destination | SessionForkError::Changed) => {
+                return Ok(ManualSessionForkOutcome::Failed);
+            }
+            Err(SessionForkError::Barrier(error)) => return Err(error.into()),
+        };
+        match target.commit(bytes, seed_events).await {
+            Ok(artifact) => Ok(ManualSessionForkOutcome::Forked {
+                child: artifact.child().clone(),
+                seed_events: artifact.seed_events(),
+                bytes: artifact.bytes(),
+            }),
+            Err(_) => Ok(ManualSessionForkOutcome::Failed),
+        }
+    }
+
+    /// Run one standalone `/compact` transaction without opening an Agent turn.
+    pub(crate) async fn compact_now(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<ManualCompactionOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        self.session.materialize_if_needed().await?;
+        match self.session.compaction_candidate(0) {
+            Ok(Some(candidate))
+                if candidate.shadowed_token_count > 0 && !candidate.messages.is_empty() => {}
+            Ok(_) => return Ok(ManualCompactionOutcome::NoHistory),
+            Err(_) => {
+                return Err(AgentLoopError::Invariant(
+                    "manual compaction selection failed",
+                ));
+            }
+        }
+
+        let provider = self.provider.clone();
+        let tools = self.tools.clone();
+        let runtime = self.runtime.clone();
+        let config = self.config.clone();
+        let source_command_id = next_id(runtime.as_ref(), AgentIdKind::Message)?;
+        let budget_failure = failure_reason(
+            "AGENT_EVENT_BUDGET",
+            "the session has no safe room for manual compaction",
+        )?;
+        let session_limit_failure = failure_reason(
+            "AGENT_SESSION_LIMIT",
+            "the durable session reached its storage limit",
+        )?;
+        let result = {
+            let mut reservation = self.session.reservation();
+            let mut pending_repeat_contexts = Vec::new();
+            let mut driver = Driver {
+                provider: provider.as_ref(),
+                tools: tools.as_ref(),
+                runtime: runtime.as_ref(),
+                config: &config,
+                request_header_logged: &mut self.request_header_logged,
+                exact_shell_grants: &mut self.exact_shell_grants,
+                pending_shell_grant: None,
+                counters: Counters::default(),
+                final_message: None,
+                observer_unavailable: false,
+                session_limit_failure,
+                durable_limit: None,
+                deadline: Instant::now() + config.limits.turn_duration,
+                goal_tool_caller: GoalToolCaller::Untrusted,
+                workspace_instructions: self.workspace_instructions.as_ref(),
+                skills: self.skills.as_ref(),
+                time_context: None,
+                pending_workspace_touches: &mut self.pending_workspace_touches,
+                repeat_tool_reminder: &mut self.repeat_tool_reminder,
+                pending_repeat_contexts: &mut pending_repeat_contexts,
+                job_notices: &self.job_notices,
+                session_titles: None,
+            };
+            compact_once(
+                &mut reservation,
+                &mut driver,
+                CompactionScope::Manual { source_command_id },
+                0,
+                &cancellation,
+                &budget_failure,
+            )
+            .await
+        };
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        let outcome = result?;
+        if matches!(outcome, CompactionOutcome::Progress { .. }) {
+            if let Some(runtime) = self.workspace_instructions.clone() {
+                match runtime
+                    .prepare(
+                        &self.session,
+                        &self.pending_workspace_touches,
+                        &cancellation,
+                    )
+                    .await
+                {
+                    Ok(context) => {
+                        self.pending_workspace_touches.clear();
+                        if let Some(context) = context {
+                            self.pending_workspace_context = Some(context);
+                        }
+                    }
+                    Err(_) => {
+                        self.poisoned = true;
+                        return Err(AgentLoopError::Invariant(
+                            "workspace instructions could not be rearmed after manual compaction",
+                        ));
+                    }
+                }
+            }
+        }
+        match outcome {
+            CompactionOutcome::Progress {
+                history_items,
+                shadowed_tokens,
+            } => Ok(ManualCompactionOutcome::Compacted {
+                history_items,
+                shadowed_tokens,
+            }),
+            CompactionOutcome::NoProgress => Ok(ManualCompactionOutcome::Unchanged),
+            CompactionOutcome::AdvisoryFailure(_) => Ok(ManualCompactionOutcome::Failed),
+            CompactionOutcome::Cancelled => Ok(ManualCompactionOutcome::Cancelled),
+            CompactionOutcome::TurnError(_) => Ok(ManualCompactionOutcome::Failed),
+        }
+    }
+
+    /// Stop tool-owned workers, then return the still-active Session.
+    ///
+    /// This replaces the old synchronous extraction seam, which could drop a
+    /// persistent plugin process without waiting for its process group.
+    pub async fn shutdown_into_session(mut self) -> Result<Session, AgentReleaseError> {
+        self.session_titles.shutdown(&mut self.session).await;
+        let Self { session, tools, .. } = self;
+        match shutdown_tool_executor(tools.as_ref()).await {
+            Ok(()) => Ok(session),
+            Err(error) => Err(AgentReleaseError::new(error, session)),
+        }
+    }
+
+    /// Stop and join tools before flushing and joining the Session writer.
+    pub async fn shutdown(&mut self) -> Result<(), AgentShutdownError> {
+        self.session_titles.shutdown(&mut self.session).await;
+        let tools = shutdown_tool_executor(self.tools.as_ref()).await;
+        let session = self.session.shutdown().await;
+        match (tools, session) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(AgentShutdownError::Tools(error)),
+            (Ok(()), Err(error)) => Err(AgentShutdownError::Session(error)),
+            (Err(tools), Err(session)) => Err(AgentShutdownError::Both { tools, session }),
+        }
+    }
+
+    /// Run one bounded turn and settle every ordinary error/cancellation path.
+    ///
+    /// Cancellation is cooperative: cancel the supplied token, then keep
+    /// awaiting this future until it returns so provider/tool cleanup and
+    /// `step/end`/`turn/end` can commit. Dropping this future after polling is
+    /// equivalent to a process crash and can leave an open tail for Phase 8
+    /// recovery; async closing work cannot be performed from `Drop`.
+    pub async fn run_turn(
+        &mut self,
+        mut proposal: TurnProposal,
+        cancellation: CancellationToken,
+    ) -> Result<TurnOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        self.pending_skill_context = None;
+        if !cancellation.is_cancelled() {
+            if let Some(runtime) = self.skills.as_ref() {
+                match runtime.prepare_catalog(&self.session, &cancellation).await {
+                    Ok(context) => self.pending_skill_context = context,
+                    Err(SkillRuntimeError::Cancelled) => {}
+                    Err(SkillRuntimeError::Task | SkillRuntimeError::Message) => {
+                        return Err(AgentLoopError::Invariant(
+                            "project Skill catalog could not be prepared",
+                        ));
+                    }
+                }
+            }
+        }
+        let inserted_workspace_context = match (&mut proposal, &self.pending_workspace_context) {
+            (TurnProposal::Enter(messages), Some(context)) if !messages.is_empty() => {
+                messages.push(context.clone());
+                Some(context.id().as_str().to_owned())
+            }
+            _ => None,
+        };
+        let inserted_skill_context = match (&mut proposal, &self.pending_skill_context) {
+            (TurnProposal::Enter(messages), Some(context)) if !messages.is_empty() => {
+                messages.push(context.clone());
+                Some(context.id().as_str().to_owned())
+            }
+            _ => None,
+        };
+        let prepared_job_wake = self.prepared_job_wake.take();
+        if let Err(error) = validate_turn_proposal(&proposal) {
+            if let Some(notices) = prepared_job_wake {
+                self.job_notices.restore_claimed(notices);
+            }
+            return Err(error);
+        }
+        let claimed_notices = match (&proposal, prepared_job_wake.as_ref()) {
+            (TurnProposal::Enter(messages), None)
+                if !messages.is_empty() && !cancellation.is_cancelled() =>
+            {
+                self.job_notices.begin_turn()
+            }
+            _ => Vec::new(),
+        };
+        if !claimed_notices.is_empty() {
+            let notice_messages =
+                match messages_for_notices(&claimed_notices, self.runtime.as_ref()) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        self.job_notices.restore_active(claimed_notices);
+                        if let Some(notices) = prepared_job_wake {
+                            self.job_notices.restore_claimed(notices);
+                        }
+                        return Err(error);
+                    }
+                };
+            if let TurnProposal::Enter(messages) = &mut proposal {
+                messages.extend(notice_messages);
+            }
+        }
+        if let Err(error) = validate_turn_proposal(&proposal) {
+            self.job_notices.restore_active(claimed_notices);
+            if let Some(notices) = prepared_job_wake {
+                self.job_notices.restore_claimed(notices);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.session.materialize_if_needed().await {
+            self.job_notices.restore_active(claimed_notices);
+            if let Some(notices) = prepared_job_wake {
+                self.job_notices.restore_claimed(notices);
+            }
+            return Err(error.into());
+        }
+        self.session_titles.collect_ready(&mut self.session).await;
+        let provider = self.provider.clone();
+        let tools = self.tools.clone();
+        let runtime = self.runtime.clone();
+        let config = self.config.clone();
+        let result = run_turn_inner(
+            &mut self.session,
+            provider.as_ref(),
+            tools.as_ref(),
+            runtime.as_ref(),
+            &config,
+            &mut self.request_header_logged,
+            &mut self.exact_shell_grants,
+            self.workspace_instructions.as_ref(),
+            self.skills.as_ref(),
+            self.time_context.as_ref(),
+            &mut self.pending_workspace_touches,
+            &mut self.repeat_tool_reminder,
+            &self.job_notices,
+            &mut self.session_titles,
+            proposal,
+            cancellation,
+        )
+        .await;
+        self.session_titles.collect_ready(&mut self.session).await;
+        if inserted_workspace_context.as_deref().is_some_and(|id| {
+            self.session
+                .visible_messages()
+                .iter()
+                .any(|message| message.id().as_str() == id)
+        }) {
+            self.pending_workspace_context = None;
+        }
+        if inserted_skill_context.as_deref().is_some_and(|id| {
+            self.session
+                .visible_messages()
+                .iter()
+                .any(|message| message.id().as_str() == id)
+        }) {
+            self.pending_skill_context = None;
+        }
+        if result.is_err()
+            || session_has_unresolved_tool_calls(&self.session)
+            || !self.session.state().pending_approvals().is_empty()
+        {
+            self.poisoned = true;
+        }
+        self.job_notices.finish_turn();
+        result
+    }
+}
+
+fn validate_turn_proposal(proposal: &TurnProposal) -> Result<(), AgentLoopError> {
+    let TurnProposal::Enter(messages) = proposal else {
+        return Ok(());
+    };
+    if messages.len() > crate::provider::MAX_PROVIDER_MESSAGES {
+        return Err(AgentLoopError::TooManyTurnMessages {
+            maximum: crate::provider::MAX_PROVIDER_MESSAGES,
+            actual: messages.len(),
+        });
+    }
+    if messages
+        .iter()
+        .any(|message| message.validate_user_event().is_err())
+    {
+        return Err(AgentLoopError::InvalidTurnMessages);
+    }
+    let actual = messages.iter().try_fold(0_usize, |total, message| {
+        let next = total
+            .checked_add(message.raw().encoded_len())
+            .unwrap_or(usize::MAX);
+        (next <= crate::provider::MAX_PROVIDER_REQUEST_BYTES).then_some(next)
+    });
+    let actual = actual.unwrap_or(crate::provider::MAX_PROVIDER_REQUEST_BYTES + 1);
+    if actual > crate::provider::MAX_PROVIDER_REQUEST_BYTES {
+        return Err(AgentLoopError::TurnInputTooLarge {
+            maximum: crate::provider::MAX_PROVIDER_REQUEST_BYTES,
+            actual,
+            messages: messages.len(),
+        });
+    }
+    Ok(())
+}
+
+async fn shutdown_tool_executor(tools: &dyn ToolExecutor) -> Result<(), ToolExecutorError> {
+    let future = catch_unwind(AssertUnwindSafe(|| tools.shutdown()))
+        .map_err(|_| ToolExecutorError::new("tool shutdown factory panicked"))?;
+    AssertUnwindSafe(future)
+        .catch_unwind()
+        .await
+        .map_err(|_| ToolExecutorError::new("tool shutdown future panicked"))?
+}
+
+#[derive(Default)]
+struct Counters {
+    steps: usize,
+    attempts: usize,
+    retries: usize,
+    tool_calls: usize,
+    reported_output_tokens: u64,
+    tool_result_bytes: usize,
+}
+
+enum StepOutcome {
+    Completed,
+    Continue,
+    MaxTokens,
+    Cancelled,
+    Error(LlmFailure),
+}
+
+struct UnstartedStepClaims {
+    start: EventClaim,
+    inputs: Vec<EventClaim>,
+    end: EventClaim,
+}
+
+impl UnstartedStepClaims {
+    fn new(mut claims: Vec<EventClaim>) -> Result<Self, AgentLoopError> {
+        if claims.len() < 2 {
+            return Err(AgentLoopError::Invariant(
+                "step reservation did not return its closure claims",
+            ));
+        }
+        let start = claims.remove(0);
+        let end = claims.pop().ok_or(AgentLoopError::Invariant(
+            "step reservation omitted its end claim",
+        ))?;
+        Ok(Self {
+            start,
+            inputs: claims,
+            end,
+        })
+    }
+
+    async fn enter(
+        mut self,
+        reservation: &mut SessionReservation<'_>,
+    ) -> Result<(EventClaim, Vec<AppendReceipt>), AgentLoopError> {
+        reservation.settle_exact_settled(&mut self.start).await?;
+        let mut receipts = Vec::new();
+        receipts
+            .try_reserve_exact(self.inputs.len())
+            .map_err(|_| AgentLoopError::Invariant("step input receipts could not be reserved"))?;
+        for input in &mut self.inputs {
+            receipts.push(reservation.settle_exact_settled(input).await?);
+        }
+        Ok((self.end, receipts))
+    }
+
+    fn release(mut self, reservation: &mut SessionReservation<'_>) -> Result<(), AgentLoopError> {
+        reservation.release(&mut self.start)?;
+        for input in &mut self.inputs {
+            reservation.release(input)?;
+        }
+        reservation.release(&mut self.end)?;
+        Ok(())
+    }
+}
+
+enum AttemptPreparation {
+    Ready(PreflightedRequest),
+    PreparedFailure {
+        prepared: PreparedProviderCall,
+        failure: LlmFailure,
+        system: Option<String>,
+    },
+    DeferredFailure(LlmFailure),
+    HardLimit {
+        prepared: Option<PreparedProviderCall>,
+    },
+}
+
+enum HardLimitPruneOutcome {
+    Progress,
+    NoProgress,
+    Cancelled,
+    TurnError(LlmFailure),
+}
+
+fn preparation_context_window(preparation: &AttemptPreparation, session: &Session) -> Option<u64> {
+    match preparation {
+        AttemptPreparation::Ready(preflighted) => preflighted.prepared_call().context_window(),
+        AttemptPreparation::PreparedFailure { prepared, .. }
+        | AttemptPreparation::HardLimit {
+            prepared: Some(prepared),
+            ..
+        } => prepared.context_window(),
+        AttemptPreparation::DeferredFailure(_)
+        | AttemptPreparation::HardLimit { prepared: None } => session
+            .request_context()
+            .and_then(RequestContext::context_window),
+    }
+    .map(|window| window.get())
+}
+
+fn pre_step_compaction_trigger(
+    preparation: &AttemptPreparation,
+    session: &Session,
+    context_window: Option<u64>,
+) -> Option<crate::session::CompactionTrigger> {
+    if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+        return Some(crate::session::CompactionTrigger::HardLimit);
+    }
+    (matches!(preparation, AttemptPreparation::Ready(_))
+        && context_window.is_some_and(|window| {
+            session
+                .context_total_tokens()
+                .is_ok_and(|total| pressure_reached(total, window))
+        }))
+    .then_some(crate::session::CompactionTrigger::Pressure)
+}
+
+struct PreflightedRequest {
+    proposed: LlmCallConfig,
+    messages: Vec<Message>,
+    system: Option<String>,
+    expected_surface_generation: u64,
+    preflight: PreparedRequestPreflight,
+}
+
+impl PreflightedRequest {
+    fn prepared_call(&self) -> &crate::provider::PreparedProviderCall {
+        self.preflight.prepared_call()
+    }
+
+    fn matches_surface(&self, session: &Session) -> bool {
+        session.surface_generation() == self.expected_surface_generation
+            && session.messages_equal(&self.messages)
+    }
+
+    fn into_request(
+        self,
+        session: &Session,
+        config: &AgentLoopConfig,
+    ) -> Result<ProviderRequest, ProviderRequestError> {
+        let mut draft = ProviderRequestDraft::new(&self.proposed, &self.messages)?;
+        if let Some(system) = &self.system {
+            draft = draft.with_system(system)?;
+        }
+        if !config.tools.is_empty() {
+            draft = draft.with_tools(&config.tools)?;
+        }
+        draft = draft.with_session_id(session.id())?;
+        draft.into_request(self.preflight)
+    }
+}
+
+struct StepResolution {
+    outcome: StepOutcome,
+    latched_turn_stop: ToolActionTurnStop,
+}
+
+impl StepResolution {
+    fn new(outcome: StepOutcome) -> Self {
+        Self {
+            outcome,
+            latched_turn_stop: ToolActionTurnStop::None,
+        }
+    }
+
+    fn with_stop(outcome: StepOutcome, stop: ToolStop) -> Self {
+        Self {
+            outcome,
+            latched_turn_stop: match stop {
+                ToolStop::None => ToolActionTurnStop::None,
+                ToolStop::Cancelled => ToolActionTurnStop::CallerCancelled,
+                ToolStop::TurnTimeout => ToolActionTurnStop::TurnTimeout,
+            },
+        }
+    }
+}
+
+enum StreamOutcome {
+    Finished(PreparedAttempt),
+    Cancelled,
+    Error(LlmFailure),
+}
+
+struct Driver<'a> {
+    provider: &'a dyn ModelProvider,
+    tools: &'a dyn ToolExecutor,
+    runtime: &'a dyn AgentRuntime,
+    config: &'a AgentLoopConfig,
+    request_header_logged: &'a mut bool,
+    exact_shell_grants: &'a mut approval::ExactShellGrantStore,
+    pending_shell_grant: Option<approval::ExactShellGrantDigest>,
+    counters: Counters,
+    final_message: Option<Message>,
+    observer_unavailable: bool,
+    session_limit_failure: LlmFailure,
+    durable_limit: Option<AppendError>,
+    deadline: Instant,
+    goal_tool_caller: GoalToolCaller,
+    workspace_instructions: Option<&'a WorkspaceInstructionRuntime>,
+    skills: Option<&'a SkillRuntime>,
+    time_context: Option<&'a TimeContextRuntime>,
+    pending_workspace_touches: &'a mut Vec<String>,
+    repeat_tool_reminder: &'a mut RepeatToolReminder,
+    pending_repeat_contexts: &'a mut Vec<Message>,
+    job_notices: &'a JobNoticeInbox,
+    session_titles: Option<&'a mut SessionTitleRuntime>,
+}
+
+impl Driver<'_> {
+    fn observe_assistant_commit(&mut self, receipt: &AppendReceipt) {
+        let Some(message) = receipt.committed_message() else {
+            return;
+        };
+        if message.content().iter().any(
+            |block| matches!(block.kind(), ContentBlockKind::Text { text } if !text.is_empty()),
+        ) {
+            self.final_message = Some(message.clone());
+        }
+    }
+
+    fn failure_for_budget(
+        &mut self,
+        error: &AppendError,
+        memory_failure: &LlmFailure,
+    ) -> LlmFailure {
+        if is_durable_session_limit(error) {
+            self.latch_durable_limit(error);
+            self.session_limit_failure.clone()
+        } else {
+            debug_assert!(is_memory_budget_error(error));
+            memory_failure.clone()
+        }
+    }
+
+    fn latch_durable_limit(&mut self, error: &AppendError) {
+        if is_durable_session_limit(error) && self.durable_limit.is_none() {
+            self.durable_limit = Some(error.clone());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_inner(
+    session: &mut Session,
+    provider: &dyn ModelProvider,
+    tools: &dyn ToolExecutor,
+    runtime: &dyn AgentRuntime,
+    config: &AgentLoopConfig,
+    request_header_logged: &mut bool,
+    exact_shell_grants: &mut approval::ExactShellGrantStore,
+    workspace_instructions: Option<&WorkspaceInstructionRuntime>,
+    skills: Option<&SkillRuntime>,
+    time_context: Option<&TimeContextRuntime>,
+    pending_workspace_touches: &mut Vec<String>,
+    repeat_tool_reminder: &mut RepeatToolReminder,
+    job_notices: &JobNoticeInbox,
+    session_titles: &mut SessionTitleRuntime,
+    proposal: TurnProposal,
+    cancellation: CancellationToken,
+) -> Result<TurnOutcome, AgentLoopError> {
+    let goal_tool_caller = classify_goal_tool_caller(&proposal);
+    let turn = session.state().next_turn();
+    let budget_reason = failure_reason(
+        "AGENT_EVENT_BUDGET",
+        "the session has no safe room for another agent event",
+    )?;
+    let session_limit_failure = failure_reason(
+        "AGENT_SESSION_LIMIT",
+        "the durable session reached its storage limit",
+    )?;
+    let durable = session.is_durable();
+    let turn_fallback = TurnEndReason::Error {
+        error: if durable {
+            session_limit_failure.clone()
+        } else {
+            budget_reason.clone()
+        },
+    };
+    let mut reservation = session.reservation();
+    let mut opening = reservation
+        .claim_batch([
+            NewEvent::log(EventKind::turn_start(turn)),
+            NewEvent::log(EventKind::turn_end(turn, turn_fallback.clone())),
+        ])
+        .map_err(AgentLoopError::Admission)?;
+    let mut turn_start = opening.remove(0);
+    let mut turn_end = opening.remove(0);
+    reservation.settle_exact_settled(&mut turn_start).await?;
+
+    let mut pending_repeat_contexts = Vec::new();
+    let mut driver = Driver {
+        provider,
+        tools,
+        runtime,
+        config,
+        request_header_logged,
+        exact_shell_grants,
+        pending_shell_grant: None,
+        counters: Counters::default(),
+        final_message: None,
+        observer_unavailable: false,
+        session_limit_failure,
+        durable_limit: None,
+        deadline: Instant::now() + config.limits.turn_duration,
+        goal_tool_caller,
+        workspace_instructions,
+        skills,
+        time_context,
+        pending_workspace_touches,
+        repeat_tool_reminder,
+        pending_repeat_contexts: &mut pending_repeat_contexts,
+        job_notices,
+        session_titles: Some(session_titles),
+    };
+
+    let mut reason = if cancellation.is_cancelled() {
+        TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        }
+    } else {
+        match proposal {
+            TurnProposal::Reject => TurnEndReason::Blocked,
+            TurnProposal::Enter(messages) if messages.is_empty() => TurnEndReason::Completed,
+            TurnProposal::Enter(messages) => {
+                if messages
+                    .iter()
+                    .any(|message| matches!(message.source().kind(), MessageSourceKind::User))
+                {
+                    driver.repeat_tool_reminder.reset();
+                    driver.job_notices.observe_direct_human_claim();
+                }
+                run_entered_turn(
+                    &mut reservation,
+                    &mut driver,
+                    turn,
+                    messages,
+                    &cancellation,
+                    &budget_reason,
+                )
+                .await?
+            }
+        }
+    };
+
+    let settlement = reservation
+        .settle_settled(
+            &mut turn_end,
+            NewEvent::log(EventKind::turn_end(turn, reason.clone())),
+        )
+        .await?;
+    let (turn_end_seq, used_fallback) = match settlement {
+        ClaimedAppend::Preferred(receipt) => (receipt.seq(), false),
+        ClaimedAppend::Fallback(receipt) => (receipt.seq(), true),
+    };
+    if used_fallback {
+        reason = turn_fallback;
+    }
+    reservation.flush_barrier().await?;
+    if let Some(error) = driver.durable_limit.take() {
+        return Err(error.into());
+    }
+    if used_fallback && durable {
+        return Err(crate::session::StoreError::Limit.into());
+    }
+    Ok(TurnOutcome {
+        turn,
+        turn_end_seq,
+        reason,
+        final_message: driver.final_message,
+        steps: driver.counters.steps,
+        attempts: driver.counters.attempts,
+        retries: driver.counters.retries,
+        tool_calls: driver.counters.tool_calls,
+        reported_output_tokens: driver.counters.reported_output_tokens,
+    })
+}
+
+fn classify_goal_tool_caller(proposal: &TurnProposal) -> GoalToolCaller {
+    let TurnProposal::Enter(messages) = proposal else {
+        return GoalToolCaller::Untrusted;
+    };
+    if messages
+        .iter()
+        .any(|message| matches!(message.source().kind(), MessageSourceKind::User))
+    {
+        return GoalToolCaller::DirectHuman;
+    }
+    if messages.iter().any(|message| {
+        matches!(message.source().kind(), MessageSourceKind::Other { kind } if kind == "goal")
+    }) {
+        GoalToolCaller::GoalRound
+    } else {
+        GoalToolCaller::Untrusted
+    }
+}
+
+#[cfg(test)]
+mod goal_tool_caller_tests {
+    use super::{GoalToolCaller, TurnProposal, classify_goal_tool_caller};
+    use crate::model::{ContentBlock, Message, MessageSource};
+
+    fn message(id: &str, source: MessageSource) -> Message {
+        Message::user(id, vec![ContentBlock::text("input").unwrap()], source).unwrap()
+    }
+
+    #[test]
+    fn direct_human_wins_mixed_turn_and_other_sources_are_untrusted() {
+        let goal_source = MessageSource::from_value(serde_json::json!({
+            "kind": "goal",
+            "goalId": "goal-test",
+            "revision": 1,
+            "round": 1,
+        }))
+        .unwrap();
+        let goal = message("goal", goal_source.clone());
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Enter(vec![goal.clone()])),
+            GoalToolCaller::GoalRound
+        );
+
+        let human = message("human", MessageSource::user().unwrap());
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Enter(vec![goal, human])),
+            GoalToolCaller::DirectHuman
+        );
+
+        let plugin = message("plugin", MessageSource::plugin("test").unwrap());
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Enter(vec![plugin])),
+            GoalToolCaller::Untrusted
+        );
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Reject),
+            GoalToolCaller::Untrusted
+        );
+    }
+}
+
+async fn run_entered_turn(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    turn: TurnId,
+    mut messages: Vec<Message>,
+    cancellation: &CancellationToken,
+    budget_failure: &LlmFailure,
+) -> Result<TurnEndReason, AgentLoopError> {
+    let mut summary_attempted = false;
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(TurnEndReason::Aborted {
+                reason: TurnEndCancelCause::User,
+            });
+        }
+        if Instant::now() >= driver.deadline {
+            return Ok(TurnEndReason::Error {
+                error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
+            });
+        }
+        if driver.counters.steps >= driver.config.limits.max_steps_per_turn {
+            return Ok(TurnEndReason::Error {
+                error: failure_reason("AGENT_MAX_STEPS", "the agent reached its step limit")?,
+            });
+        }
+
+        let step = StepId::new((driver.counters.steps + 1) as u64)
+            .map_err(|_| AgentLoopError::Invariant("step identifier exhausted"))?;
+        if let Some(reason) = refresh_dynamic_context(
+            reservation.session(),
+            driver,
+            &mut messages,
+            cancellation,
+            turn,
+            step,
+        )
+        .await?
+        {
+            return Ok(reason);
+        }
+        let mut exact = Vec::with_capacity(messages.len() + 2);
+        exact.push(NewEvent::log(EventKind::step_start(turn, step)));
+        exact.extend(messages.iter().cloned().map(|message| {
+            NewEvent::surface(EventKind::user_message(message), SurfaceIntent::append())
+        }));
+        exact.push(NewEvent::log(EventKind::step_end(turn, step)));
+        let claims = match reservation.claim_batch(exact) {
+            Ok(claims) => claims,
+            Err(error) if is_budget_error(&error) => {
+                return Ok(TurnEndReason::Error {
+                    error: driver.failure_for_budget(&error, budget_failure),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let unstarted = UnstartedStepClaims::new(claims)?;
+        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+            unstarted.release(reservation)?;
+            return Ok(reason);
+        }
+        if let Err(error) = flush_pending_plan_mode(reservation, driver).await {
+            unstarted.release(reservation)?;
+            return Err(error);
+        }
+        let first_preparation = if driver.counters.attempts
+            >= driver.config.limits.max_attempts_per_turn
+        {
+            None
+        } else {
+            let mut preparation =
+                prepare_conversation_request(reservation.session(), driver, messages.as_slice())?;
+            if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                unstarted.release(reservation)?;
+                return Ok(reason);
+            }
+            if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+                let prune_outcome =
+                    prune_hard_limited_request(reservation, driver, cancellation, budget_failure)
+                        .await?;
+                if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                    unstarted.release(reservation)?;
+                    return Ok(reason);
+                }
+                match prune_outcome {
+                    HardLimitPruneOutcome::Progress => {
+                        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                            unstarted.release(reservation)?;
+                            return Ok(reason);
+                        }
+                        preparation = prepare_conversation_request(
+                            reservation.session(),
+                            driver,
+                            messages.as_slice(),
+                        )?;
+                        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                            unstarted.release(reservation)?;
+                            return Ok(reason);
+                        }
+                    }
+                    HardLimitPruneOutcome::Cancelled => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Aborted {
+                            reason: TurnEndCancelCause::User,
+                        });
+                    }
+                    HardLimitPruneOutcome::TurnError(error) => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error { error });
+                    }
+                    HardLimitPruneOutcome::NoProgress => {}
+                }
+            }
+
+            let mut context_window =
+                preparation_context_window(&preparation, reservation.session());
+            let mut trigger =
+                pre_step_compaction_trigger(&preparation, reservation.session(), context_window);
+            if summary_attempted && trigger == Some(crate::session::CompactionTrigger::Pressure) {
+                trigger = None;
+            }
+            if trigger == Some(crate::session::CompactionTrigger::Pressure) {
+                match prune_hard_limited_request(reservation, driver, cancellation, budget_failure)
+                    .await?
+                {
+                    HardLimitPruneOutcome::Progress => {
+                        preparation = prepare_conversation_request(
+                            reservation.session(),
+                            driver,
+                            messages.as_slice(),
+                        )?;
+                        context_window =
+                            preparation_context_window(&preparation, reservation.session());
+                        trigger = pre_step_compaction_trigger(
+                            &preparation,
+                            reservation.session(),
+                            context_window,
+                        );
+                    }
+                    HardLimitPruneOutcome::NoProgress => {}
+                    HardLimitPruneOutcome::Cancelled => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Aborted {
+                            reason: TurnEndCancelCause::User,
+                        });
+                    }
+                    HardLimitPruneOutcome::TurnError(error) => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error { error });
+                    }
+                }
+                if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                    unstarted.release(reservation)?;
+                    return Ok(reason);
+                }
+            }
+            if summary_attempted {
+                if trigger == Some(crate::session::CompactionTrigger::HardLimit) {
+                    unstarted.release(reservation)?;
+                    return Ok(TurnEndReason::Error {
+                        error: context_limit_failure()?,
+                    });
+                }
+                trigger = None;
+            }
+            if let Some(trigger) = trigger {
+                let was_hard_limit = trigger == crate::session::CompactionTrigger::HardLimit;
+                let attempts_before_summary = driver.counters.attempts;
+                let outcome = compact_once(
+                    reservation,
+                    driver,
+                    CompactionScope::Automatic { turn, trigger },
+                    retained_token_target(context_window),
+                    cancellation,
+                    budget_failure,
+                )
+                .await?;
+                summary_attempted |= driver.counters.attempts > attempts_before_summary;
+                match outcome {
+                    CompactionOutcome::Progress { .. } => {
+                        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                            unstarted.release(reservation)?;
+                            return Ok(reason);
+                        }
+                        preparation = prepare_conversation_request(
+                            reservation.session(),
+                            driver,
+                            messages.as_slice(),
+                        )?;
+                    }
+                    CompactionOutcome::NoProgress if was_hard_limit => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error {
+                            error: context_limit_failure()?,
+                        });
+                    }
+                    CompactionOutcome::NoProgress => {}
+                    CompactionOutcome::AdvisoryFailure(_) if was_hard_limit => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error {
+                            error: context_limit_failure()?,
+                        });
+                    }
+                    CompactionOutcome::AdvisoryFailure(_) => {}
+                    CompactionOutcome::Cancelled => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Aborted {
+                            reason: TurnEndCancelCause::User,
+                        });
+                    }
+                    CompactionOutcome::TurnError(error) => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error { error });
+                    }
+                }
+            }
+            if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+                unstarted.release(reservation)?;
+                return Ok(TurnEndReason::Error {
+                    error: context_limit_failure()?,
+                });
+            }
+            Some(preparation)
+        };
+        // Compaction may have replaced the visible surface after this step's
+        // claims were sized. Reconcile once more; if guidance was re-armed,
+        // release the untouched claims and reserve the same step again with
+        // that message included.
+        let input_count_before_rearm = messages.len();
+        if let Some(reason) = refresh_dynamic_context(
+            reservation.session(),
+            driver,
+            &mut messages,
+            cancellation,
+            turn,
+            step,
+        )
+        .await?
+        {
+            unstarted.release(reservation)?;
+            return Ok(reason);
+        }
+        if messages.len() != input_count_before_rearm {
+            unstarted.release(reservation)?;
+            continue;
+        }
+        let (mut step_end, input_receipts) = unstarted.enter(reservation).await?;
+        if let Some(session_titles) = driver.session_titles.as_deref_mut() {
+            session_titles
+                .record_fallback(reservation, &messages, &input_receipts)
+                .await;
+        }
+        messages.clear();
+        driver.counters.steps += 1;
+
+        let mut attempt_token = None;
+        let mut resolution = match AssertUnwindSafe(run_step(
+            reservation,
+            driver,
+            StepExecution {
+                turn,
+                step,
+                cancellation,
+                budget_failure,
+            },
+            first_preparation,
+            &mut attempt_token,
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(Ok(resolution)) => resolution,
+            Ok(Err(error)) if reservation.has_pending_preferred_only_result() => {
+                // An irreversible tool side effect already produced this
+                // exact result. A second pre-commit failure leaves Session as
+                // its sole owner, so step/end cannot truthfully pass it. Keep
+                // the original cause visible and let shutdown/recovery finish
+                // the append-only tail.
+                return Err(error);
+            }
+            Ok(Err(error)) if is_fatal_loop_error(&error) => return Err(error),
+            Ok(Err(_)) | Err(_) => StepResolution::new(StepOutcome::Error(failure_reason(
+                "AGENT_INTERNAL",
+                "the agent stopped after an internal failure",
+            )?)),
+        };
+        let disposition = if attempt_token.is_some() {
+            if matches!(&resolution.outcome, StepOutcome::Cancelled) {
+                Some(AttemptDisposition::Cancelled)
+            } else if matches!(&resolution.outcome, StepOutcome::Error(_)) {
+                Some(AttemptDisposition::Failed)
+            } else {
+                // A successful model response must already have committed its
+                // assistant closure and retired the attempt. Surface a stable
+                // internal error, but still close the reserved step/end
+                // instead of leaving a half-open durable turn.
+                resolution = StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_INTERNAL",
+                    "the agent did not finish its provider attempt",
+                )?));
+                Some(AttemptDisposition::Failed)
+            }
+        } else {
+            None
+        };
+        reservation
+            .settle_step_end_with_attempt_settled(
+                &mut step_end,
+                attempt_token.as_ref(),
+                disposition,
+            )
+            .await?;
+        if let Some(token) = attempt_token.as_ref() {
+            match dispatch_barrier(reservation).await? {
+                DispatchBarrier::Ready => {}
+                DispatchBarrier::ObserverUnavailable => {
+                    driver.observer_unavailable = true;
+                    resolution =
+                        StepResolution::new(StepOutcome::Error(observer_unavailable_failure()?));
+                }
+            }
+            reservation.retire_attempt(token)?;
+            attempt_token.take();
+        }
+        if driver.durable_limit.is_some() {
+            return Ok(TurnEndReason::Error {
+                error: driver.session_limit_failure.clone(),
+            });
+        }
+        // Even a completely ready final step must give signals and output
+        // deadlines one scheduling turn before the turn is classified.
+        tokio::task::yield_now().await;
+        match resolution.latched_turn_stop {
+            ToolActionTurnStop::CallerCancelled => {
+                return Ok(TurnEndReason::Aborted {
+                    reason: TurnEndCancelCause::User,
+                });
+            }
+            ToolActionTurnStop::TurnTimeout => {
+                return Ok(TurnEndReason::Error {
+                    error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
+                });
+            }
+            ToolActionTurnStop::None => {
+                if cancellation.is_cancelled() {
+                    return Ok(TurnEndReason::Aborted {
+                        reason: TurnEndCancelCause::User,
+                    });
+                }
+                if Instant::now() >= driver.deadline {
+                    return Ok(TurnEndReason::Error {
+                        error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
+                    });
+                }
+            }
+        }
+        match resolution.outcome {
+            StepOutcome::Continue => {
+                messages.append(driver.pending_repeat_contexts);
+            }
+            StepOutcome::Completed => {
+                if driver.counters.steps >= driver.config.limits.max_steps_per_turn {
+                    driver.job_notices.finish_turn();
+                    return Ok(TurnEndReason::Completed);
+                }
+                if !driver.job_notices.continue_after_completed_step() {
+                    return Ok(TurnEndReason::Completed);
+                }
+            }
+            StepOutcome::MaxTokens => return Ok(TurnEndReason::MaxTokens),
+            StepOutcome::Cancelled => {
+                return Ok(TurnEndReason::Aborted {
+                    reason: TurnEndCancelCause::User,
+                });
+            }
+            StepOutcome::Error(error) => return Ok(TurnEndReason::Error { error }),
+        }
+    }
+}
+
+async fn refresh_dynamic_context(
+    session: &Session,
+    driver: &mut Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+    turn: TurnId,
+    step: StepId,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if let Some(reason) = refresh_workspace_context(session, driver, messages, cancellation).await?
+    {
+        return Ok(Some(reason));
+    }
+    if let Some(reason) = refresh_skill_context(session, driver, messages, cancellation).await? {
+        return Ok(Some(reason));
+    }
+    if let Some(reason) = refresh_time_context(session, driver, messages, cancellation, turn, step)?
+    {
+        return Ok(Some(reason));
+    }
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        }));
+    }
+    let notices = driver.job_notices.claim_for_active_step();
+    if !notices.is_empty() {
+        match messages_for_notices(&notices, driver.runtime) {
+            Ok(mut notice_messages) => messages.append(&mut notice_messages),
+            Err(error) => {
+                driver.job_notices.restore_active(notices);
+                return Err(error);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn refresh_time_context(
+    session: &Session,
+    driver: &Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+    turn: TurnId,
+    step: StepId,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if messages.iter().any(is_time_context_message) {
+        return Ok(None);
+    }
+    let Some(runtime) = driver.time_context else {
+        return Ok(None);
+    };
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        }));
+    }
+    let context = match runtime.prepare(session, turn, step, driver.runtime) {
+        Ok(context) => context,
+        Err(_) => {
+            return Ok(Some(TurnEndReason::Error {
+                error: failure_reason(
+                    "AGENT_TIME_CONTEXT",
+                    "time context could not be prepared safely",
+                )?,
+            }));
+        }
+    };
+    messages.push(context);
+    Ok(None)
+}
+
+fn is_time_context_message(message: &Message) -> bool {
+    matches!(
+        message.source().kind(),
+        MessageSourceKind::Plugin { plugin, .. }
+            if plugin == crate::time_context::TIME_CONTEXT_SOURCE
+    )
+}
+
+async fn refresh_workspace_context(
+    session: &Session,
+    driver: &mut Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if messages.iter().any(is_workspace_context_message) {
+        return Ok(None);
+    }
+    let Some(runtime) = driver.workspace_instructions else {
+        driver.pending_workspace_touches.clear();
+        return Ok(None);
+    };
+    match runtime
+        .prepare(session, driver.pending_workspace_touches, cancellation)
+        .await
+    {
+        Ok(context) => {
+            driver.pending_workspace_touches.clear();
+            if let Some(context) = context {
+                messages.push(context);
+            }
+            Ok(None)
+        }
+        Err(WorkspaceInstructionError::Cancelled) => Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        })),
+        Err(_) => Ok(Some(TurnEndReason::Error {
+            error: failure_reason(
+                "AGENT_WORKSPACE_INSTRUCTIONS",
+                "workspace instructions could not be refreshed safely",
+            )?,
+        })),
+    }
+}
+
+fn is_workspace_context_message(message: &Message) -> bool {
+    message.source().raw().as_value()["kind"].as_str() == Some("agent-instructions")
+}
+
+async fn refresh_skill_context(
+    session: &Session,
+    driver: &Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if messages.iter().any(is_skill_catalog_message) {
+        return Ok(None);
+    }
+    let Some(runtime) = driver.skills else {
+        return Ok(None);
+    };
+    match runtime.prepare_catalog(session, cancellation).await {
+        Ok(Some(context)) => {
+            messages.push(context);
+            Ok(None)
+        }
+        Ok(None) => Ok(None),
+        Err(SkillRuntimeError::Cancelled) => Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        })),
+        Err(SkillRuntimeError::Task | SkillRuntimeError::Message) => {
+            Ok(Some(TurnEndReason::Error {
+                error: failure_reason(
+                    "AGENT_SKILLS",
+                    "project Skill catalog could not be refreshed safely",
+                )?,
+            }))
+        }
+    }
+}
+
+fn is_skill_catalog_message(message: &Message) -> bool {
+    message.source().raw().as_value()["kind"].as_str() == Some("skill-catalog")
+}
+
+async fn flush_pending_plan_mode(
+    reservation: &mut SessionReservation<'_>,
+    driver: &Driver<'_>,
+) -> Result<(), AgentLoopError> {
+    let Some(runtime) = driver.config.plan_mode.as_ref() else {
+        return Ok(());
+    };
+    let Some(mutation) = runtime
+        .prepare_boundary()
+        .map_err(|_| AgentLoopError::Invariant("Plan Mode boundary state is unavailable"))?
+    else {
+        return Ok(());
+    };
+    reservation
+        .append_settled(NewEvent::log(EventKind::plan_mode(mutation.change())))
+        .await?;
+    mutation
+        .commit()
+        .map_err(|_| AgentLoopError::Invariant("committed Plan Mode boundary was not installable"))
+}
+
+fn pre_step_stop(
+    driver: &Driver<'_>,
+    cancellation: &CancellationToken,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if driver.durable_limit.is_some() {
+        return Ok(Some(TurnEndReason::Error {
+            error: driver.session_limit_failure.clone(),
+        }));
+    }
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        }));
+    }
+    if Instant::now() >= driver.deadline {
+        return Ok(Some(TurnEndReason::Error {
+            error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
+        }));
+    }
+    Ok(None)
+}
+
+async fn prune_hard_limited_request(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    cancellation: &CancellationToken,
+    budget_failure: &LlmFailure,
+) -> Result<HardLimitPruneOutcome, AgentLoopError> {
+    let result = reservation.prune_oversized_tool_results(cancellation).await;
+    match result {
+        Ok(report) if report.replacements() > 0 => Ok(HardLimitPruneOutcome::Progress),
+        Ok(_) => Ok(HardLimitPruneOutcome::NoProgress),
+        Err(error) => {
+            let progress = error.progress().replacements() > 0;
+            match error.cause() {
+                ToolResultPrunePassCause::Cancelled
+                | ToolResultPrunePassCause::Read(SessionReadError::Cancelled) => {
+                    Ok(HardLimitPruneOutcome::Cancelled)
+                }
+                ToolResultPrunePassCause::Read(SessionReadError::Storage(error)) => {
+                    Err((*error).into())
+                }
+                ToolResultPrunePassCause::Read(SessionReadError::Corrupt) => {
+                    Err(AppendError::DurablePoisoned.into())
+                }
+                ToolResultPrunePassCause::Barrier(BarrierError::ObserverUnavailable) => {
+                    driver.observer_unavailable = true;
+                    Ok(HardLimitPruneOutcome::TurnError(
+                        observer_unavailable_failure()?,
+                    ))
+                }
+                ToolResultPrunePassCause::Barrier(error) => Err(error.clone().into()),
+                ToolResultPrunePassCause::Read(SessionReadError::Append(error)) => {
+                    classify_prune_append_error(driver, error, budget_failure, progress)
+                }
+                ToolResultPrunePassCause::Pair(error) => {
+                    let source = match error {
+                        crate::session::PrunePairAppendError::BeforeMarker(source)
+                        | crate::session::PrunePairAppendError::MarkerCommitted {
+                            source, ..
+                        } => source,
+                    };
+                    classify_prune_append_error(driver, source, budget_failure, progress)
+                }
+                ToolResultPrunePassCause::Capacity
+                | ToolResultPrunePassCause::Transform(_)
+                | ToolResultPrunePassCause::Read(SessionReadError::Changed) => Ok(if progress {
+                    HardLimitPruneOutcome::Progress
+                } else {
+                    HardLimitPruneOutcome::NoProgress
+                }),
+            }
+        }
+    }
+}
+
+fn classify_prune_append_error(
+    driver: &mut Driver<'_>,
+    error: &AppendError,
+    budget_failure: &LlmFailure,
+    progress: bool,
+) -> Result<HardLimitPruneOutcome, AgentLoopError> {
+    if is_budget_error(error) {
+        return Ok(HardLimitPruneOutcome::TurnError(
+            driver.failure_for_budget(error, budget_failure),
+        ));
+    }
+    let loop_error = AgentLoopError::Session(error.clone());
+    if is_fatal_loop_error(&loop_error) {
+        return Err(loop_error);
+    }
+    Ok(if progress {
+        HardLimitPruneOutcome::Progress
+    } else {
+        HardLimitPruneOutcome::NoProgress
+    })
+}
+
+fn prepare_conversation_request(
+    session: &Session,
+    driver: &Driver<'_>,
+    pending_messages: &[Message],
+) -> Result<AttemptPreparation, AgentLoopError> {
+    if session.context_total_tokens().is_err() {
+        return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+            "AGENT_INTERNAL",
+            "the agent stopped after an internal failure",
+        )?));
+    }
+    let source_surface_generation = session.surface_generation();
+    let pending_generation = u64::try_from(pending_messages.len())
+        .map_err(|_| AgentLoopError::Invariant("pending message count exceeded u64"))?;
+    let expected_surface_generation = source_surface_generation
+        .checked_add(pending_generation)
+        .ok_or(AgentLoopError::Invariant("surface generation exhausted"))?;
+    let proposed = match proposed_config(
+        driver.config,
+        session.request_header(),
+        *driver.request_header_logged,
+    ) {
+        Ok(proposed) => proposed,
+        Err(_) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_INTERNAL",
+                "the agent stopped after an internal failure",
+            )?));
+        }
+    };
+    let system = match driver.config.effective_system() {
+        Ok(system) => system,
+        Err(()) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_INTERNAL",
+                "the agent stopped after an internal failure",
+            )?));
+        }
+    };
+    let messages = match session.try_messages_with(pending_messages) {
+        Ok(messages) => messages,
+        Err(()) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_REQUEST",
+                "model request construction failed",
+            )?));
+        }
+    };
+    let draft = match conversation_request_draft(
+        &proposed,
+        &messages,
+        system.as_deref(),
+        &driver.config.tools,
+        session,
+    ) {
+        Ok(draft) => draft,
+        Err(error) if is_hard_request_limit(&error) => {
+            return Ok(AttemptPreparation::HardLimit { prepared: None });
+        }
+        Err(error) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_from_display(
+                "AGENT_REQUEST",
+                "model request construction failed",
+                &error,
+            )?));
+        }
+    };
+    let preflight = match catch_unwind(AssertUnwindSafe(|| {
+        driver.provider.preflight_request(draft)
+    })) {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(
+            ProviderPreflightError::WireTooLarge { prepared, .. }
+            | ProviderPreflightError::RequestLimit { prepared },
+        )) => {
+            return Ok(AttemptPreparation::HardLimit {
+                prepared: Some(prepared),
+            });
+        }
+        Ok(Err(ProviderPreflightError::Preparation(error))) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_from_display(
+                "AGENT_PROVIDER_PREPARE",
+                "provider preparation failed",
+                &error,
+            )?));
+        }
+        Ok(Err(ProviderPreflightError::InvalidRequest { failure, prepared })) => {
+            return Ok(AttemptPreparation::PreparedFailure {
+                prepared,
+                failure,
+                system,
+            });
+        }
+        Err(_) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_PROVIDER_PANIC",
+                "the provider panicked while preparing a request",
+            )?));
+        }
+    };
+    Ok(AttemptPreparation::Ready(PreflightedRequest {
+        proposed,
+        messages,
+        system,
+        expected_surface_generation,
+        preflight,
+    }))
+}
+
+fn conversation_request_draft<'a>(
+    proposed: &'a LlmCallConfig,
+    messages: &'a [Message],
+    system: Option<&'a str>,
+    tools: &'a [ToolSchema],
+    session: &'a Session,
+) -> Result<ProviderRequestDraft<'a>, ProviderRequestError> {
+    let mut draft = ProviderRequestDraft::new(proposed, messages)?;
+    if let Some(system) = system {
+        draft = draft.with_system(system)?;
+    }
+    if !tools.is_empty() {
+        draft = draft.with_tools(tools)?;
+    }
+    draft.with_session_id(session.id())
+}
+
+fn is_hard_request_limit(error: &ProviderRequestError) -> bool {
+    matches!(
+        error,
+        ProviderRequestError::TooManyMessages { .. }
+            | ProviderRequestError::TooLarge { .. }
+            | ProviderRequestError::SizeOverflow
+    )
+}
+
+fn context_limit_failure() -> Result<LlmFailure, AgentLoopError> {
+    failure_reason(
+        "AGENT_CONTEXT_LIMIT",
+        "the conversation cannot be reduced to fit the model request limits",
+    )
+}
+
+struct StepExecution<'a> {
+    turn: TurnId,
+    step: StepId,
+    cancellation: &'a CancellationToken,
+    budget_failure: &'a LlmFailure,
+}
+
+async fn run_step(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    execution: StepExecution<'_>,
+    mut first_preparation: Option<AttemptPreparation>,
+    attempt_token: &mut Option<AttemptToken>,
+) -> Result<StepResolution, AgentLoopError> {
+    let StepExecution {
+        turn,
+        step,
+        cancellation,
+        budget_failure,
+    } = execution;
+    let mut retry_chains: BTreeMap<(String, String), (RetryId, usize)> = BTreeMap::new();
+    let mut retries_in_step = 0_usize;
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(StepResolution::new(StepOutcome::Cancelled));
+        }
+        if Instant::now() >= driver.deadline {
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                "AGENT_TURN_TIMEOUT",
+                "the agent turn timed out",
+            )?)));
+        }
+        if driver.counters.attempts >= driver.config.limits.max_attempts_per_turn {
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                "AGENT_MAX_MODEL_ATTEMPTS",
+                "the agent reached its model-attempt limit",
+            )?)));
+        }
+        driver.counters.attempts += 1;
+
+        let preparation = match first_preparation.take() {
+            Some(preparation) => preparation,
+            None => prepare_conversation_request(reservation.session(), driver, &[])?,
+        };
+        let (
+            preflighted,
+            effective_config,
+            retry_policy,
+            adapter_defaults,
+            context_window,
+            prepared_failure,
+            request_system,
+        ) = match preparation {
+            AttemptPreparation::Ready(preflighted) => {
+                let prepared = preflighted.prepared_call();
+                let effective_config = prepared.config().clone();
+                let retry_policy = prepared.retry_policy().clone();
+                let adapter_defaults = prepared.adapter_defaults().clone();
+                let context_window = prepared.context_window();
+                let request_system = preflighted.system.clone();
+                (
+                    Some(preflighted),
+                    effective_config,
+                    retry_policy,
+                    adapter_defaults,
+                    context_window,
+                    None,
+                    request_system,
+                )
+            }
+            AttemptPreparation::PreparedFailure {
+                prepared,
+                failure,
+                system,
+            } => (
+                None,
+                prepared.config().clone(),
+                prepared.retry_policy().clone(),
+                prepared.adapter_defaults().clone(),
+                prepared.context_window(),
+                Some(failure),
+                system,
+            ),
+            AttemptPreparation::DeferredFailure(failure) => {
+                return Ok(StepResolution::new(StepOutcome::Error(failure)));
+            }
+            AttemptPreparation::HardLimit { prepared, .. } => {
+                let _context_window = prepared.and_then(|prepared| prepared.context_window());
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    context_limit_failure()?,
+                )));
+            }
+        };
+        if !effective_config.max_tokens().is_some_and(|maximum| {
+            maximum.get() > 0 && maximum.get() <= driver.config.limits.max_output_tokens_per_request
+        }) {
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                "AGENT_MAX_OUTPUT_TOKENS",
+                "the prepared model request exceeds the agent output-token limit",
+            )?)));
+        }
+        let header = EpochHeader {
+            config: effective_config.clone(),
+            adapter_defaults: Some(adapter_defaults),
+            system: request_system,
+            tools: (!driver.config.tools.is_empty()).then(|| driver.config.tools.clone()),
+        }
+        .canonicalized();
+
+        let force_header = !*driver.request_header_logged;
+        let header_changed = reservation
+            .session()
+            .request_header()
+            .is_none_or(|previous| !previous.equivalent_to(&header));
+        if force_header || header_changed {
+            let reason = if force_header {
+                if reservation.session().request_header().is_some() {
+                    RequestHeaderReason::Resume
+                } else {
+                    RequestHeaderReason::Initial
+                }
+            } else {
+                RequestHeaderReason::Change
+            };
+            match reservation
+                .append_settled(NewEvent::log(EventKind::RequestHeader {
+                    header: header.clone(),
+                    reason,
+                }))
+                .await
+            {
+                Ok(_) => *driver.request_header_logged = true,
+                Err(error) if is_budget_error(&error) => {
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        driver.failure_for_budget(&error, budget_failure),
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let context = RequestContext::new(
+            effective_config.provider(),
+            effective_config.model(),
+            context_window,
+        )?;
+        let context_changed = reservation
+            .session()
+            .request_context()
+            .is_none_or(|previous| !previous.equivalent_to(&context));
+        if context_changed {
+            match reservation
+                .append_settled(NewEvent::log(EventKind::RequestContext {
+                    context: context.clone(),
+                }))
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if is_budget_error(&error) => {
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        driver.failure_for_budget(&error, budget_failure),
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        if let Some(session_titles) = driver.session_titles.as_deref_mut() {
+            session_titles
+                .start_refinement(reservation, &effective_config)
+                .await;
+        }
+
+        if let Some(failure) = prepared_failure {
+            return Ok(StepResolution::new(StepOutcome::Error(failure)));
+        }
+        let preflighted = preflighted.ok_or(AgentLoopError::Invariant(
+            "a prepared request disappeared before dispatch",
+        ))?;
+
+        if !preflighted.matches_surface(reservation.session()) {
+            return Err(AgentLoopError::Invariant(
+                "model-visible surface changed after provider preflight",
+            ));
+        }
+        let request = match preflighted.into_request(reservation.session(), driver.config) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    failure_from_display(
+                        "AGENT_REQUEST",
+                        "model request construction failed",
+                        &error,
+                    )?,
+                )));
+            }
+        };
+
+        if dispatch_barrier(reservation).await? == DispatchBarrier::ObserverUnavailable {
+            driver.observer_unavailable = true;
+            return Ok(StepResolution::new(StepOutcome::Error(
+                observer_unavailable_failure()?,
+            )));
+        }
+        if cancellation.is_cancelled() {
+            return Ok(StepResolution::new(StepOutcome::Cancelled));
+        }
+        if Instant::now() >= driver.deadline {
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                "AGENT_TURN_TIMEOUT",
+                "the agent turn timed out",
+            )?)));
+        }
+
+        if attempt_token.is_some() {
+            return Err(AgentLoopError::Invariant(
+                "a previous provider attempt was not retired before dispatch",
+            ));
+        }
+        *attempt_token = Some(reservation.begin_attempt(turn, step)?);
+        let attempt_cancellation = cancellation.child_token();
+        let stream = match catch_unwind(AssertUnwindSafe(|| {
+            driver
+                .provider
+                .stream(request, attempt_cancellation.clone())
+        })) {
+            Ok(stream) => stream,
+            Err(_) => {
+                attempt_cancellation.cancel();
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_PROVIDER_PANIC",
+                    "the provider panicked while opening a stream",
+                )?)));
+            }
+        };
+        let streamed = consume_stream(
+            reservation,
+            driver,
+            turn,
+            step,
+            attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+                "provider attempt owner disappeared before streaming",
+            ))?,
+            stream,
+            cancellation,
+            budget_failure,
+        )
+        .await;
+        if !matches!(streamed, Ok(StreamOutcome::Finished(_))) {
+            attempt_cancellation.cancel();
+        }
+        let streamed = streamed?;
+        let prepared_attempt = match streamed {
+            StreamOutcome::Cancelled => {
+                return Ok(StepResolution::new(StepOutcome::Cancelled));
+            }
+            StreamOutcome::Error(error) => {
+                return Ok(StepResolution::new(StepOutcome::Error(error)));
+            }
+            StreamOutcome::Finished(prepared) => prepared,
+        };
+
+        let prepared = prepared_attempt.into_parts();
+        let assembled = AssembledAssistant {
+            content: prepared.content,
+            usage: prepared.usage,
+            finish: prepared.finish,
+            replay_state: prepared.replay_state,
+            _resident_guard: prepared.resident_guard,
+        };
+        let source_seqs = prepared.sources;
+
+        // Cancellation can race with the provider's final item. Re-check it
+        // before publishing an assistant message or starting any tool work.
+        if cancellation.is_cancelled() {
+            attempt_cancellation.cancel();
+            return Ok(StepResolution::new(StepOutcome::Cancelled));
+        }
+        if Instant::now() >= driver.deadline {
+            attempt_cancellation.cancel();
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                "AGENT_TURN_TIMEOUT",
+                "the agent turn timed out",
+            )?)));
+        }
+
+        let provider_failure = match assembled.finish.kind() {
+            FinishReasonKind::Error { failure } | FinishReasonKind::Aborted { failure } => {
+                Some(failure.clone())
+            }
+            _ => None,
+        };
+        if let Some(failure) = provider_failure {
+            if cancellation.is_cancelled() {
+                return Ok(StepResolution::new(StepOutcome::Cancelled));
+            }
+            let key = policy_key(&retry_policy)
+                .map_err(|error| AgentLoopError::Serialization(error.to_string()))?;
+            let chain_key = (effective_config.provider().to_owned(), key.clone());
+            let prior = retry_chains.get(&chain_key).map_or(0, |(_, prior)| *prior);
+            let next_retry = prior
+                .checked_add(1)
+                .ok_or(AgentLoopError::Invariant("retry number exhausted"))?;
+            let initial_decision = decide(&retry_policy, &failure, next_retry, None);
+            if matches!(initial_decision, RetryDecision::Stop) {
+                return Ok(StepResolution::new(StepOutcome::Error(failure)));
+            }
+            if retries_in_step >= driver.config.limits.max_retries_per_step {
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_MAX_RETRIES",
+                    "the agent reached its retry limit",
+                )?)));
+            }
+            if driver.counters.attempts >= driver.config.limits.max_attempts_per_turn {
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_MAX_MODEL_ATTEMPTS",
+                    "the agent reached its model-attempt limit",
+                )?)));
+            }
+            let decision = match initial_decision {
+                RetryDecision::NeedsSample => decide(
+                    &retry_policy,
+                    &failure,
+                    next_retry,
+                    Some(checked_sample(driver.runtime)?),
+                ),
+                decision => decision,
+            };
+            let RetryDecision::Retry { delay_ms } = decision else {
+                return Ok(StepResolution::new(StepOutcome::Error(failure)));
+            };
+            let retry_id = match retry_chains.get(&chain_key) {
+                Some((retry_id, _)) => retry_id.clone(),
+                None => RetryId::new(next_id(driver.runtime, AgentIdKind::Retry)?),
+            };
+            let number = RetryNumber::new(next_retry as u64)
+                .map_err(|_| AgentLoopError::Invariant("retry number exhausted"))?;
+            let retry_event = match retry_policy.mode() {
+                RetryMode::Normal => {
+                    let maximum = retry_policy.max_retries().ok_or(AgentLoopError::Invariant(
+                        "normal retry policy omitted maxRetries",
+                    ))?;
+                    let maximum = RetryNumber::new(maximum.get()).map_err(|_| {
+                        AgentLoopError::Invariant("scheduled retry has zero maxRetries")
+                    })?;
+                    LlmRetryEvent::normal(
+                        retry_id.clone(),
+                        turn,
+                        step,
+                        effective_config.provider(),
+                        key.clone(),
+                        number,
+                        maximum,
+                        delay_ms,
+                        failure,
+                    )?
+                }
+                RetryMode::Always => LlmRetryEvent::always(
+                    retry_id.clone(),
+                    turn,
+                    step,
+                    effective_config.provider(),
+                    key.clone(),
+                    number,
+                    delay_ms,
+                    failure,
+                )?,
+            };
+            let token = attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+                "failed provider attempt lost its Session owner",
+            ))?;
+            match reservation
+                .append_attempt_closure_settled(
+                    token,
+                    AttemptDisposition::Retry,
+                    NewEvent::log(EventKind::llm_retry(retry_event)),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if is_budget_error(&error) => {
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        driver.failure_for_budget(&error, budget_failure),
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            // The retry row now owns every fact needed after the failed
+            // attempt. Drop every moved-out attempt payload while the Session
+            // guard still covers it, before waiting for durable dispatch.
+            drop(assembled);
+            drop(source_seqs);
+            let barrier = dispatch_barrier(reservation).await?;
+            reservation.retire_attempt(token)?;
+            attempt_token.take();
+            if barrier == DispatchBarrier::ObserverUnavailable {
+                driver.observer_unavailable = true;
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    observer_unavailable_failure()?,
+                )));
+            }
+            retry_chains.insert(chain_key, (retry_id.clone(), prior + 1));
+            retries_in_step += 1;
+            driver.counters.retries += 1;
+
+            let delay = Duration::from_secs_f64(delay_ms.get() / 1_000.0);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Ok(StepResolution::new(StepOutcome::Cancelled));
+                }
+                _ = tokio::time::sleep_until(driver.deadline) => {
+                    return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                        "AGENT_TURN_TIMEOUT",
+                        "the agent turn timed out",
+                    )?)));
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            tokio::task::yield_now().await;
+            if cancellation.is_cancelled() {
+                return Ok(StepResolution::new(StepOutcome::Cancelled));
+            }
+            if Instant::now() >= driver.deadline {
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?)));
+            }
+            let started = LlmRetryStartedEvent::new(retry_id, turn, step, number)?;
+            match reservation
+                .append_settled(NewEvent::log(EventKind::llm_retry_started(started)))
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if is_budget_error(&error) => {
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        driver.failure_for_budget(&error, budget_failure),
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            continue;
+        }
+
+        return commit_successful_attempt(
+            reservation,
+            driver,
+            turn,
+            step,
+            effective_config,
+            assembled,
+            source_seqs,
+            attempt_token,
+            cancellation,
+            budget_failure,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn consume_stream(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    _turn: TurnId,
+    _step: StepId,
+    attempt: &AttemptToken,
+    mut stream: crate::provider::ProviderStream,
+    cancellation: &CancellationToken,
+    budget_failure: &LlmFailure,
+) -> Result<StreamOutcome, AgentLoopError> {
+    let mut ready_chunks = 0_usize;
+    loop {
+        let next = AssertUnwindSafe(stream.next()).catch_unwind();
+        let item = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(StreamOutcome::Cancelled),
+            _ = tokio::time::sleep_until(driver.deadline) => {
+                return Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?));
+            }
+            item = next => match item {
+                Ok(item) => item,
+                Err(_) => return Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_PROVIDER_PANIC",
+                    "the provider stream panicked",
+                )?)),
+            },
+        };
+        let Some(item) = item else {
+            return match reservation.seal_attempt(attempt) {
+                Ok(prepared) => Ok(StreamOutcome::Finished(prepared)),
+                Err(AppendError::Validation(_)) => Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_PROVIDER_PROTOCOL",
+                    "the provider stream ended incorrectly",
+                )?)),
+                Err(error) if is_budget_error(&error) => Ok(StreamOutcome::Error(
+                    driver.failure_for_budget(&error, budget_failure),
+                )),
+                Err(error) => Err(error.into()),
+            };
+        };
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return Ok(StreamOutcome::Error(failure_from_display(
+                    "AGENT_PROVIDER_STREAM",
+                    "the provider stream failed",
+                    &error,
+                )?));
+            }
+        };
+        let reported_output_tokens = match chunk.kind() {
+            StreamChunkKind::Usage { usage } => Some(usage.output_tokens().get()),
+            _ => None,
+        };
+        match reservation
+            .append_attempt_chunk_settled(attempt, chunk)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if is_budget_error(&error) => {
+                return Ok(StreamOutcome::Error(
+                    driver.failure_for_budget(&error, budget_failure),
+                ));
+            }
+            Err(AppendError::Validation(_)) => {
+                return Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_PROVIDER_PROTOCOL",
+                    "the provider emitted an invalid stream",
+                )?));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(output_tokens) = reported_output_tokens {
+            driver.counters.reported_output_tokens = driver
+                .counters
+                .reported_output_tokens
+                .checked_add(output_tokens)
+                .unwrap_or(u64::MAX);
+            if driver.counters.reported_output_tokens
+                > driver.config.limits.max_reported_output_tokens_per_turn
+            {
+                return Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_TOKEN_BUDGET",
+                    "the agent reached its reported output-token limit",
+                )?));
+            }
+        }
+        ready_chunks += 1;
+        if ready_chunks == AGENT_READY_WORK_BUDGET {
+            ready_chunks = 0;
+            tokio::task::yield_now().await;
+            if cancellation.is_cancelled() {
+                return Ok(StreamOutcome::Cancelled);
+            }
+            if Instant::now() >= driver.deadline {
+                return Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_successful_attempt(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    turn: TurnId,
+    step: StepId,
+    config: LlmCallConfig,
+    assembled: AssembledAssistant,
+    source_seqs: Vec<EventSeq>,
+    attempt_token: &mut Option<AttemptToken>,
+    cancellation: &CancellationToken,
+    budget_failure: &LlmFailure,
+) -> Result<StepResolution, AgentLoopError> {
+    let AssembledAssistant {
+        mut content,
+        usage,
+        finish,
+        replay_state,
+        _resident_guard: resident_guard,
+    } = assembled;
+    let max_tokens = matches!(finish.kind(), FinishReasonKind::MaxTokens);
+    // FinishReason is attempt-only on every successful path. Release this
+    // alias while the Session attempt owner still covers the allocation, so
+    // tool execution cannot outlive the credit that accounted for it.
+    drop(finish);
+    if max_tokens {
+        content = without_tool_calls(content);
+    }
+    let message = Message::new(
+        next_id(driver.runtime, AgentIdKind::Message)?,
+        MessageRole::Assistant,
+        content,
+        MessageSource::model_with_replay_state(config.provider(), config.model(), replay_state)?,
+    )?;
+    let tool_calls = message
+        .content()
+        .iter()
+        .filter_map(|block| match block.kind() {
+            ContentBlockKind::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some(ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Err(code) = validate_tool_calls(driver, &tool_calls) {
+        let message = if code == "AGENT_MAX_TOOL_CALLS" {
+            "the agent reached its tool-call limit"
+        } else {
+            "the model produced invalid or duplicate tool calls"
+        };
+        return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+            code, message,
+        )?)));
+    }
+    let mut claim_profiles = Vec::with_capacity(tool_calls.len());
+    for call in &tool_calls {
+        let profile = match catch_unwind(AssertUnwindSafe(|| {
+            driver.tools.claim_profile(call.name.as_str())
+        })) {
+            Ok(profile) => profile,
+            Err(_) => {
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_TOOL_EXECUTOR",
+                    "the tool executor failed while planning result capacity",
+                )?)));
+            }
+        };
+        claim_profiles.push(profile);
+    }
+    let assistant = NewEvent::surface(
+        EventKind::AssistantMessage {
+            turn,
+            step,
+            message,
+            usage,
+        },
+        SurfaceIntent::append().with_sources(source_seqs),
+    );
+    if tool_calls.is_empty() {
+        let token = attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+            "successful provider attempt lost its Session owner",
+        ))?;
+        match reservation
+            .append_attempt_closure_settled(token, AttemptDisposition::Committed, assistant)
+            .await
+        {
+            Ok(receipt) => driver.observe_assistant_commit(&receipt),
+            Err(error) if is_budget_error(&error) => {
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    driver.failure_for_budget(&error, budget_failure),
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let barrier = dispatch_barrier(reservation).await?;
+        reservation.retire_attempt(token)?;
+        attempt_token.take();
+        drop(resident_guard);
+        if barrier == DispatchBarrier::ObserverUnavailable {
+            driver.observer_unavailable = true;
+            return Ok(StepResolution::new(StepOutcome::Error(
+                observer_unavailable_failure()?,
+            )));
+        }
+        return Ok(StepResolution::new(if max_tokens {
+            StepOutcome::MaxTokens
+        } else {
+            StepOutcome::Completed
+        }));
+    }
+
+    commit_tool_round(
+        reservation,
+        driver,
+        turn,
+        step,
+        assistant,
+        tool_calls,
+        claim_profiles,
+        attempt_token,
+        resident_guard,
+        cancellation,
+        budget_failure,
+    )
+    .await
+}
+
+#[derive(Clone)]
+struct ToolCall {
+    id: CallId,
+    name: String,
+    arguments: String,
+}
+
+fn validate_tool_calls(driver: &Driver<'_>, calls: &[ToolCall]) -> Result<(), &'static str> {
+    if calls.len() > driver.config.limits.max_tool_calls_per_step
+        || driver.counters.tool_calls.saturating_add(calls.len())
+            > driver.config.limits.max_tool_calls_per_turn
+    {
+        return Err("AGENT_MAX_TOOL_CALLS");
+    }
+    let mut ids = BTreeSet::new();
+    if calls.iter().any(|call| {
+        call.id.is_empty()
+            || call.id.as_str().len() > 1_024
+            || call.id.as_str().chars().any(char::is_control)
+            || call.name.is_empty()
+            || call.name.len() > 256
+            || call.name.chars().any(char::is_control)
+            || !ids.insert(call.id.clone())
+    }) {
+        return Err("AGENT_INVALID_TOOL_CALL");
+    }
+    Ok(())
+}
+
+struct PlannedTool {
+    call: ToolCall,
+    claim_profile: ToolClaimProfile,
+    dispatch: ToolDispatchBinding,
+    call_seq: EventSeq,
+    result_message_id: String,
+    call_claim: EventClaim,
+    result_claim: EventClaim,
+}
+
+#[derive(Clone)]
+struct ToolRunPlan {
+    call: ToolCall,
+    claim_profile: ToolClaimProfile,
+    dispatch: ToolDispatchBinding,
+}
+
+impl From<&PlannedTool> for ToolRunPlan {
+    fn from(plan: &PlannedTool) -> Self {
+        Self {
+            call: plan.call.clone(),
+            claim_profile: plan.claim_profile.clone(),
+            dispatch: plan.dispatch.clone(),
+        }
+    }
+}
+
+trait ToolPlanView {
+    fn call(&self) -> &ToolCall;
+    fn claim_profile(&self) -> &ToolClaimProfile;
+}
+
+impl ToolPlanView for PlannedTool {
+    fn call(&self) -> &ToolCall {
+        &self.call
+    }
+
+    fn claim_profile(&self) -> &ToolClaimProfile {
+        &self.claim_profile
+    }
+}
+
+impl ToolPlanView for ToolRunPlan {
+    fn call(&self) -> &ToolCall {
+        &self.call
+    }
+
+    fn claim_profile(&self) -> &ToolClaimProfile {
+        &self.claim_profile
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_tool_round(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    turn: TurnId,
+    step: StepId,
+    assistant: NewEvent,
+    calls: Vec<ToolCall>,
+    claim_profiles: Vec<ToolClaimProfile>,
+    attempt_token: &mut Option<AttemptToken>,
+    resident_guard: Option<AttemptResidentGuard>,
+    cancellation: &CancellationToken,
+    budget_failure: &LlmFailure,
+) -> Result<StepResolution, AgentLoopError> {
+    if calls.len() != claim_profiles.len() {
+        return Err(AgentLoopError::Invariant(
+            "tool calls and claim profiles have different lengths",
+        ));
+    }
+    let mut result_ids = Vec::with_capacity(calls.len());
+    let mut fallbacks = Vec::with_capacity(1 + calls.len() * 2);
+    fallbacks.push(assistant);
+    let maximum_source_seq = EventSeq::new(crate::session::MAX_SAFE_INTEGER)
+        .map_err(|_| AgentLoopError::Invariant("maximum event sequence is invalid"))?;
+    for call in &calls {
+        let result_id = next_id(driver.runtime, AgentIdKind::Message)?;
+        fallbacks.push(NewEvent::log(EventKind::tool_call(
+            turn,
+            step,
+            call.id.clone(),
+            call.name.clone(),
+            call.arguments.clone(),
+        )));
+        let profile = claim_profiles[result_ids.len()].clone();
+        fallbacks.push(tool_prestart_error_event(
+            &profile,
+            turn,
+            step,
+            &result_id,
+            call,
+            maximum_source_seq,
+            "TOOL_OUTPUT_BUDGET_EXCEEDED",
+            call.name.as_str(),
+            if profile.is_shell_action() {
+                "shell output could not fit safely in the session"
+            } else if profile.is_plugin_action() {
+                "plugin output could not fit safely in the session"
+            } else {
+                "tool output could not fit safely in the session"
+            },
+        )?);
+        result_ids.push(result_id);
+    }
+    let mut claims = match reservation.claim_batch(fallbacks) {
+        Ok(claims) => claims,
+        Err(error) if is_budget_error(&error) => {
+            return Ok(StepResolution::new(StepOutcome::Error(
+                driver.failure_for_budget(&error, budget_failure),
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut assistant_claim = claims.remove(0);
+    let mut planned = Vec::with_capacity(calls.len());
+    for ((call, result_message_id), claim_profile) in
+        calls.into_iter().zip(result_ids).zip(claim_profiles)
+    {
+        let call_claim = claims.remove(0);
+        let result_claim = claims.remove(0);
+        planned.push(PlannedTool {
+            call,
+            claim_profile,
+            dispatch: ToolDispatchBinding::with_goal_caller(driver.goal_tool_caller),
+            call_seq: maximum_source_seq,
+            result_message_id,
+            call_claim,
+            result_claim,
+        });
+    }
+    for index in 0..planned.len() {
+        let ceiling = if matches!(
+            planned[index].call.name.as_str(),
+            "create_goal" | "update_goal"
+        ) {
+            MAX_AGENT_GOAL_RESULT_EVENT_BYTES
+        } else {
+            match planned[index].claim_profile.action_contract() {
+                Some(ActionContract::Shell) => shell_prestart_claim_ceiling(
+                    turn,
+                    step,
+                    &planned[index].result_message_id,
+                    &planned[index].call,
+                    maximum_source_seq,
+                )?,
+                Some(ActionContract::Plugin { plugin_id }) => plugin_prestart_claim_ceiling(
+                    plugin_id.as_str(),
+                    turn,
+                    step,
+                    &planned[index].result_message_id,
+                    &planned[index].call,
+                    maximum_source_seq,
+                )?,
+                None => continue,
+            }
+        };
+        if let Err(error) =
+            reservation.reserve_claim_retained_json_bytes(&mut planned[index].result_claim, ceiling)
+        {
+            release_uncommitted_tool_round(reservation, &mut assistant_claim, &mut planned)?;
+            return if is_budget_error(&error) {
+                Ok(StepResolution::new(StepOutcome::Error(
+                    driver.failure_for_budget(&error, budget_failure),
+                )))
+            } else {
+                Err(error.into())
+            };
+        }
+    }
+    let token = attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+        "successful provider attempt lost its Session owner",
+    ))?;
+    let assistant_receipt = reservation
+        .settle_attempt_closure_exact_settled(
+            &mut assistant_claim,
+            token,
+            AttemptDisposition::Committed,
+        )
+        .await?;
+    driver.observe_assistant_commit(&assistant_receipt);
+    let barrier = dispatch_barrier(reservation).await?;
+    reservation.retire_attempt(token)?;
+    attempt_token.take();
+    drop(resident_guard);
+    if barrier == DispatchBarrier::ObserverUnavailable {
+        driver.observer_unavailable = true;
+    }
+    driver.counters.tool_calls += planned.len();
+
+    let mut cancelled = false;
+    let mut concludes_turn = false;
+    let mut infrastructure_failure = None;
+    let mut latched_stop = ToolStop::None;
+    let mut pending_goal_wrapup = None;
+    let mut index = 0_usize;
+    while index < planned.len() {
+        if infrastructure_failure.is_none()
+            && !cancelled
+            && !driver.observer_unavailable
+            && driver.durable_limit.is_none()
+            && !cancellation.is_cancelled()
+            && planned_execution_mode(driver.tools, &planned[index]) == ToolExecutionMode::Parallel
+        {
+            let group_end = (index + 1..planned.len())
+                .find(|candidate| {
+                    planned_execution_mode(driver.tools, &planned[*candidate])
+                        != ToolExecutionMode::Parallel
+                })
+                .unwrap_or(planned.len());
+            let outcome = run_parallel_tool_group(
+                reservation,
+                driver,
+                turn,
+                step,
+                &mut planned[index..group_end],
+                cancellation,
+            )
+            .await?;
+            concludes_turn |= outcome.concludes_turn;
+            cancelled |= outcome.cancelled;
+            latched_stop = latch_tool_stop(latched_stop, outcome.latched_stop);
+            if let Some(error) = outcome.infrastructure_failure {
+                if let Some(local_index) = outcome.memory_unresolved_index {
+                    release_parallel_unresolved(reservation, &mut planned, index + local_index)?;
+                    return Ok(StepResolution::with_stop(
+                        StepOutcome::Error(error),
+                        latched_stop,
+                    ));
+                }
+                infrastructure_failure = Some(error);
+            }
+            index = group_end;
+            continue;
+        }
+
+        let current_index = index;
+        index += 1;
+        let (completed, remaining) = planned.split_at_mut(current_index + 1);
+        let plan = &mut completed[current_index];
+        let actual_call_seq = reservation
+            .settle_exact_settled(&mut plan.call_claim)
+            .await?
+            .seq();
+        plan.call_seq = actual_call_seq;
+        reservation.rebind_claim_fallback(
+            &mut plan.result_claim,
+            tool_prestart_error_event(
+                &plan.claim_profile,
+                turn,
+                step,
+                &plan.result_message_id,
+                &plan.call,
+                actual_call_seq,
+                "TOOL_OUTPUT_BUDGET_EXCEEDED",
+                plan.call.name.as_str(),
+                if plan.claim_profile.is_shell_action() {
+                    "shell output could not fit safely in the session"
+                } else if plan.claim_profile.is_plugin_action() {
+                    "plugin output could not fit safely in the session"
+                } else {
+                    "tool output could not fit safely in the session"
+                },
+            )?,
+        )?;
+        let result = if driver.durable_limit.is_some() {
+            prestart_failure(
+                plan,
+                "SESSION_LIMIT",
+                "tool was not started because the durable session reached its storage limit",
+                ToolStop::None,
+            )
+        } else if infrastructure_failure.is_some()
+            || driver.observer_unavailable
+            || cancelled
+            || cancellation.is_cancelled()
+        {
+            cancelled |= cancellation.is_cancelled();
+            if plan.claim_profile.is_owned_action() {
+                prestart_failure(
+                    plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the turn was stopping",
+                    if cancellation.is_cancelled() {
+                        ToolStop::Cancelled
+                    } else {
+                        ToolStop::None
+                    },
+                )
+            } else {
+                ToolRun::ModelError {
+                    code: "ABORTED_BEFORE_DISPATCH",
+                    message: "tool was not started because the turn was stopping",
+                }
+            }
+        } else if dispatch_barrier(reservation).await? == DispatchBarrier::ObserverUnavailable {
+            driver.observer_unavailable = true;
+            prestart_failure(
+                plan,
+                "ABORTED_BEFORE_DISPATCH",
+                "tool was not started because the live session observer became unavailable",
+                ToolStop::None,
+            )
+        } else {
+            run_one_tool(
+                ToolRunEnvironment::from_driver(driver),
+                ToolRunPlan::from(&*plan),
+                cancellation.clone(),
+            )
+            .await
+        };
+        match result {
+            ToolRun::Completed {
+                result,
+                settlement,
+                stop,
+            } => {
+                let requested_conclusion = result.concludes_turn();
+                let committed_preferred =
+                    settle_tool_result(reservation, driver, plan, result, settlement).await?;
+                concludes_turn |= requested_conclusion && committed_preferred;
+                latched_stop = latch_tool_stop(latched_stop, stop);
+                match stop {
+                    ToolStop::None => {}
+                    ToolStop::Cancelled => cancelled = true,
+                    ToolStop::TurnTimeout => {
+                        infrastructure_failure = Some(failure_reason(
+                            "AGENT_TURN_TIMEOUT",
+                            "the agent turn timed out",
+                        )?);
+                    }
+                }
+            }
+            ToolRun::Goal(mutation) => {
+                if cancellation.is_cancelled() || Instant::now() >= driver.deadline {
+                    drop(mutation);
+                    let (code, message) = if cancellation.is_cancelled() {
+                        (
+                            "ABORTED",
+                            "Goal change was cancelled before it was committed",
+                        )
+                    } else {
+                        (
+                            "AGENT_TURN_TIMEOUT",
+                            "Goal change was not committed because the turn timed out",
+                        )
+                    };
+                    settle_model_error(reservation, driver, plan, turn, step, code, message)
+                        .await?;
+                    if cancellation.is_cancelled() {
+                        cancelled = true;
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
+                    } else {
+                        infrastructure_failure = Some(failure_reason(
+                            "AGENT_TURN_TIMEOUT",
+                            "the agent turn timed out",
+                        )?);
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::TurnTimeout);
+                    }
+                    continue;
+                }
+                let result = goal_tool_result(&mutation)?;
+                let wrapup = (driver.goal_tool_caller == GoalToolCaller::GoalRound)
+                    .then(|| mutation.wrapup())
+                    .flatten();
+                let change = mutation.change().clone();
+                if let Err(error) = reservation
+                    .append_settled(NewEvent::log(EventKind::goal_change(change)))
+                    .await
+                {
+                    return Err(error.into());
+                }
+                mutation.commit().map_err(|_| {
+                    AgentLoopError::Invariant("committed Goal state was not installable")
+                })?;
+                let _ = settle_tool_result(
+                    reservation,
+                    driver,
+                    plan,
+                    result,
+                    ResultSettlement::PreferredRequired,
+                )
+                .await?;
+                if wrapup.is_some() {
+                    pending_goal_wrapup = wrapup;
+                }
+            }
+            ToolRun::PlanExit { exit, result } => {
+                let committed = settle_tool_result(
+                    reservation,
+                    driver,
+                    plan,
+                    result,
+                    ResultSettlement::PreferredRequired,
+                )
+                .await?;
+                if !committed {
+                    return Err(AgentLoopError::Invariant(
+                        "approved Plan Mode exit result used its fallback",
+                    ));
+                }
+                exit.commit().map_err(|_| {
+                    AgentLoopError::Invariant("approved Plan Mode exit was not installable")
+                })?;
+            }
+            ToolRun::TodoWrite { todos, result } => {
+                if cancellation.is_cancelled() || Instant::now() >= driver.deadline {
+                    let (code, message) = if cancellation.is_cancelled() {
+                        (
+                            "ABORTED",
+                            "Todo update was cancelled before it was committed",
+                        )
+                    } else {
+                        (
+                            "AGENT_TURN_TIMEOUT",
+                            "Todo update was not committed because the turn timed out",
+                        )
+                    };
+                    settle_model_error(reservation, driver, plan, turn, step, code, message)
+                        .await?;
+                    if cancellation.is_cancelled() {
+                        cancelled = true;
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
+                    } else {
+                        infrastructure_failure = Some(failure_reason(
+                            "AGENT_TURN_TIMEOUT",
+                            "the agent turn timed out",
+                        )?);
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::TurnTimeout);
+                    }
+                    continue;
+                }
+                reservation
+                    .append_settled(NewEvent::log(EventKind::TodoWrite { todos }))
+                    .await?;
+                let committed = settle_tool_result(
+                    reservation,
+                    driver,
+                    plan,
+                    result,
+                    ResultSettlement::PreferredRequired,
+                )
+                .await?;
+                if !committed {
+                    return Err(AgentLoopError::Invariant(
+                        "Todo update result used its fallback",
+                    ));
+                }
+            }
+            ToolRun::Mutation(mutation) => {
+                let resolved =
+                    resolve_mutation(reservation, driver, plan, mutation, cancellation).await?;
+                match resolved {
+                    ToolRun::Completed {
+                        result,
+                        settlement,
+                        stop,
+                    } => {
+                        let requested_conclusion = result.concludes_turn();
+                        let committed_preferred =
+                            settle_tool_result(reservation, driver, plan, result, settlement)
+                                .await?;
+                        concludes_turn |= requested_conclusion && committed_preferred;
+                        latched_stop = latch_tool_stop(latched_stop, stop);
+                        match stop {
+                            ToolStop::None => {}
+                            ToolStop::Cancelled => cancelled = true,
+                            ToolStop::TurnTimeout => {
+                                infrastructure_failure = Some(failure_reason(
+                                    "AGENT_TURN_TIMEOUT",
+                                    "the agent turn timed out",
+                                )?);
+                            }
+                        }
+                    }
+                    ToolRun::Infrastructure { stop } => {
+                        if reservation.session().is_durable() {
+                            settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
+                            infrastructure_failure = Some(failure_reason(
+                                "AGENT_TOOL_EXECUTOR",
+                                "the prepared file mutation failed without a definite outcome",
+                            )?);
+                            latched_stop = latch_tool_stop(latched_stop, stop);
+                            continue;
+                        }
+                        reservation.release(&mut plan.result_claim)?;
+                        for later in remaining {
+                            reservation.release(&mut later.call_claim)?;
+                            reservation.release(&mut later.result_claim)?;
+                        }
+                        return Ok(StepResolution::with_stop(
+                            StepOutcome::Error(failure_reason(
+                                "AGENT_TOOL_EXECUTOR",
+                                "the prepared file mutation failed without a definite outcome",
+                            )?),
+                            latch_tool_stop(latched_stop, stop),
+                        ));
+                    }
+                    ToolRun::ModelError { code, message } => {
+                        settle_model_error(reservation, driver, plan, turn, step, code, message)
+                            .await?;
+                    }
+                    _ => {
+                        return Err(AgentLoopError::Invariant(
+                            "mutation resolution returned an invalid tool state",
+                        ));
+                    }
+                }
+            }
+            ToolRun::Action(action) => {
+                let resolved =
+                    resolve_action(reservation, driver, plan, action, cancellation).await?;
+                match resolved {
+                    ToolRun::Completed {
+                        result,
+                        settlement,
+                        stop,
+                    } => {
+                        let requested_conclusion = result.concludes_turn();
+                        let committed_preferred =
+                            settle_tool_result(reservation, driver, plan, result, settlement)
+                                .await?;
+                        let stop =
+                            latch_tool_stop(stop, sample_tool_stop(cancellation, driver.deadline));
+                        if committed_preferred && stop == ToolStop::None {
+                            if let Some(digest) = driver.pending_shell_grant.take() {
+                                let _ = driver.exact_shell_grants.insert(digest);
+                            }
+                        } else {
+                            driver.pending_shell_grant = None;
+                        }
+                        concludes_turn |= requested_conclusion && committed_preferred;
+                        latched_stop = latch_tool_stop(latched_stop, stop);
+                        match stop {
+                            ToolStop::None => {}
+                            ToolStop::Cancelled => cancelled = true,
+                            ToolStop::TurnTimeout => {
+                                infrastructure_failure = Some(failure_reason(
+                                    "AGENT_TURN_TIMEOUT",
+                                    "the agent turn timed out",
+                                )?);
+                            }
+                        }
+                    }
+                    ToolRun::ActionUnresolved { stop } => {
+                        if reservation.session().is_durable() {
+                            settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
+                            infrastructure_failure = Some(failure_reason(
+                                "AGENT_TOOL_EXECUTOR",
+                                "the foreground action lost a definite result",
+                            )?);
+                            latched_stop = latch_tool_stop(latched_stop, stop);
+                            continue;
+                        }
+                        reservation.release(&mut plan.result_claim)?;
+                        for later in remaining {
+                            reservation.release(&mut later.call_claim)?;
+                            reservation.release(&mut later.result_claim)?;
+                        }
+                        return Ok(StepResolution::with_stop(
+                            StepOutcome::Error(failure_reason(
+                                "AGENT_TOOL_EXECUTOR",
+                                "the foreground action lost a definite result",
+                            )?),
+                            latch_tool_stop(latched_stop, stop),
+                        ));
+                    }
+                    ToolRun::ModelError { code, message } => {
+                        settle_model_error(reservation, driver, plan, turn, step, code, message)
+                            .await?;
+                    }
+                    _ => {
+                        return Err(AgentLoopError::Invariant(
+                            "action resolution returned an invalid tool state",
+                        ));
+                    }
+                }
+            }
+            ToolRun::ModelError { code, message } => {
+                if code == "ABORTED" {
+                    cancelled = true;
+                    latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
+                }
+                settle_model_error(reservation, driver, plan, turn, step, code, message).await?;
+            }
+            ToolRun::Infrastructure { stop } => {
+                if reservation.session().is_durable() {
+                    settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
+                    infrastructure_failure = Some(failure_reason(
+                        "AGENT_TOOL_EXECUTOR",
+                        "the tool executor failed before producing a result",
+                    )?);
+                    latched_stop = latch_tool_stop(latched_stop, stop);
+                    continue;
+                }
+                reservation.release(&mut plan.result_claim)?;
+                for later in remaining {
+                    reservation.release(&mut later.call_claim)?;
+                    reservation.release(&mut later.result_claim)?;
+                }
+                return Ok(StepResolution::with_stop(
+                    StepOutcome::Error(failure_reason(
+                        "AGENT_TOOL_EXECUTOR",
+                        "the tool executor failed before producing a result",
+                    )?),
+                    latch_tool_stop(latched_stop, stop),
+                ));
+            }
+            ToolRun::ActionUnresolved { stop } => {
+                if reservation.session().is_durable() {
+                    settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
+                    infrastructure_failure = Some(failure_reason(
+                        "AGENT_TOOL_EXECUTOR",
+                        "the foreground action lost a definite result",
+                    )?);
+                    latched_stop = latch_tool_stop(latched_stop, stop);
+                    continue;
+                }
+                reservation.release(&mut plan.result_claim)?;
+                for later in remaining {
+                    reservation.release(&mut later.call_claim)?;
+                    reservation.release(&mut later.result_claim)?;
+                }
+                return Ok(StepResolution::with_stop(
+                    StepOutcome::Error(failure_reason(
+                        "AGENT_TOOL_EXECUTOR",
+                        "the foreground action lost a definite result",
+                    )?),
+                    latch_tool_stop(latched_stop, stop),
+                ));
+            }
+            ToolRun::TurnTimeout => {
+                latched_stop = latch_tool_stop(latched_stop, ToolStop::TurnTimeout);
+                let preferred = tool_error_event(
+                    turn,
+                    step,
+                    &plan.result_message_id,
+                    &plan.call,
+                    plan.call_seq,
+                    "ABORTED",
+                    "AbortError",
+                    "tool was stopped because the agent turn timed out",
+                )?;
+                reservation
+                    .settle_settled(&mut plan.result_claim, preferred)
+                    .await?;
+                infrastructure_failure = Some(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?);
+            }
+        }
+        if index % AGENT_READY_WORK_BUDGET == 0 {
+            // A group of immediately-ready tool bodies must still give the
+            // owning CLI a chance to deliver cancellation before the next one.
+            tokio::task::yield_now().await;
+        }
+        // A stop may become ready while a truthful result is being encoded and
+        // appended. Preserve the first such outer stop before any later tool is
+        // dispatched; do not rewrite the result that was just committed.
+        latched_stop = latch_tool_stop(
+            latched_stop,
+            sample_tool_stop(cancellation, driver.deadline),
+        );
+        match latched_stop {
+            ToolStop::None => {}
+            ToolStop::Cancelled => cancelled = true,
+            ToolStop::TurnTimeout => {
+                if infrastructure_failure.is_none() {
+                    infrastructure_failure = Some(failure_reason(
+                        "AGENT_TURN_TIMEOUT",
+                        "the agent turn timed out",
+                    )?);
+                }
+            }
+        }
+    }
+    if let Some(wrapup) = pending_goal_wrapup {
+        append_goal_wrapup(reservation, driver, wrapup).await?;
+    }
+    let outcome = if driver.durable_limit.is_some() {
+        StepOutcome::Error(driver.session_limit_failure.clone())
+    } else if driver.observer_unavailable {
+        StepOutcome::Error(observer_unavailable_failure()?)
+    } else if let Some(error) = infrastructure_failure {
+        StepOutcome::Error(error)
+    } else if cancelled {
+        StepOutcome::Cancelled
+    } else if concludes_turn && driver.pending_repeat_contexts.is_empty() {
+        StepOutcome::Completed
+    } else {
+        StepOutcome::Continue
+    };
+    Ok(StepResolution::with_stop(outcome, latched_stop))
+}
+
+async fn append_goal_wrapup(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    wrapup: GoalWrapup,
+) -> Result<(), AgentLoopError> {
+    let id = next_id(driver.runtime, AgentIdKind::Message)?;
+    let source = MessageSource::plugin_notice("tool-goal", wrapup.summary())?;
+    let content = ContentBlock::text(wrapup.text())?;
+    let message = Message::user(id, vec![content], source)?;
+    reservation
+        .append_settled(NewEvent::surface(
+            EventKind::user_message(message),
+            SurfaceIntent::append(),
+        ))
+        .await?;
+    Ok(())
+}
+
+fn goal_tool_result(
+    mutation: &PreparedGoalMutation,
+) -> Result<ToolExecutionResult, AgentLoopError> {
+    let text = serde_json::to_string(&mutation.result_value())
+        .map_err(|error| AgentLoopError::Serialization(error.to_string()))?;
+    let block = ContentBlock::text(text)?;
+    ToolExecutionResult::success(vec![block]).map_err(AgentLoopError::Model)
+}
+
+async fn settle_model_error(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    plan: &mut PlannedTool,
+    turn: TurnId,
+    step: StepId,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), AgentLoopError> {
+    settle_model_error_unobserved(reservation, plan, turn, step, code, message).await?;
+    if !matches!(code, "ABORTED_BEFORE_DISPATCH" | "SESSION_LIMIT") {
+        record_repeat_tool_result(driver, plan)?;
+    }
+    Ok(())
+}
+
+async fn settle_model_error_unobserved(
+    reservation: &mut SessionReservation<'_>,
+    plan: &mut PlannedTool,
+    turn: TurnId,
+    step: StepId,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), AgentLoopError> {
+    let failure_name = match code {
+        "ABORTED" | "ABORTED_BEFORE_DISPATCH" => "AbortError",
+        TOOL_OUTCOME_UNKNOWN => "ToolOutcomeUnknownError",
+        _ => plan.call.name.as_str(),
+    };
+    let preferred = tool_error_event(
+        turn,
+        step,
+        &plan.result_message_id,
+        &plan.call,
+        plan.call_seq,
+        code,
+        failure_name,
+        message,
+    )?;
+    reservation
+        .settle_settled(&mut plan.result_claim, preferred)
+        .await?;
+    Ok(())
+}
+
+async fn settle_unknown_tool_outcome(
+    reservation: &mut SessionReservation<'_>,
+    plan: &mut PlannedTool,
+    turn: TurnId,
+    step: StepId,
+) -> Result<(), AgentLoopError> {
+    settle_model_error_unobserved(
+        reservation,
+        plan,
+        turn,
+        step,
+        TOOL_OUTCOME_UNKNOWN,
+        "The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.",
+    )
+    .await
+}
+
+fn latch_tool_stop(current: ToolStop, observed: ToolStop) -> ToolStop {
+    if current == ToolStop::None {
+        observed
+    } else {
+        current
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolStop {
+    None,
+    Cancelled,
+    TurnTimeout,
+}
+
+enum ToolRun {
+    Completed {
+        result: ToolExecutionResult,
+        settlement: ResultSettlement,
+        stop: ToolStop,
+    },
+    Goal(PreparedGoalMutation),
+    PlanExit {
+        exit: crate::plan_mode::PreparedPlanExit,
+        result: ToolExecutionResult,
+    },
+    TodoWrite {
+        todos: Vec<crate::session::TodoItem>,
+        result: ToolExecutionResult,
+    },
+    Mutation(PreparedToolMutation),
+    Action(PreparedToolActionSetup),
+    ModelError {
+        code: &'static str,
+        message: &'static str,
+    },
+    Infrastructure {
+        stop: ToolStop,
+    },
+    ActionUnresolved {
+        stop: ToolStop,
+    },
+    TurnTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultSettlement {
+    FallbackAllowed,
+    PreferredRequired,
+}
+
+fn planned_execution_mode(tools: &dyn ToolExecutor, plan: &PlannedTool) -> ToolExecutionMode {
+    if !plan.claim_profile.permits_parallel_execution() {
+        return ToolExecutionMode::Exclusive;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        tools.execution_mode(plan.call.name.as_str())
+    })) {
+        Ok(ToolExecutionMode::Parallel) => ToolExecutionMode::Parallel,
+        Ok(ToolExecutionMode::Exclusive) | Err(_) => ToolExecutionMode::Exclusive,
+    }
+}
+
+struct ParallelToolGroupOutcome {
+    cancelled: bool,
+    concludes_turn: bool,
+    infrastructure_failure: Option<LlmFailure>,
+    latched_stop: ToolStop,
+    memory_unresolved_index: Option<usize>,
+}
+
+struct ParallelCommitOutcome {
+    cancelled: bool,
+    concludes_turn: bool,
+    infrastructure_failure: Option<LlmFailure>,
+    stop: ToolStop,
+    memory_unresolved: bool,
+}
+
+async fn run_parallel_tool_group(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    turn: TurnId,
+    step: StepId,
+    group: &mut [PlannedTool],
+    cancellation: &CancellationToken,
+) -> Result<ParallelToolGroupOutcome, AgentLoopError> {
+    let mut outcome = ParallelToolGroupOutcome {
+        cancelled: false,
+        concludes_turn: false,
+        infrastructure_failure: None,
+        latched_stop: ToolStop::None,
+        memory_unresolved_index: None,
+    };
+    let mut slots: Vec<Option<ToolRun>> = (0..group.len()).map(|_| None).collect();
+    let mut in_flight = FuturesUnordered::new();
+    let mut next_to_start = 0_usize;
+    let mut next_to_commit = 0_usize;
+    let mut stop_starting = false;
+
+    loop {
+        while !stop_starting
+            && next_to_start < group.len()
+            && in_flight.len() < driver.config.limits.max_parallel_tool_calls
+        {
+            if driver.durable_limit.is_some()
+                || driver.observer_unavailable
+                || cancellation.is_cancelled()
+                || Instant::now() >= driver.deadline
+            {
+                stop_starting = true;
+                break;
+            }
+            let plan = &mut group[next_to_start];
+            let barrier = commit_tool_call_intent(reservation, plan, turn, step).await?;
+            if barrier == DispatchBarrier::ObserverUnavailable {
+                driver.observer_unavailable = true;
+                slots[next_to_start] = Some(prestart_failure(
+                    plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the live session observer became unavailable",
+                    ToolStop::None,
+                ));
+                stop_starting = true;
+            } else {
+                let environment = ToolRunEnvironment::from_driver(driver);
+                let run_plan = ToolRunPlan::from(&*plan);
+                let child = cancellation.clone();
+                let local_index = next_to_start;
+                in_flight.push(async move {
+                    (
+                        local_index,
+                        run_one_tool(environment, run_plan, child).await,
+                    )
+                });
+            }
+            next_to_start += 1;
+        }
+
+        commit_ready_parallel_results(
+            reservation,
+            driver,
+            group,
+            &mut slots,
+            &mut next_to_commit,
+            &mut outcome,
+            &mut stop_starting,
+        )
+        .await?;
+
+        if outcome.memory_unresolved_index.is_some() {
+            stop_starting = true;
+        }
+        if cancellation.is_cancelled() {
+            outcome.cancelled = true;
+            outcome.latched_stop = latch_tool_stop(outcome.latched_stop, ToolStop::Cancelled);
+            stop_starting = true;
+        } else if Instant::now() >= driver.deadline {
+            outcome.latched_stop = latch_tool_stop(outcome.latched_stop, ToolStop::TurnTimeout);
+            if outcome.infrastructure_failure.is_none() {
+                outcome.infrastructure_failure = Some(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?);
+            }
+            stop_starting = true;
+        }
+
+        if in_flight.is_empty() {
+            if stop_starting || next_to_start == group.len() {
+                break;
+            }
+            continue;
+        }
+
+        let Some((settled_index, run)) = in_flight.next().await else {
+            return Err(AgentLoopError::Invariant(
+                "parallel tool pool lost an in-flight future",
+            ));
+        };
+        if tool_run_stops_parallel_group(&run) {
+            stop_starting = true;
+        }
+        slots[settled_index] = Some(run);
+    }
+
+    // The loop exits only after every started future settles. Commit every
+    // remaining model-ordered slot unless an in-memory infrastructure failure
+    // intentionally preserves the unresolved started-call prefix.
+    commit_ready_parallel_results(
+        reservation,
+        driver,
+        group,
+        &mut slots,
+        &mut next_to_commit,
+        &mut outcome,
+        &mut stop_starting,
+    )
+    .await?;
+
+    if outcome.memory_unresolved_index.is_none() {
+        while next_to_start < group.len() {
+            let plan = &mut group[next_to_start];
+            let _ = commit_tool_call_intent(reservation, plan, turn, step).await?;
+            settle_model_error_unobserved(
+                reservation,
+                plan,
+                turn,
+                step,
+                "ABORTED_BEFORE_DISPATCH",
+                "tool was not started because the turn was stopping",
+            )
+            .await?;
+            next_to_start += 1;
+        }
+    }
+
+    Ok(outcome)
+}
+
+async fn commit_ready_parallel_results(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    group: &mut [PlannedTool],
+    slots: &mut [Option<ToolRun>],
+    next_to_commit: &mut usize,
+    outcome: &mut ParallelToolGroupOutcome,
+    stop_starting: &mut bool,
+) -> Result<(), AgentLoopError> {
+    while outcome.memory_unresolved_index.is_none() && *next_to_commit < slots.len() {
+        let Some(run) = slots[*next_to_commit].take() else {
+            break;
+        };
+        let committed =
+            settle_parallel_tool_run(reservation, driver, &mut group[*next_to_commit], run).await?;
+        outcome.cancelled |= committed.cancelled;
+        outcome.concludes_turn |= committed.concludes_turn;
+        outcome.latched_stop = latch_tool_stop(outcome.latched_stop, committed.stop);
+        if let Some(failure) = committed.infrastructure_failure {
+            outcome.infrastructure_failure.get_or_insert(failure);
+            *stop_starting = true;
+        }
+        if committed.cancelled || committed.stop != ToolStop::None {
+            *stop_starting = true;
+        }
+        if committed.memory_unresolved {
+            outcome.memory_unresolved_index = Some(*next_to_commit);
+        }
+        *next_to_commit += 1;
+        if *next_to_commit % AGENT_READY_WORK_BUDGET == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
+async fn settle_parallel_tool_run(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    plan: &mut PlannedTool,
+    run: ToolRun,
+) -> Result<ParallelCommitOutcome, AgentLoopError> {
+    match run {
+        ToolRun::Completed {
+            result,
+            settlement,
+            stop,
+        } => {
+            let requested_conclusion = result.concludes_turn();
+            let committed =
+                settle_tool_result(reservation, driver, plan, result, settlement).await?;
+            Ok(ParallelCommitOutcome {
+                cancelled: stop == ToolStop::Cancelled,
+                concludes_turn: requested_conclusion && committed,
+                infrastructure_failure: (stop == ToolStop::TurnTimeout)
+                    .then(|| failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out"))
+                    .transpose()?,
+                stop,
+                memory_unresolved: false,
+            })
+        }
+        ToolRun::ModelError { code, message } => {
+            settle_model_error(
+                reservation,
+                driver,
+                plan,
+                plan_turn(plan, reservation)?,
+                plan_step(plan, reservation)?,
+                code,
+                message,
+            )
+            .await?;
+            Ok(ParallelCommitOutcome {
+                cancelled: code == "ABORTED",
+                concludes_turn: false,
+                infrastructure_failure: None,
+                stop: if code == "ABORTED" {
+                    ToolStop::Cancelled
+                } else {
+                    ToolStop::None
+                },
+                memory_unresolved: false,
+            })
+        }
+        ToolRun::TurnTimeout => {
+            let turn = plan_turn(plan, reservation)?;
+            let step = plan_step(plan, reservation)?;
+            let preferred = tool_error_event(
+                turn,
+                step,
+                &plan.result_message_id,
+                &plan.call,
+                plan.call_seq,
+                "ABORTED",
+                "AbortError",
+                "tool was stopped because the agent turn timed out",
+            )?;
+            reservation
+                .settle_settled(&mut plan.result_claim, preferred)
+                .await?;
+            Ok(ParallelCommitOutcome {
+                cancelled: false,
+                concludes_turn: false,
+                infrastructure_failure: Some(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?),
+                stop: ToolStop::TurnTimeout,
+                memory_unresolved: false,
+            })
+        }
+        ToolRun::Infrastructure { stop } | ToolRun::ActionUnresolved { stop } => {
+            settle_parallel_infrastructure(reservation, plan, stop).await
+        }
+        ToolRun::Goal(mutation) => {
+            drop(mutation);
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::PlanExit { exit, result } => {
+            drop((exit, result));
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::TodoWrite { todos, result } => {
+            drop((todos, result));
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::Mutation(mutation) => {
+            drop(mutation);
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::Action(action) => {
+            drop(action);
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+    }
+}
+
+async fn settle_parallel_infrastructure(
+    reservation: &mut SessionReservation<'_>,
+    plan: &mut PlannedTool,
+    stop: ToolStop,
+) -> Result<ParallelCommitOutcome, AgentLoopError> {
+    let memory_unresolved = !reservation.session().is_durable();
+    if !memory_unresolved {
+        let turn = plan_turn(plan, reservation)?;
+        let step = plan_step(plan, reservation)?;
+        settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
+    }
+    Ok(ParallelCommitOutcome {
+        cancelled: stop == ToolStop::Cancelled,
+        concludes_turn: false,
+        infrastructure_failure: Some(failure_reason(
+            "AGENT_TOOL_EXECUTOR",
+            "the parallel-safe tool executor failed before producing a result",
+        )?),
+        stop,
+        memory_unresolved,
+    })
+}
+
+fn tool_run_stops_parallel_group(run: &ToolRun) -> bool {
+    match run {
+        ToolRun::Completed { stop, .. } => *stop != ToolStop::None,
+        ToolRun::ModelError { code, .. } => *code == "ABORTED",
+        ToolRun::Goal(_)
+        | ToolRun::PlanExit { .. }
+        | ToolRun::TodoWrite { .. }
+        | ToolRun::Mutation(_)
+        | ToolRun::Action(_)
+        | ToolRun::Infrastructure { .. }
+        | ToolRun::ActionUnresolved { .. }
+        | ToolRun::TurnTimeout => true,
+    }
+}
+
+async fn commit_tool_call_intent(
+    reservation: &mut SessionReservation<'_>,
+    plan: &mut PlannedTool,
+    turn: TurnId,
+    step: StepId,
+) -> Result<DispatchBarrier, AgentLoopError> {
+    let actual_call_seq = reservation
+        .settle_exact_settled(&mut plan.call_claim)
+        .await?
+        .seq();
+    plan.call_seq = actual_call_seq;
+    reservation.rebind_claim_fallback(
+        &mut plan.result_claim,
+        tool_prestart_error_event(
+            &plan.claim_profile,
+            turn,
+            step,
+            &plan.result_message_id,
+            &plan.call,
+            actual_call_seq,
+            "TOOL_OUTPUT_BUDGET_EXCEEDED",
+            plan.call.name.as_str(),
+            "tool output could not fit safely in the session",
+        )?,
+    )?;
+    dispatch_barrier(reservation).await
+}
+
+fn release_parallel_unresolved(
+    reservation: &mut SessionReservation<'_>,
+    planned: &mut [PlannedTool],
+    unresolved_from: usize,
+) -> Result<(), AgentLoopError> {
+    for plan in &mut planned[unresolved_from..] {
+        if plan.call_seq.get() == crate::session::MAX_SAFE_INTEGER {
+            reservation.release(&mut plan.call_claim)?;
+        }
+        reservation.release(&mut plan.result_claim)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ToolRunEnvironment<'a> {
+    tools: &'a dyn ToolExecutor,
+    declared_tools: &'a [ToolSchema],
+    route: &'a LlmCallConfig,
+    limits: &'a AgentLimits,
+    turn_deadline: Instant,
+}
+
+impl<'a> ToolRunEnvironment<'a> {
+    fn from_driver(driver: &Driver<'a>) -> Self {
+        Self {
+            tools: driver.tools,
+            declared_tools: &driver.config.tools,
+            route: &driver.config.call,
+            limits: &driver.config.limits,
+            turn_deadline: driver.deadline,
+        }
+    }
+}
+
+async fn run_one_tool(
+    environment: ToolRunEnvironment<'_>,
+    plan: ToolRunPlan,
+    cancellation: CancellationToken,
+) -> ToolRun {
+    let call = &plan.call;
+    if !environment
+        .declared_tools
+        .iter()
+        .any(|tool| tool.name() == call.name)
+    {
+        return prestart_failure(
+            &plan,
+            "UNKNOWN_TOOL",
+            "the requested tool was not declared for this model call",
+            ToolStop::None,
+        );
+    }
+    let raw = if call.arguments.is_empty() {
+        "{}".to_owned()
+    } else {
+        call.arguments.clone()
+    };
+    if raw.len() > environment.limits.max_tool_argument_bytes {
+        return prestart_failure(
+            &plan,
+            "TOOL_ARGUMENTS_TOO_LARGE",
+            "tool arguments exceed the configured size limit",
+            ToolStop::None,
+        );
+    }
+    let parsed = match serde_json::from_str(raw.as_str())
+        .ok()
+        .and_then(|value| JsonValue::new(value).ok())
+    {
+        Some(parsed) => parsed,
+        None => {
+            return prestart_failure(
+                &plan,
+                "INVALID_TOOL_ARGUMENTS",
+                "tool arguments are not valid bounded JSON",
+                ToolStop::None,
+            );
+        }
+    };
+    let request = ToolExecutionRequest::new(
+        call.id.clone(),
+        call.name.clone(),
+        raw,
+        parsed,
+        environment.route.clone(),
+        plan.dispatch.clone(),
+    );
+    let child = cancellation.child_token();
+    if cancellation.is_cancelled() {
+        child.cancel();
+        return prestart_failure(
+            &plan,
+            "ABORTED_BEFORE_DISPATCH",
+            "tool was not started because the turn was stopping",
+            ToolStop::Cancelled,
+        );
+    }
+    if Instant::now() >= environment.turn_deadline {
+        child.cancel();
+        return prestart_failure(
+            &plan,
+            "ABORTED_BEFORE_DISPATCH",
+            "tool was not started because the agent turn timed out",
+            ToolStop::TurnTimeout,
+        );
+    }
+    let future = match catch_unwind(AssertUnwindSafe(|| {
+        environment.tools.prepare(request, child.clone())
+    })) {
+        Ok(future) => future,
+        Err(_) => {
+            child.cancel();
+            return ToolRun::Infrastructure {
+                stop: sample_tool_stop(&cancellation, environment.turn_deadline),
+            };
+        }
+    };
+    let guarded = AssertUnwindSafe(future).catch_unwind();
+    tokio::pin!(guarded);
+    let tool_deadline = Instant::now() + environment.limits.tool_duration;
+    let interrupted = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            prestart_failure(
+                &plan,
+                "ABORTED_BEFORE_DISPATCH",
+                "tool was not started because the turn was stopping",
+                ToolStop::Cancelled,
+            )
+        }
+        _ = tokio::time::sleep_until(environment.turn_deadline) => {
+            prestart_failure(
+                &plan,
+                "ABORTED_BEFORE_DISPATCH",
+                "tool was not started because the agent turn timed out",
+                ToolStop::TurnTimeout,
+            )
+        }
+        _ = tokio::time::sleep_until(tool_deadline), if !plan.claim_profile.is_user_question() => {
+            prestart_failure(
+                &plan,
+                "TOOL_TIMEOUT",
+                "tool preparation exceeded its configured timeout",
+                ToolStop::None,
+            )
+        }
+        result = &mut guarded => return {
+            if cancellation.is_cancelled() {
+                child.cancel();
+                return prestart_failure(
+                    &plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the turn was stopping",
+                    ToolStop::Cancelled,
+                );
+            }
+            if Instant::now() >= environment.turn_deadline {
+                child.cancel();
+                return prestart_failure(
+                    &plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the agent turn timed out",
+                    ToolStop::TurnTimeout,
+                );
+            }
+            if Instant::now() >= tool_deadline {
+                child.cancel();
+                return prestart_failure(
+                    &plan,
+                    "TOOL_TIMEOUT",
+                    "tool preparation exceeded its configured timeout",
+                    ToolStop::None,
+                );
+            }
+            match result {
+                Ok(Ok(ToolPreparation::Complete(result))) => {
+                    let contract = plan.claim_profile.action_contract();
+                    if contract.as_ref().is_some_and(|contract| {
+                        tool::validate_action_not_started_result(&result, contract).is_err()
+                    })
+                    {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Completed {
+                            result,
+                            settlement: ResultSettlement::FallbackAllowed,
+                            stop: ToolStop::None,
+                        }
+                    }
+                }
+                Ok(Ok(ToolPreparation::Goal(mutation))) => {
+                    if plan.claim_profile.is_owned_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Goal(mutation)
+                    }
+                }
+                Ok(Ok(ToolPreparation::PlanExit { exit, result })) => {
+                    if plan.claim_profile.is_owned_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::PlanExit { exit, result }
+                    }
+                }
+                Ok(Ok(ToolPreparation::TodoWrite { todos, result })) => {
+                    if plan.claim_profile.is_owned_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::TodoWrite { todos, result }
+                    }
+                }
+                Ok(Ok(ToolPreparation::Mutation(mutation))) => {
+                    if plan.claim_profile.is_owned_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Mutation(mutation)
+                    }
+                }
+                Ok(Ok(ToolPreparation::Action(action))) => {
+                    if !plan.claim_profile.is_owned_action()
+                        || !action.contract().matches_profile(&plan.claim_profile)
+                        || !action.matches_dispatch(&plan.dispatch)
+                    {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Action(action)
+                    }
+                }
+                Ok(Err(_)) | Err(_) => {
+                    child.cancel();
+                    ToolRun::Infrastructure {
+                        stop: sample_tool_stop(&cancellation, environment.turn_deadline),
+                    }
+                }
+            }
+        }
+    };
+
+    child.cancel();
+    // Started tools get one bounded cleanup window. The same future is polled
+    // again so cooperative implementations can observe their child token and
+    // close files, sockets, or other resources before the durable result is
+    // committed. A tool that ignores cancellation cannot hold the turn open.
+    // Cancellation or timeout already won the linearization race. Cleanup
+    // success, failure, panic, or grace expiry cannot rewrite that durable
+    // outcome (and no extension detail is retained).
+    let _ = tokio::time::timeout(MAX_AGENT_TOOL_SHUTDOWN_GRACE, &mut guarded).await;
+    interrupted
+}
+
+fn prestart_failure(
+    plan: &impl ToolPlanView,
+    code: &'static str,
+    message: &'static str,
+    stop: ToolStop,
+) -> ToolRun {
+    if !plan.claim_profile().is_owned_action() {
+        return match stop {
+            ToolStop::TurnTimeout => ToolRun::TurnTimeout,
+            ToolStop::Cancelled => ToolRun::ModelError {
+                code: "ABORTED",
+                message: "tool was cancelled",
+            },
+            ToolStop::None => ToolRun::ModelError { code, message },
+        };
+    }
+    let failure_name = if matches!(code, "ABORTED" | "ABORTED_BEFORE_DISPATCH") {
+        "AbortError"
+    } else {
+        plan.call().name.as_str()
+    };
+    let result = match plan.claim_profile().action_contract() {
+        Some(ActionContract::Shell) => shell_prestart_result(code, failure_name, message, None),
+        Some(ActionContract::Plugin { plugin_id }) => {
+            plugin_prestart_result(plugin_id.as_str(), code, failure_name, message)
+        }
+        None => {
+            return ToolRun::Infrastructure { stop };
+        }
+    };
+    match result {
+        Ok(result) => ToolRun::Completed {
+            result,
+            settlement: ResultSettlement::FallbackAllowed,
+            stop,
+        },
+        Err(_) => ToolRun::Infrastructure { stop },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_action(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    plan: &mut PlannedTool,
+    setup: PreparedToolActionSetup,
+    cancellation: &CancellationToken,
+) -> Result<ToolRun, AgentLoopError> {
+    if !setup.contract().matches_profile(&plan.claim_profile) {
+        return Ok(ToolRun::ActionUnresolved {
+            stop: sample_tool_stop(cancellation, driver.deadline),
+        });
+    }
+    let contract = setup.contract().clone();
+    let setup_child = cancellation.child_token();
+    let preparation_deadline = Instant::now() + MAX_AGENT_ACTION_PREPARATION_DURATION;
+    let setup_control =
+        ToolActionSetupControl::new(setup_child.clone(), driver.deadline, preparation_deadline);
+    let setup_future = match catch_unwind(AssertUnwindSafe(|| setup.resolve(setup_control))) {
+        Ok(future) => future,
+        Err(_) => {
+            setup_child.cancel();
+            return Ok(ToolRun::ActionUnresolved {
+                stop: sample_tool_stop(cancellation, driver.deadline),
+            });
+        }
+    };
+    let guarded_setup = AssertUnwindSafe(setup_future).catch_unwind();
+    tokio::pin!(guarded_setup);
+    let mut latched_stop = ToolStop::None;
+    let setup_outcome = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled(), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::Cancelled;
+            }
+            _ = tokio::time::sleep_until(driver.deadline), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::TurnTimeout;
+            }
+            outcome = &mut guarded_setup => break match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Ok(ToolRun::ActionUnresolved {
+                        stop: preserve_or_sample_tool_stop(
+                            latched_stop,
+                            cancellation,
+                            driver.deadline,
+                        ),
+                    });
+                }
+            },
+        }
+    };
+    let action = match setup_outcome {
+        ToolActionSetupOutcome::Ready(action) => {
+            latched_stop =
+                preserve_or_sample_tool_stop(latched_stop, cancellation, driver.deadline);
+            if action.contract() != &contract || !action.matches_dispatch(&plan.dispatch) {
+                return Ok(ToolRun::ActionUnresolved { stop: latched_stop });
+            }
+            if latched_stop != ToolStop::None {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::AbortedBeforeDispatch,
+                    latched_stop,
+                ));
+            }
+            action
+        }
+        ToolActionSetupOutcome::NotStarted { turn_stop, result } => {
+            let stop = preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            );
+            if tool::validate_action_not_started_result(&result, &contract).is_err() {
+                return Ok(ToolRun::ActionUnresolved { stop });
+            }
+            return Ok(ToolRun::Completed {
+                result,
+                settlement: ResultSettlement::FallbackAllowed,
+                stop,
+            });
+        }
+        ToolActionSetupOutcome::Infrastructure { turn_stop } => {
+            return Ok(ToolRun::ActionUnresolved {
+                stop: preserve_or_sample_tool_stop(
+                    merge_action_stop(latched_stop, turn_stop),
+                    cancellation,
+                    driver.deadline,
+                ),
+            });
+        }
+    };
+
+    let (policy_denied, approval_required) = action_policy(
+        driver.config.shell_policy,
+        driver.config.plugin_policy,
+        &contract,
+    );
+    if policy_denied {
+        return Ok(decline_action(
+            action,
+            ActionDeclineReason::PolicyDenied,
+            ToolStop::None,
+        ));
+    }
+
+    let maximum_result_bytes = action.maximum_result_event_bytes();
+    let configured_result_fits = maximum_result_bytes <= driver.config.limits.max_tool_result_bytes
+        && driver
+            .counters
+            .tool_result_bytes
+            .checked_add(maximum_result_bytes)
+            .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes);
+    if !configured_result_fits {
+        return Ok(decline_action(
+            action,
+            ActionDeclineReason::OutputBudgetExceeded,
+            ToolStop::None,
+        ));
+    }
+    match reservation
+        .reserve_claim_retained_json_bytes(&mut plan.result_claim, maximum_result_bytes)
+    {
+        Ok(()) => {}
+        Err(error) if is_durable_session_limit(&error) => {
+            driver.latch_durable_limit(&error);
+            return Ok(prestart_failure(
+                plan,
+                "SESSION_LIMIT",
+                "tool was not started because the durable session reached its storage limit",
+                ToolStop::None,
+            ));
+        }
+        Err(error) if is_memory_budget_error(&error) => {
+            return Ok(decline_action(
+                action,
+                ActionDeclineReason::OutputBudgetExceeded,
+                ToolStop::None,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let exact_shell_digest = if approval_required && contract == ActionContract::Shell {
+        action
+            .exact_shell_identity()
+            .and_then(|identity| driver.exact_shell_grants.digest(identity))
+    } else {
+        None
+    };
+    let cache_hit = exact_shell_digest.is_some_and(|digest| driver.exact_shell_grants.take(digest));
+    let mut shell_grant_candidate = cache_hit.then_some(exact_shell_digest).flatten();
+
+    let action = if approval_required && !cache_hit {
+        let approval_id = match next_id(driver.runtime, AgentIdKind::Approval) {
+            Ok(id) => ApprovalRequestId::new(id),
+            Err(_) => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+        };
+        let exact_scope_digest =
+            exact_shell_digest.filter(|_| driver.exact_shell_grants.can_insert());
+        let (request, scope_receipt) = if exact_scope_digest.is_some() {
+            let (request, receipt) = ApprovalRequest::new_with_exact_shell_scope(
+                approval_id.clone(),
+                plan.call.name.clone(),
+                plan.call.id.clone(),
+                action.prompt(),
+            );
+            (request, Some(receipt))
+        } else {
+            (
+                ApprovalRequest::new(
+                    approval_id.clone(),
+                    plan.call.name.clone(),
+                    plan.call.id.clone(),
+                    action.prompt(),
+                ),
+                None,
+            )
+        };
+        let asked = NewEvent::log(EventKind::approval_asked(ApprovalAskedEvent::new(
+            approval_id.clone(),
+            plan.call.name.clone(),
+            Some(plan.call.id.clone()),
+            action.prompt().reason().map(str::to_owned),
+        )?));
+        let decision_fallback = NewEvent::log(EventKind::approval_decided(
+            ApprovalDecidedEvent::new(approval_id.clone(), ApprovalOutcome::AllowedOnce)?,
+        ));
+        let mut audit_claims = match reservation.claim_batch([asked, decision_fallback]) {
+            Ok(claims) => claims,
+            Err(error) if is_durable_session_limit(&error) => {
+                driver.latch_durable_limit(&error);
+                return Ok(prestart_failure(
+                    plan,
+                    "SESSION_LIMIT",
+                    "tool was not started because the durable session reached its storage limit",
+                    ToolStop::None,
+                ));
+            }
+            Err(error) if is_memory_budget_error(&error) => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut asked_claim = audit_claims.remove(0);
+        let mut decided_claim = audit_claims.remove(0);
+        reservation.settle_exact_settled(&mut asked_claim).await?;
+        let asked_visible = dispatch_barrier(reservation).await? == DispatchBarrier::Ready;
+        if !asked_visible {
+            driver.observer_unavailable = true;
+        }
+        let (outcome, stop) = if asked_visible {
+            request_approval(driver, request, cancellation).await
+        } else {
+            (ApprovalOutcome::Unavailable, ToolStop::None)
+        };
+        reservation.rebind_claim_fallback(
+            &mut decided_claim,
+            NewEvent::log(EventKind::approval_decided(ApprovalDecidedEvent::new(
+                approval_id,
+                outcome,
+            )?)),
+        )?;
+        reservation.settle_exact_settled(&mut decided_claim).await?;
+        let decision_visible = dispatch_barrier(reservation).await? == DispatchBarrier::Ready;
+        if !decision_visible {
+            driver.observer_unavailable = true;
+        }
+        match outcome {
+            ApprovalOutcome::AllowedOnce if stop == ToolStop::None && decision_visible => {
+                if scope_receipt.is_some_and(|receipt| receipt.was_requested()) {
+                    shell_grant_candidate = exact_scope_digest;
+                }
+                action
+            }
+            ApprovalOutcome::AllowedOnce => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::AbortedBeforeDispatch,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Cancelled => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalCancelled,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Rejected => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalRejected,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Unavailable => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalUnavailable,
+                    stop,
+                ));
+            }
+        }
+    } else {
+        action
+    };
+
+    let final_stop = sample_tool_stop(cancellation, driver.deadline);
+    if final_stop != ToolStop::None {
+        return Ok(decline_action(
+            action,
+            ActionDeclineReason::AbortedBeforeDispatch,
+            final_stop,
+        ));
+    }
+    if !action.matches_dispatch(&plan.dispatch) {
+        return Ok(ToolRun::ActionUnresolved {
+            stop: ToolStop::None,
+        });
+    }
+
+    let action_child = cancellation.child_token();
+    let action_deadline = Instant::now() + driver.config.limits.tool_duration;
+    let action_control =
+        ToolActionControl::new(action_child.clone(), driver.deadline, action_deadline);
+    let action_contract = action.contract().clone();
+    let action_future = match catch_unwind(AssertUnwindSafe(|| action.run(action_control))) {
+        Ok(future) => future,
+        Err(_) => {
+            action_child.cancel();
+            return Ok(ToolRun::ActionUnresolved {
+                stop: sample_tool_stop(cancellation, driver.deadline),
+            });
+        }
+    };
+    let guarded_action = AssertUnwindSafe(action_future).catch_unwind();
+    tokio::pin!(guarded_action);
+    let mut latched_stop = ToolStop::None;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled(), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::Cancelled;
+            }
+            _ = tokio::time::sleep_until(driver.deadline), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::TurnTimeout;
+            }
+            outcome = &mut guarded_action => break match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Ok(ToolRun::ActionUnresolved {
+                        stop: preserve_or_sample_tool_stop(
+                            latched_stop,
+                            cancellation,
+                            driver.deadline,
+                        ),
+                    });
+                }
+            },
+        }
+    };
+    Ok(match outcome {
+        ToolActionOutcome::NotStarted { turn_stop, result } => {
+            let stop = preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            );
+            if tool::validate_action_not_started_result(&result, &action_contract).is_err() {
+                ToolRun::ActionUnresolved { stop }
+            } else {
+                ToolRun::Completed {
+                    result,
+                    settlement: ResultSettlement::FallbackAllowed,
+                    stop,
+                }
+            }
+        }
+        ToolActionOutcome::Infrastructure { turn_stop }
+        | ToolActionOutcome::StartedOwnershipLost { turn_stop } => ToolRun::ActionUnresolved {
+            stop: preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            ),
+        },
+        ToolActionOutcome::StartedAndQuiescent { turn_stop, result } => {
+            let stop = preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            );
+            let result_fits_declared_bound = action_result_event_bytes(reservation, plan, &result)
+                .is_ok_and(|size| size <= maximum_result_bytes);
+            if tool::validate_action_started_result(&result, &action_contract).is_err()
+                || !result_fits_declared_bound
+            {
+                ToolRun::ActionUnresolved { stop }
+            } else {
+                if stop == ToolStop::None && tool::is_clean_exact_shell_result(&result) {
+                    if let Some(digest) = shell_grant_candidate {
+                        driver.pending_shell_grant = Some(digest);
+                    }
+                }
+                ToolRun::Completed {
+                    result,
+                    settlement: ResultSettlement::PreferredRequired,
+                    stop,
+                }
+            }
+        }
+        ToolActionOutcome::StartedAndDetached { result } => {
+            let stop = preserve_or_sample_tool_stop(latched_stop, cancellation, driver.deadline);
+            let result_fits_declared_bound = action_result_event_bytes(reservation, plan, &result)
+                .is_ok_and(|size| size <= maximum_result_bytes);
+            if tool::validate_action_detached_result(&result, &action_contract).is_err()
+                || !result_fits_declared_bound
+            {
+                ToolRun::ActionUnresolved { stop }
+            } else {
+                if stop == ToolStop::None && tool::is_owned_detached_shell_result(&result) {
+                    if let Some(digest) = shell_grant_candidate {
+                        driver.pending_shell_grant = Some(digest);
+                    }
+                }
+                ToolRun::Completed {
+                    result,
+                    settlement: ResultSettlement::PreferredRequired,
+                    stop,
+                }
+            }
+        }
+    })
+}
+
+fn action_policy(
+    shell_policy: ShellPolicy,
+    plugin_policy: PluginPolicy,
+    contract: &ActionContract,
+) -> (bool, bool) {
+    match contract {
+        ActionContract::Shell => (
+            shell_policy == ShellPolicy::Deny,
+            shell_policy == ShellPolicy::Ask,
+        ),
+        ActionContract::Plugin { .. } => (
+            plugin_policy == PluginPolicy::Deny,
+            plugin_policy == PluginPolicy::Ask,
+        ),
+    }
+}
+
+fn decline_action(
+    action: PreparedToolAction,
+    reason: ActionDeclineReason,
+    stop: ToolStop,
+) -> ToolRun {
+    match action.decline(reason) {
+        Ok(result) => ToolRun::Completed {
+            result,
+            settlement: ResultSettlement::FallbackAllowed,
+            stop,
+        },
+        Err(_) => ToolRun::ActionUnresolved { stop },
+    }
+}
+
+fn sample_tool_stop(cancellation: &CancellationToken, deadline: Instant) -> ToolStop {
+    if cancellation.is_cancelled() {
+        ToolStop::Cancelled
+    } else if Instant::now() >= deadline {
+        ToolStop::TurnTimeout
+    } else {
+        ToolStop::None
+    }
+}
+
+fn preserve_or_sample_tool_stop(
+    current: ToolStop,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> ToolStop {
+    if current == ToolStop::None {
+        sample_tool_stop(cancellation, deadline)
+    } else {
+        current
+    }
+}
+
+fn merge_action_stop(current: ToolStop, reported: ToolActionTurnStop) -> ToolStop {
+    if current != ToolStop::None {
+        return current;
+    }
+    match reported {
+        ToolActionTurnStop::None => ToolStop::None,
+        ToolActionTurnStop::CallerCancelled => ToolStop::Cancelled,
+        ToolActionTurnStop::TurnTimeout => ToolStop::TurnTimeout,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_mutation(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    plan: &mut PlannedTool,
+    mutation: PreparedToolMutation,
+    cancellation: &CancellationToken,
+) -> Result<ToolRun, AgentLoopError> {
+    if driver.config.file_change_policy == FileChangePolicy::Deny {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::PolicyDenied,
+            ToolStop::None,
+        ));
+    }
+
+    // An irreversible change may start only after the session has protected a
+    // large enough slot for its truthful result. Near the session byte limit we
+    // fail before asking the user and before invoking the commit capability.
+    let maximum_result_bytes = mutation.maximum_result_event_bytes();
+    let configured_result_fits = maximum_result_bytes <= driver.config.limits.max_tool_result_bytes
+        && driver
+            .counters
+            .tool_result_bytes
+            .checked_add(maximum_result_bytes)
+            .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes);
+    if !configured_result_fits {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::OutputBudgetExceeded,
+            ToolStop::None,
+        ));
+    }
+    match reservation
+        .reserve_claim_retained_json_bytes(&mut plan.result_claim, maximum_result_bytes)
+    {
+        Ok(()) => {}
+        Err(error) if is_durable_session_limit(&error) => {
+            driver.latch_durable_limit(&error);
+            return Ok(prestart_failure(
+                plan,
+                "SESSION_LIMIT",
+                "tool was not started because the durable session reached its storage limit",
+                ToolStop::None,
+            ));
+        }
+        Err(error) if is_memory_budget_error(&error) => {
+            return Ok(decline_mutation(
+                mutation,
+                MutationDeclineReason::OutputBudgetExceeded,
+                ToolStop::None,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let mutation = if driver.config.file_change_policy == FileChangePolicy::Ask {
+        let approval_id = match next_id(driver.runtime, AgentIdKind::Approval) {
+            Ok(id) => ApprovalRequestId::new(id),
+            Err(_) => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+        };
+        let request = ApprovalRequest::new(
+            approval_id.clone(),
+            plan.call.name.clone(),
+            plan.call.id.clone(),
+            mutation.prompt(),
+        );
+        let asked = NewEvent::log(EventKind::approval_asked(ApprovalAskedEvent::new(
+            approval_id.clone(),
+            plan.call.name.clone(),
+            Some(plan.call.id.clone()),
+            mutation.prompt().reason().map(str::to_owned),
+        )?));
+        // `allowed-once` is the longest current wire spelling, so this fallback
+        // protects enough bytes for every exact decision we may later rebind.
+        let decision_fallback = NewEvent::log(EventKind::approval_decided(
+            ApprovalDecidedEvent::new(approval_id.clone(), ApprovalOutcome::AllowedOnce)?,
+        ));
+        let mut audit_claims = match reservation.claim_batch([asked, decision_fallback]) {
+            Ok(claims) => claims,
+            Err(error) if is_durable_session_limit(&error) => {
+                driver.latch_durable_limit(&error);
+                return Ok(prestart_failure(
+                    plan,
+                    "SESSION_LIMIT",
+                    "tool was not started because the durable session reached its storage limit",
+                    ToolStop::None,
+                ));
+            }
+            Err(error) if is_memory_budget_error(&error) => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut asked_claim = audit_claims.remove(0);
+        let mut decided_claim = audit_claims.remove(0);
+        reservation.settle_exact_settled(&mut asked_claim).await?;
+        let asked_visible = dispatch_barrier(reservation).await? == DispatchBarrier::Ready;
+        if !asked_visible {
+            driver.observer_unavailable = true;
+        }
+        let (outcome, stop) = if asked_visible {
+            request_approval(driver, request, cancellation).await
+        } else {
+            (ApprovalOutcome::Unavailable, ToolStop::None)
+        };
+        reservation.rebind_claim_fallback(
+            &mut decided_claim,
+            NewEvent::log(EventKind::approval_decided(ApprovalDecidedEvent::new(
+                approval_id,
+                outcome,
+            )?)),
+        )?;
+        reservation.settle_exact_settled(&mut decided_claim).await?;
+        let decision_visible = dispatch_barrier(reservation).await? == DispatchBarrier::Ready;
+        if !decision_visible {
+            driver.observer_unavailable = true;
+        }
+
+        match outcome {
+            ApprovalOutcome::AllowedOnce if stop == ToolStop::None && decision_visible => mutation,
+            ApprovalOutcome::AllowedOnce => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::AbortedBeforeDispatch,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Cancelled => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalCancelled,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Rejected => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalRejected,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Unavailable => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalUnavailable,
+                    stop,
+                ));
+            }
+        }
+    } else {
+        mutation
+    };
+
+    commit_mutation(driver, mutation, cancellation).await
+}
+
+fn decline_mutation(
+    mutation: PreparedToolMutation,
+    reason: MutationDeclineReason,
+    stop: ToolStop,
+) -> ToolRun {
+    match mutation.decline(reason) {
+        Ok(result) => ToolRun::Completed {
+            result,
+            settlement: ResultSettlement::FallbackAllowed,
+            stop,
+        },
+        Err(_) => ToolRun::Infrastructure { stop },
+    }
+}
+
+async fn request_approval(
+    driver: &Driver<'_>,
+    request: ApprovalRequest,
+    cancellation: &CancellationToken,
+) -> (ApprovalOutcome, ToolStop) {
+    if cancellation.is_cancelled() {
+        return (ApprovalOutcome::Cancelled, ToolStop::Cancelled);
+    }
+    if Instant::now() >= driver.deadline {
+        return (ApprovalOutcome::Cancelled, ToolStop::TurnTimeout);
+    }
+    let child = cancellation.child_token();
+    let future = match catch_unwind(AssertUnwindSafe(|| {
+        driver
+            .config
+            .approval_provider
+            .request(request, child.clone())
+    })) {
+        Ok(future) => future,
+        Err(_) => {
+            child.cancel();
+            return (ApprovalOutcome::Unavailable, ToolStop::None);
+        }
+    };
+    let guarded = AssertUnwindSafe(future).catch_unwind();
+    tokio::pin!(guarded);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            child.cancel();
+            let _ = tokio::time::timeout(MAX_AGENT_TOOL_SHUTDOWN_GRACE, &mut guarded).await;
+            (ApprovalOutcome::Cancelled, ToolStop::Cancelled)
+        }
+        _ = tokio::time::sleep_until(driver.deadline) => {
+            child.cancel();
+            let _ = tokio::time::timeout(MAX_AGENT_TOOL_SHUTDOWN_GRACE, &mut guarded).await;
+            (ApprovalOutcome::Cancelled, ToolStop::TurnTimeout)
+        }
+        result = &mut guarded => {
+            if cancellation.is_cancelled() {
+                child.cancel();
+                (ApprovalOutcome::Cancelled, ToolStop::Cancelled)
+            } else if Instant::now() >= driver.deadline {
+                child.cancel();
+                (ApprovalOutcome::Cancelled, ToolStop::TurnTimeout)
+            } else {
+                match result {
+                    Ok(Ok(outcome)) => (outcome, ToolStop::None),
+                    Ok(Err(_)) | Err(_) => {
+                        child.cancel();
+                        (ApprovalOutcome::Unavailable, ToolStop::None)
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn commit_mutation(
+    driver: &Driver<'_>,
+    mutation: PreparedToolMutation,
+    cancellation: &CancellationToken,
+) -> Result<ToolRun, AgentLoopError> {
+    if cancellation.is_cancelled() {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::AbortedBeforeDispatch,
+            ToolStop::Cancelled,
+        ));
+    }
+    if Instant::now() >= driver.deadline {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::AbortedBeforeDispatch,
+            ToolStop::TurnTimeout,
+        ));
+    }
+
+    let child = cancellation.child_token();
+    let job_child = child.clone();
+    let mut job = tokio::task::spawn_blocking(move || {
+        catch_unwind(AssertUnwindSafe(|| mutation.commit(job_child)))
+    });
+    let mut stop = ToolStop::None;
+    let mut tool_timeout_seen = false;
+    let tool_timeout = tokio::time::sleep(driver.config.limits.tool_duration);
+    tokio::pin!(tool_timeout);
+    let joined = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                child.cancel();
+                stop = ToolStop::Cancelled;
+                break (&mut job).await;
+            }
+            _ = tokio::time::sleep_until(driver.deadline) => {
+                child.cancel();
+                stop = ToolStop::TurnTimeout;
+                break (&mut job).await;
+            }
+            _ = &mut tool_timeout, if !tool_timeout_seen => {
+                child.cancel();
+                tool_timeout_seen = true;
+            }
+            result = &mut job => break result,
+        }
+    };
+    let outcome = match joined {
+        Ok(Ok(Ok(outcome))) => outcome,
+        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+            child.cancel();
+            return Ok(ToolRun::Infrastructure { stop });
+        }
+    };
+    let (disposition, result) = outcome.into_parts();
+    let result = if tool_timeout_seen
+        && stop == ToolStop::None
+        && disposition == ToolCommitDisposition::NotCommitted
+    {
+        let (_, _, _, meta, _) = result.into_parts();
+        ToolExecutionResult::new(
+            vec![ContentBlock::text(
+                "Error: file mutation exceeded its configured timeout before publication",
+            )?],
+            true,
+            Some(ToolFailure {
+                name: "TimeoutError".to_owned(),
+                code: "TOOL_TIMEOUT".to_owned(),
+            }),
+            meta,
+            false,
+        )?
+    } else {
+        result
+    };
+    Ok(ToolRun::Completed {
+        result,
+        settlement: if disposition == ToolCommitDisposition::Committed {
+            ResultSettlement::PreferredRequired
+        } else {
+            ResultSettlement::FallbackAllowed
+        },
+        stop,
+    })
+}
+
+fn session_has_unresolved_tool_calls(session: &Session) -> bool {
+    session.has_unresolved_surface_tool_calls()
+}
+
+async fn settle_tool_result(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    plan: &mut PlannedTool,
+    result: ToolExecutionResult,
+    settlement: ResultSettlement,
+) -> Result<bool, AgentLoopError> {
+    let workspace_touch = result.workspace_touch().map(str::to_owned);
+    let (content, is_error, error, meta, _concludes_turn) = result.into_parts();
+    let component_bytes = content
+        .iter()
+        .try_fold(0_usize, |total, block| {
+            total.checked_add(block.raw().encoded_len())
+        })
+        .and_then(|total| total.checked_add(meta.as_ref().map_or(0, JsonValue::encoded_len)))
+        .and_then(|total| {
+            error.as_ref().map_or(Some(total), |error| {
+                total
+                    .checked_add(error.name.len())
+                    .and_then(|value| value.checked_add(error.code.len()))
+            })
+        });
+    let component_fits = component_bytes.is_some_and(|size| {
+        size <= driver.config.limits.max_tool_result_bytes
+            && driver
+                .counters
+                .tool_result_bytes
+                .checked_add(size)
+                .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes)
+    });
+    let preferred_required = settlement == ResultSettlement::PreferredRequired;
+    if !preferred_required && !component_fits {
+        reservation
+            .settle_exact_settled(&mut plan.result_claim)
+            .await?;
+        record_repeat_tool_result(driver, plan)?;
+        return Ok(false);
+    }
+    let message = match Message::tool_result(
+        plan.result_message_id.clone(),
+        plan.call.id.clone(),
+        content,
+        is_error,
+    ) {
+        Ok(message) => message,
+        Err(error) if preferred_required => return Err(error.into()),
+        Err(_) => {
+            reservation
+                .settle_exact_settled(&mut plan.result_claim)
+                .await?;
+            record_repeat_tool_result(driver, plan)?;
+            return Ok(false);
+        }
+    };
+    let preferred = NewEvent::surface(
+        EventKind::ToolResult {
+            turn: plan_turn(plan, reservation)?,
+            step: plan_step(plan, reservation)?,
+            message,
+            error,
+            meta,
+        },
+        SurfaceIntent::append().with_sources(vec![plan.call_seq]),
+    );
+    let size = match Session::event_retained_json_bytes(&preferred) {
+        Ok(size) => size,
+        Err(error) if preferred_required => return Err(error.into()),
+        Err(_) => {
+            reservation
+                .settle_exact_settled(&mut plan.result_claim)
+                .await?;
+            record_repeat_tool_result(driver, plan)?;
+            return Ok(false);
+        }
+    };
+    if preferred_required {
+        match reservation
+            .settle_preferred_only_settled(&mut plan.result_claim, preferred)
+            .await
+        {
+            Ok(_) => {}
+            Err(first @ AppendError::Clock(_)) if reservation.session().is_durable() => {
+                match reservation
+                    .resume_preferred_only_settled(&mut plan.result_claim)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(AppendError::Clock(_)) => return Err(first.into()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        driver.counters.tool_result_bytes = driver.counters.tool_result_bytes.saturating_add(size);
+        retain_workspace_touch(driver, workspace_touch);
+        record_repeat_tool_result(driver, plan)?;
+        return Ok(true);
+    }
+    let inside_limits = size <= driver.config.limits.max_tool_result_bytes
+        && driver
+            .counters
+            .tool_result_bytes
+            .checked_add(size)
+            .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes);
+    if !inside_limits {
+        reservation
+            .settle_exact_settled(&mut plan.result_claim)
+            .await?;
+        record_repeat_tool_result(driver, plan)?;
+        return Ok(false);
+    }
+    let settlement = reservation
+        .settle_settled(&mut plan.result_claim, preferred)
+        .await?;
+    let preferred = matches!(settlement, ClaimedAppend::Preferred(_));
+    if preferred {
+        driver.counters.tool_result_bytes += size;
+        retain_workspace_touch(driver, workspace_touch);
+    }
+    record_repeat_tool_result(driver, plan)?;
+    Ok(preferred)
+}
+
+fn record_repeat_tool_result(
+    driver: &mut Driver<'_>,
+    plan: &PlannedTool,
+) -> Result<(), AgentLoopError> {
+    let Some(notice) = driver
+        .repeat_tool_reminder
+        .observe(plan.call.name.as_str(), plan.call.arguments.as_str())
+        .map_err(|error| AgentLoopError::Serialization(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if driver.pending_repeat_contexts.len() >= MAX_AGENT_TOOL_CALLS_PER_STEP {
+        return Err(AgentLoopError::Invariant(
+            "repeat-tool reminder context count exceeded the step tool limit",
+        ));
+    }
+    let source = MessageSource::plugin_notice("repeat-tool-reminder", notice.summary())?;
+    let content = ContentBlock::text(notice.text())?;
+    let message = Message::user(
+        next_id(driver.runtime, AgentIdKind::Message)?,
+        vec![content],
+        source,
+    )?;
+    driver.pending_repeat_contexts.push(message);
+    Ok(())
+}
+
+fn retain_workspace_touch(driver: &mut Driver<'_>, touch: Option<String>) {
+    let Some(touch) = touch else {
+        return;
+    };
+    if driver.pending_workspace_touches.len() < MAX_AGENT_TOOL_CALLS_PER_TURN
+        && !driver
+            .pending_workspace_touches
+            .iter()
+            .any(|known| known == &touch)
+    {
+        driver.pending_workspace_touches.push(touch);
+    }
+}
+
+fn release_uncommitted_tool_round(
+    reservation: &mut SessionReservation<'_>,
+    assistant_claim: &mut EventClaim,
+    planned: &mut [PlannedTool],
+) -> Result<(), AgentLoopError> {
+    reservation.release(assistant_claim)?;
+    for plan in planned {
+        reservation.release(&mut plan.call_claim)?;
+        reservation.release(&mut plan.result_claim)?;
+    }
+    Ok(())
+}
+
+fn action_result_event_bytes(
+    reservation: &SessionReservation<'_>,
+    plan: &PlannedTool,
+    result: &ToolExecutionResult,
+) -> Result<usize, AgentLoopError> {
+    let message = Message::tool_result(
+        plan.result_message_id.clone(),
+        plan.call.id.clone(),
+        result.content().to_vec(),
+        result.is_error(),
+    )?;
+    let event = NewEvent::surface(
+        EventKind::ToolResult {
+            turn: plan_turn(plan, reservation)?,
+            step: plan_step(plan, reservation)?,
+            message,
+            error: result.error().cloned(),
+            meta: result.meta().cloned(),
+        },
+        SurfaceIntent::append().with_sources(vec![plan.call_seq]),
+    );
+    Session::event_retained_json_bytes(&event).map_err(Into::into)
+}
+
+fn shell_prestart_result(
+    code: &'static str,
+    failure_name: &str,
+    message: impl Into<String>,
+    parsed: Option<(&str, u64)>,
+) -> Result<ToolExecutionResult, AgentLoopError> {
+    let mut meta = serde_json::Map::from_iter([
+        (
+            "kind".to_owned(),
+            serde_json::Value::String("foreground".to_owned()),
+        ),
+        ("started".to_owned(), serde_json::Value::Bool(false)),
+        ("exitCode".to_owned(), serde_json::Value::Null),
+        ("signal".to_owned(), serde_json::Value::Null),
+    ]);
+    if let Some((workdir, timeout_ms)) = parsed {
+        meta.insert(
+            "workdir".to_owned(),
+            serde_json::Value::String(workdir.to_owned()),
+        );
+        meta.insert(
+            "timeoutMs".to_owned(),
+            serde_json::Value::Number(timeout_ms.into()),
+        );
+    }
+    Ok(ToolExecutionResult::new(
+        vec![ContentBlock::text(message.into())?],
+        true,
+        Some(ToolFailure {
+            name: failure_name.to_owned(),
+            code: code.to_owned(),
+        }),
+        Some(
+            JsonValue::new(serde_json::Value::Object(meta)).map_err(|_| {
+                AgentLoopError::Invariant("internal shell result metadata exceeded model bounds")
+            })?,
+        ),
+        false,
+    )?)
+}
+
+fn plugin_prestart_result(
+    plugin_id: &str,
+    code: &str,
+    failure_name: &str,
+    message: impl Into<String>,
+) -> Result<ToolExecutionResult, AgentLoopError> {
+    let meta = serde_json::json!({
+        "kind": "plugin",
+        "pluginId": plugin_id,
+        "dispatched": false,
+        "peerSettled": false,
+        "quiescent": true,
+    });
+    Ok(ToolExecutionResult::new(
+        vec![ContentBlock::text(message.into())?],
+        true,
+        Some(ToolFailure {
+            name: failure_name.to_owned(),
+            code: code.to_owned(),
+        }),
+        Some(JsonValue::new(meta).map_err(|_| {
+            AgentLoopError::Invariant("internal plugin result metadata exceeded model bounds")
+        })?),
+        false,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tool_prestart_error_event(
+    profile: &ToolClaimProfile,
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+    code: &'static str,
+    failure_name: &str,
+    message: &'static str,
+) -> Result<NewEvent, AgentLoopError> {
+    match profile.action_contract() {
+        Some(ActionContract::Shell) => shell_prestart_error_event(
+            turn,
+            step,
+            message_id,
+            call,
+            call_seq,
+            code,
+            failure_name,
+            message,
+            None,
+        ),
+        Some(ActionContract::Plugin { plugin_id }) => {
+            let result = plugin_prestart_result(plugin_id.as_str(), code, failure_name, message)?;
+            tool_result_event(turn, step, message_id, call, call_seq, result)
+        }
+        None => tool_error_event(
+            turn,
+            step,
+            message_id,
+            call,
+            call_seq,
+            code,
+            failure_name,
+            message,
+        ),
+    }
+}
+
+fn plugin_prestart_claim_ceiling(
+    plugin_id: &str,
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+) -> Result<usize, AgentLoopError> {
+    let result = plugin_prestart_result(
+        plugin_id,
+        &"X".repeat(256),
+        &"x".repeat(256),
+        "x".repeat(4 * 1024),
+    )?;
+    let probe = tool_result_event(turn, step, message_id, call, call_seq, result)?;
+    Session::event_retained_json_bytes(&probe).map_err(Into::into)
+}
+
+fn tool_result_event(
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+    result: ToolExecutionResult,
+) -> Result<NewEvent, AgentLoopError> {
+    let (content, is_error, error, meta, _) = result.into_parts();
+    let message = Message::tool_result(message_id, call.id.clone(), content, is_error)?;
+    Ok(NewEvent::surface(
+        EventKind::ToolResult {
+            turn,
+            step,
+            message,
+            error,
+            meta,
+        },
+        SurfaceIntent::append().with_sources(vec![call_seq]),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shell_prestart_error_event(
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+    code: &'static str,
+    failure_name: &str,
+    message: impl Into<String>,
+    parsed: Option<(&str, u64)>,
+) -> Result<NewEvent, AgentLoopError> {
+    let result = shell_prestart_result(code, failure_name, message, parsed)?;
+    tool_result_event(turn, step, message_id, call, call_seq, result)
+}
+
+fn shell_prestart_claim_ceiling(
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+) -> Result<usize, AgentLoopError> {
+    // This probe is never appended. Backslashes exercise JSON expansion for a
+    // maximum-length legal relative workdir; the remaining text covers every
+    // fixed pre-start diagnostic without inventing those fields in a fallback.
+    let workdir = "\\".repeat(4_096);
+    let probe = shell_prestart_error_event(
+        turn,
+        step,
+        message_id,
+        call,
+        call_seq,
+        "TOOL_OUTPUT_BUDGET_EXCEEDED",
+        &"x".repeat(256),
+        "x".repeat(4_096),
+        Some((workdir.as_str(), 295_000)),
+    )?;
+    Session::event_retained_json_bytes(&probe).map_err(Into::into)
+}
+
+fn plan_turn(
+    _plan: &PlannedTool,
+    reservation: &SessionReservation<'_>,
+) -> Result<TurnId, AgentLoopError> {
+    reservation
+        .session()
+        .state()
+        .open_turn()
+        .ok_or(AgentLoopError::Invariant("tool result has no open turn"))
+}
+
+fn plan_step(
+    _plan: &PlannedTool,
+    reservation: &SessionReservation<'_>,
+) -> Result<StepId, AgentLoopError> {
+    reservation
+        .session()
+        .state()
+        .open_step()
+        .ok_or(AgentLoopError::Invariant("tool result has no open step"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tool_error_event(
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+    code: &'static str,
+    failure_name: &str,
+    message: &'static str,
+) -> Result<NewEvent, AgentLoopError> {
+    let content = vec![ContentBlock::text(message)?];
+    let result = Message::tool_result(message_id, call.id.clone(), content, true)?;
+    Ok(NewEvent::surface(
+        EventKind::ToolResult {
+            turn,
+            step,
+            message: result,
+            error: Some(ToolFailure {
+                name: failure_name.to_owned(),
+                code: code.to_owned(),
+            }),
+            meta: None,
+        },
+        SurfaceIntent::append().with_sources(vec![call_seq]),
+    ))
+}
+
+fn proposed_config(
+    config: &AgentLoopConfig,
+    previous: Option<&EpochHeader>,
+    header_logged: bool,
+) -> Result<LlmCallConfig, AgentLoopError> {
+    if header_logged {
+        if let Some(previous) = previous {
+            let defaults = previous.adapter_defaults.clone().unwrap_or_default();
+            let prior_proposal = previous.config.without_adapter_defaults(&defaults)?;
+            // Most turns keep using the already logged proposal. An idle
+            // `/model` command is the one supported mutation of `config.call`;
+            // when it differs, let the normal header comparison append a
+            // `change` before the next Provider dispatch.
+            return Ok(if config.call.equivalent_to(&prior_proposal) {
+                prior_proposal
+            } else {
+                config.call.clone()
+            });
+        }
+        return Ok(config.call.clone());
+    }
+    let Some(previous) = previous else {
+        return Ok(config.call.clone());
+    };
+    let same_route = previous.config.provider() == config.call.provider()
+        && previous.config.model() == config.call.model();
+    let explicit_effort = same_route
+        .then_some(previous)
+        .filter(|header| {
+            header
+                .adapter_defaults
+                .as_ref()
+                .is_none_or(|defaults| defaults.reasoning_effort.is_none())
+        })
+        .and_then(|header| header.config.reasoning_effort());
+    Ok(config
+        .call
+        .with_reasoning_effort_if_absent(explicit_effort)?)
+}
+
+fn selection_from_call(call: &LlmCallConfig) -> SessionModelSelection {
+    SessionModelSelection {
+        model: call.model().to_owned(),
+        reasoning_effort: call
+            .reasoning_effort()
+            .map(|effort| effort.as_str().to_owned()),
+    }
+}
+
+fn next_id(runtime: &dyn AgentRuntime, kind: AgentIdKind) -> Result<String, AgentRuntimeError> {
+    let id = runtime.next_id(kind)?;
+    if id.is_empty() || id.len() > 1_024 || id.chars().any(char::is_control) {
+        return Err(AgentRuntimeError::EmptyId {
+            kind: kind.prefix(),
+        });
+    }
+    Ok(id)
+}
+
+fn checked_sample(runtime: &dyn AgentRuntime) -> Result<f64, AgentRuntimeError> {
+    let sample = runtime.sample_unit()?;
+    if !sample.is_finite() || !(0.0..=1.0).contains(&sample) {
+        return Err(AgentRuntimeError::InvalidSample);
+    }
+    Ok(sample)
+}
+
+fn failure_reason(code: &str, message: &str) -> Result<LlmFailure, AgentLoopError> {
+    Ok(LlmFailure::new(message, code)?)
+}
+
+fn failure_from_display(
+    code: &str,
+    prefix: &str,
+    _error: &impl std::fmt::Display,
+) -> Result<LlmFailure, AgentLoopError> {
+    // Provider implementations are extension boundaries. Their Display text
+    // may contain prompts, credentials, or server payloads, so durable session
+    // facts use only this stable agent-owned summary.
+    failure_reason(code, prefix)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchBarrier {
+    Ready,
+    ObserverUnavailable,
+}
+
+async fn dispatch_barrier(
+    reservation: &mut SessionReservation<'_>,
+) -> Result<DispatchBarrier, AgentLoopError> {
+    match reservation.flush_barrier().await {
+        Ok(()) => Ok(DispatchBarrier::Ready),
+        Err(BarrierError::ObserverUnavailable) => Ok(DispatchBarrier::ObserverUnavailable),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn observer_unavailable_failure() -> Result<LlmFailure, AgentLoopError> {
+    failure_reason(
+        "AGENT_OBSERVER_UNAVAILABLE",
+        "the live session observer became unavailable",
+    )
+}
+
+fn is_budget_error(error: &AppendError) -> bool {
+    is_memory_budget_error(error) || is_durable_session_limit(error)
+}
+
+fn is_memory_budget_error(error: &AppendError) -> bool {
+    matches!(
+        error,
+        AppendError::EventLimit { .. }
+            | AppendError::RetainedJsonLimit { .. }
+            | AppendError::ReservedEventLimit { .. }
+            | AppendError::ReservedRetainedJsonLimit { .. }
+    )
+}
+
+fn is_durable_session_limit(error: &AppendError) -> bool {
+    matches!(
+        error,
+        AppendError::DurableRecord
+            | AppendError::DurableEventLimit { .. }
+            | AppendError::DurableByteLimit { .. }
+            | AppendError::DurableResidentLimit { .. }
+    )
+}
+
+fn is_fatal_loop_error(error: &AgentLoopError) -> bool {
+    match error {
+        AgentLoopError::Barrier(_) | AgentLoopError::Store(_) => true,
+        AgentLoopError::Session(error) => matches!(
+            error,
+            AppendError::NeedsMaterialization
+                | AppendError::DurableAsyncRequired
+                | AppendError::DurablePoisoned
+                | AppendError::DurableWriter
+                | AppendError::NeedsAppendSettle
+        ),
+        _ => false,
+    }
+}

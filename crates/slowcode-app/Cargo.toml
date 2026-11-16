@@ -1,0 +1,32 @@
+[package]
+name = "slowcode-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared session assembly and command dispatch for slowcode"
+license = "MIT"
+publish = false
+
+[lib]
+name = "slowcode_app"
+path = "src/lib.rs"
+
+[dependencies]
+dotenvy = "0.15"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+slowcode-cognition = { workspace = true }
+slowcode-context = { path = "../slowcode-context" }
+slowcode-kernel = { workspace = true }
+slowcode-mcp = { path = "../slowcode-mcp" }
+slowcode-roles = { workspace = true }
+slowcode-runtime = { workspace = true }
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.8"
+
+[dev-dependencies]
+futures-util = "0.3"

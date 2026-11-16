@@ -1,0 +1,7319 @@
+//! One-owner blocking journal writer with cancellation-safe async waits.
+
+use std::{
+    fs::File,
+    io::{Seek, SeekFrom, Write},
+    os::unix::fs::FileExt as _,
+    thread,
+};
+
+use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use crate::resident_credit::{ChargedBytes, ResidentCreditLease, ResidentCreditPool};
+
+use super::journal_row::{JournalRowLocator, RawRowHasher};
+
+const COMMAND_CAPACITY: usize = 1;
+pub(super) const MAX_PRUNE_PREFIX_BYTES: usize = 10 * 1024 * 1024;
+const MAX_PRUNE_PREFIX_ROWS: usize = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JournalCursor {
+    pub(crate) physical_offset: u64,
+    pub(crate) durable_offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum JournalError {
+    #[error("the session journal is poisoned")]
+    Poisoned,
+    #[error("the session journal writer stopped")]
+    WriterStopped,
+    #[error("the session journal has no staged append")]
+    NothingStaged,
+    #[error("the session journal already has a staged append")]
+    AlreadyStaged,
+    #[error("the session journal must settle its in-flight command first")]
+    FlightInProgress,
+}
+
+enum Command {
+    Append {
+        bytes: Vec<u8>,
+        ack: oneshot::Sender<Result<JournalCursor, JournalError>>,
+    },
+    AppendPrunePrefix {
+        bytes: Vec<u8>,
+        rows: usize,
+        ack: oneshot::Sender<Result<JournalCursor, JournalError>>,
+    },
+    Barrier {
+        ack: oneshot::Sender<Result<JournalCursor, JournalError>>,
+    },
+    ReadRow {
+        locator: JournalRowLocator,
+        cancellation: CancellationToken,
+        ack: oneshot::Sender<Result<Vec<u8>, ReadCommandError>>,
+    },
+    ExportRaw {
+        destination: File,
+        cancellation: CancellationToken,
+        ack: oneshot::Sender<Result<u64, JournalExportError>>,
+    },
+    InspectFork {
+        anchor: Option<u64>,
+        cancellation: CancellationToken,
+        ack: oneshot::Sender<Result<ForkFlightResult, JournalForkError>>,
+    },
+    CopyFork {
+        boundary: JournalForkBoundary,
+        destination: File,
+        header_line: Vec<u8>,
+        suffix: Vec<u8>,
+        cancellation: CancellationToken,
+        ack: oneshot::Sender<Result<ForkFlightResult, JournalForkError>>,
+    },
+    Finish {
+        ack: oneshot::Sender<Result<JournalCursor, JournalError>>,
+    },
+}
+
+/// Client/server halves used when a recovery worker becomes the normal writer
+/// without releasing its file descriptor or advisory lock in between.
+pub(super) struct JournalHandoff {
+    sender: mpsc::Sender<Command>,
+}
+
+pub(super) struct JournalInbox {
+    receiver: mpsc::Receiver<Command>,
+}
+
+pub(super) fn handoff_channel() -> (JournalHandoff, JournalInbox) {
+    let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
+    (JournalHandoff { sender }, JournalInbox { receiver })
+}
+
+impl JournalInbox {
+    pub(super) fn run(self, file: File, durable_offset: u64) {
+        writer_main(file, durable_offset, self.receiver);
+    }
+}
+
+struct Flight {
+    kind: FlightKind,
+    ack: oneshot::Receiver<Result<JournalCursor, JournalError>>,
+    _credit: Option<ResidentCreditLease>,
+}
+
+struct ReadFlight {
+    locator: JournalRowLocator,
+    cancellation: CancellationToken,
+    ack: oneshot::Receiver<Result<Vec<u8>, ReadCommandError>>,
+}
+
+struct ExportFlight {
+    cancellation: CancellationToken,
+    ack: oneshot::Receiver<Result<u64, JournalExportError>>,
+}
+
+enum ForkFlightResult {
+    Boundary(JournalForkBoundary),
+    Copied(u64),
+}
+
+struct ForkFlight {
+    cancellation: CancellationToken,
+    ack: oneshot::Receiver<Result<ForkFlightResult, JournalForkError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadCommandError {
+    Cancelled,
+    Writer(JournalError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum JournalExportError {
+    #[error("the session journal export was cancelled")]
+    Cancelled,
+    #[error("the session journal export destination failed")]
+    Destination,
+    #[error(transparent)]
+    Writer(#[from] JournalError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JournalForkBoundary {
+    header_end: u64,
+    seed_end: u64,
+    seed_events: u64,
+    seed_ends_with_end_seed: bool,
+    source_events: u64,
+    source_durable_offset: u64,
+}
+
+impl JournalForkBoundary {
+    pub(crate) fn seed_events(self) -> u64 {
+        self.seed_events
+    }
+
+    pub(crate) fn source_events(self) -> u64 {
+        self.source_events
+    }
+
+    pub(crate) fn seed_ends_with_end_seed(self) -> bool {
+        self.seed_ends_with_end_seed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum JournalForkError {
+    #[error("the Session has no completed turn available for this fork anchor")]
+    Unavailable,
+    #[error("the Session fork was cancelled")]
+    Cancelled,
+    #[error("the Session fork destination failed")]
+    Destination,
+    #[error("the inspected Session fork source changed")]
+    Changed,
+    #[error(transparent)]
+    Writer(#[from] JournalError),
+}
+
+enum PendingWrite {
+    Ordinary(ChargedBytes),
+    PrunePrefix { bytes: ChargedBytes, rows: usize },
+}
+
+impl PendingWrite {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordinary(bytes) | Self::PrunePrefix { bytes, .. } => bytes.len(),
+        }
+    }
+
+    fn kind(&self) -> FlightKind {
+        match self {
+            Self::Ordinary(_) => FlightKind::Append,
+            Self::PrunePrefix { .. } => FlightKind::PrunePrefix,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlightKind {
+    Append,
+    PrunePrefix,
+    Barrier,
+    Finish,
+}
+
+/// Owns a not-yet-settled bootstrap thread before any async wait begins.
+///
+/// Dropping the wait future leaves the receiver and thread handle here, so a
+/// later wait or shutdown can settle the same physical creation operation.
+pub(super) struct DeferredWriter<E> {
+    sender: Option<mpsc::Sender<Command>>,
+    startup: Option<oneshot::Receiver<Result<JournalCursor, E>>>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl<E: Send + 'static> DeferredWriter<E> {
+    pub(super) fn start(
+        factory: impl FnOnce() -> Result<(File, u64), E> + Send + 'static,
+    ) -> Result<Self, JournalError> {
+        let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let (startup_ack, startup) = oneshot::channel();
+        let join = thread::Builder::new()
+            .name("dsh-session-journal".to_owned())
+            .spawn(move || match factory() {
+                Ok((file, durable_offset)) => {
+                    let cursor = JournalCursor {
+                        physical_offset: durable_offset,
+                        durable_offset,
+                    };
+                    if startup_ack.send(Ok(cursor)).is_ok() {
+                        writer_main(file, durable_offset, receiver);
+                    }
+                }
+                Err(error) => {
+                    let _ = startup_ack.send(Err(error));
+                }
+            })
+            .map_err(|_| JournalError::WriterStopped)?;
+        Ok(Self {
+            sender: Some(sender),
+            startup: Some(startup),
+            join: Some(join),
+        })
+    }
+
+    pub(super) async fn wait_ready(
+        &mut self,
+        resident_pool: ResidentCreditPool,
+    ) -> Result<Result<JournalWriter, E>, JournalError> {
+        let startup = self.startup.as_mut().ok_or(JournalError::WriterStopped)?;
+        let result = startup.await.map_err(|_| JournalError::WriterStopped);
+        self.startup = None;
+        match result {
+            Ok(Ok(cursor)) => Ok(Ok(JournalWriter::from_running_with_pool(
+                self.sender.take().ok_or(JournalError::WriterStopped)?,
+                self.join.take().ok_or(JournalError::WriterStopped)?,
+                cursor,
+                resident_pool,
+            ))),
+            Ok(Err(error)) => {
+                self.sender.take();
+                self.join_worker()?;
+                Ok(Err(error))
+            }
+            Err(error) => {
+                self.sender.take();
+                let _ = self.join_worker();
+                Err(error)
+            }
+        }
+    }
+
+    fn join_worker(&mut self) -> Result<(), JournalError> {
+        if self.join.take().is_some_and(|join| join.join().is_err()) {
+            return Err(JournalError::WriterStopped);
+        }
+        Ok(())
+    }
+}
+
+impl<E> Drop for DeferredWriter<E> {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Sole async handle for one standard thread, fd, and advisory lock.
+pub(crate) struct JournalWriter {
+    sender: Option<mpsc::Sender<Command>>,
+    pending: Option<PendingWrite>,
+    flight: Option<Flight>,
+    read_flight: Option<ReadFlight>,
+    export_flight: Option<ExportFlight>,
+    fork_flight: Option<ForkFlight>,
+    join: Option<thread::JoinHandle<()>>,
+    cursor: JournalCursor,
+    poisoned: bool,
+    finished: bool,
+    finish_error: Option<JournalError>,
+    #[cfg(test)]
+    resident_pool: ResidentCreditPool,
+}
+
+impl std::fmt::Debug for JournalWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournalWriter")
+            .field("pending", &self.pending.as_ref().map(PendingWrite::len))
+            .field("flight", &self.flight.is_some())
+            .field("read_flight", &self.read_flight.is_some())
+            .field("export_flight", &self.export_flight.is_some())
+            .field("fork_flight", &self.fork_flight.is_some())
+            .field("cursor", &self.cursor)
+            .field("poisoned", &self.poisoned)
+            .field("finished", &self.finished)
+            .field("finish_error", &self.finish_error)
+            .finish()
+    }
+}
+
+impl JournalWriter {
+    #[cfg(test)]
+    pub(crate) fn start(file: File, durable_offset: u64) -> Result<Self, JournalError> {
+        let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let join = thread::Builder::new()
+            .name("dsh-session-journal".to_owned())
+            .spawn(move || writer_main(file, durable_offset, receiver))
+            .map_err(|_| JournalError::WriterStopped)?;
+        Ok(Self::from_running_with_pool(
+            sender,
+            join,
+            JournalCursor {
+                physical_offset: durable_offset,
+                durable_offset,
+            },
+            ResidentCreditPool::for_durable_session(),
+        ))
+    }
+
+    #[cfg(test)]
+    fn from_running(
+        sender: mpsc::Sender<Command>,
+        join: thread::JoinHandle<()>,
+        cursor: JournalCursor,
+    ) -> Self {
+        Self::from_running_with_pool(
+            sender,
+            join,
+            cursor,
+            ResidentCreditPool::for_durable_session(),
+        )
+    }
+
+    fn from_running_with_pool(
+        sender: mpsc::Sender<Command>,
+        join: thread::JoinHandle<()>,
+        cursor: JournalCursor,
+        resident_pool: ResidentCreditPool,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = resident_pool;
+        Self {
+            sender: Some(sender),
+            pending: None,
+            flight: None,
+            read_flight: None,
+            export_flight: None,
+            fork_flight: None,
+            join: Some(join),
+            cursor,
+            poisoned: false,
+            finished: false,
+            finish_error: None,
+            #[cfg(test)]
+            resident_pool,
+        }
+    }
+
+    pub(super) fn from_handoff(
+        handoff: JournalHandoff,
+        join: thread::JoinHandle<()>,
+        cursor: JournalCursor,
+        resident_pool: ResidentCreditPool,
+    ) -> Self {
+        Self::from_running_with_pool(handoff.sender, join, cursor, resident_pool)
+    }
+
+    #[cfg(test)]
+    pub(super) fn resident_pool(&self) -> ResidentCreditPool {
+        self.resident_pool.clone()
+    }
+
+    /// Move an already bounded command into owner state before any await.
+    pub(super) fn stage(&mut self, bytes: ChargedBytes) -> Result<(), JournalError> {
+        self.ensure_stageable()?;
+        self.pending = Some(PendingWrite::Ordinary(bytes));
+        Ok(())
+    }
+
+    /// Stage one already validated marker-only or marker/replacement prefix.
+    pub(super) fn stage_prune_prefix(
+        &mut self,
+        bytes: ChargedBytes,
+        rows: usize,
+    ) -> Result<(), JournalError> {
+        self.ensure_stageable()?;
+        if !valid_prune_prefix(&bytes, rows) {
+            self.poisoned = true;
+            self.finish_error.get_or_insert(JournalError::Poisoned);
+            return Err(JournalError::Poisoned);
+        }
+        self.pending = Some(PendingWrite::PrunePrefix { bytes, rows });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn stage_bytes_for_test(&mut self, bytes: Vec<u8>) -> Result<(), JournalError> {
+        let bytes = ChargedBytes::try_new(bytes, &self.resident_pool)
+            .map_err(|_| JournalError::Poisoned)?;
+        self.stage(bytes)
+    }
+
+    #[cfg(test)]
+    fn stage_prune_prefix_bytes_for_test(
+        &mut self,
+        bytes: Vec<u8>,
+        rows: usize,
+    ) -> Result<(), JournalError> {
+        let bytes = ChargedBytes::try_new(bytes, &self.resident_pool)
+            .map_err(|_| JournalError::Poisoned)?;
+        self.stage_prune_prefix(bytes, rows)
+    }
+
+    pub(crate) fn ensure_stageable(&self) -> Result<(), JournalError> {
+        self.ensure_usable()?;
+        if self.flight.is_some() || self.export_flight.is_some() || self.fork_flight.is_some() {
+            return Err(JournalError::FlightInProgress);
+        }
+        if self.read_flight.is_some() {
+            return Err(JournalError::FlightInProgress);
+        }
+        if self.pending.is_some() {
+            return Err(JournalError::AlreadyStaged);
+        }
+        Ok(())
+    }
+
+    pub(super) fn latch_poison(&mut self) {
+        self.poisoned = true;
+        self.finish_error.get_or_insert(JournalError::Poisoned);
+    }
+
+    /// Send and settle the owner-held staged bytes.
+    ///
+    /// Cancelling this wait leaves either `pending` or `flight` inside `self`,
+    /// so a later barrier/shutdown can continue the same operation.
+    pub(crate) async fn flush_staged(&mut self) -> Result<JournalCursor, JournalError> {
+        self.ensure_usable()?;
+        if let Some(kind) = self.flight.as_ref().map(|flight| flight.kind) {
+            let cursor = self.settle_flight().await?;
+            if matches!(kind, FlightKind::Append | FlightKind::PrunePrefix) {
+                return Ok(cursor);
+            }
+        }
+        if self.pending.is_none() {
+            return Err(JournalError::NothingStaged);
+        }
+        let sender = self.sender.as_ref().ok_or(JournalError::WriterStopped)?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalError::WriterStopped)?;
+        let pending = self.pending.take().ok_or(JournalError::NothingStaged)?;
+        let kind = pending.kind();
+        let (ack, receiver) = oneshot::channel();
+        let (command, credit) = match pending {
+            PendingWrite::Ordinary(bytes) => {
+                let (bytes, credit) = bytes.into_parts();
+                (Command::Append { bytes, ack }, credit)
+            }
+            PendingWrite::PrunePrefix { bytes, rows } => {
+                let (bytes, credit) = bytes.into_parts();
+                (Command::AppendPrunePrefix { bytes, rows, ack }, credit)
+            }
+        };
+        permit.send(command);
+        self.flight = Some(Flight {
+            kind,
+            ack: receiver,
+            _credit: Some(credit),
+        });
+        self.settle_flight().await
+    }
+
+    /// Settle any command already owned by this writer before staging bytes.
+    pub(crate) async fn settle_before_stage(&mut self) -> Result<JournalCursor, JournalError> {
+        self.ensure_usable()?;
+        self.settle_export_before_other_command().await?;
+        self.settle_fork_before_other_command().await?;
+        if self.read_flight.is_some() {
+            self.settle_read_before_other_command().await?;
+        }
+        if self.pending.is_some() {
+            self.flush_staged().await
+        } else {
+            self.settle_flight().await
+        }
+    }
+
+    pub(crate) async fn barrier(&mut self) -> Result<JournalCursor, JournalError> {
+        self.ensure_usable()?;
+        self.settle_export_before_other_command().await?;
+        self.settle_fork_before_other_command().await?;
+        if self.read_flight.is_some() {
+            self.settle_read_before_other_command().await?;
+        }
+        if self.pending.is_some() {
+            self.flush_staged().await?;
+        } else if let Some(kind) = self.flight.as_ref().map(|flight| flight.kind) {
+            let cursor = self.settle_flight().await?;
+            if kind == FlightKind::Barrier {
+                return Ok(cursor);
+            }
+            if kind == FlightKind::Finish {
+                return Err(self.finish_error.unwrap_or(JournalError::WriterStopped));
+            }
+        }
+        if self.finished {
+            return Err(self.finish_error.unwrap_or(JournalError::WriterStopped));
+        }
+        self.send_control(FlightKind::Barrier).await
+    }
+
+    pub(crate) async fn finish(&mut self) -> Result<JournalCursor, JournalError> {
+        if self.finished {
+            return self.finish_error.map_or(Ok(self.cursor), Err);
+        }
+        let settle_export = self.settle_export_before_other_command().await;
+        let settle_fork = if settle_export.is_ok() {
+            self.settle_fork_before_other_command().await
+        } else {
+            Ok(())
+        };
+        let settle = if settle_export.is_err() {
+            settle_export.map(|()| self.cursor)
+        } else if settle_fork.is_err() {
+            settle_fork.map(|()| self.cursor)
+        } else if self.read_flight.is_some() {
+            self.settle_read_before_other_command()
+                .await
+                .map(|()| self.cursor)
+        } else if self.pending.is_some() {
+            self.flush_staged().await
+        } else {
+            self.settle_flight().await
+        };
+        if let Err(error) = settle {
+            self.finish_error.get_or_insert(error);
+            self.pending.take();
+        }
+        if !self.finished {
+            if let Err(error) = self.send_control(FlightKind::Finish).await {
+                self.finish_error.get_or_insert(error);
+            }
+        }
+        self.sender.take();
+        if let Err(error) = self.join_worker() {
+            self.finish_error.get_or_insert(error);
+        }
+        self.finished = true;
+        self.finish_error.map_or(Ok(self.cursor), Err)
+    }
+
+    /// Read one already durable event row through the same fd and owner thread.
+    ///
+    /// If this wait is cancelled, the receiver remains in `self`; retrying the
+    /// same locator settles the original physical read instead of issuing a
+    /// duplicate command.
+    pub(super) async fn read_durable_row(
+        &mut self,
+        locator: JournalRowLocator,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<u8>, JournalReadError> {
+        self.ensure_usable().map_err(JournalReadError::Writer)?;
+        self.settle_export_before_other_command()
+            .await
+            .map_err(JournalReadError::Writer)?;
+        self.settle_fork_before_other_command()
+            .await
+            .map_err(JournalReadError::Writer)?;
+        if let Some(active) = self.read_flight.as_ref() {
+            if active.locator == locator {
+                return self.settle_read_flight().await;
+            }
+            active.cancellation.cancel();
+            match self.settle_read_flight().await {
+                Ok(_) | Err(JournalReadError::Cancelled) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if self.pending.is_some() {
+            self.flush_staged()
+                .await
+                .map_err(JournalReadError::Writer)?;
+        } else if self.flight.is_some() {
+            self.settle_flight()
+                .await
+                .map_err(JournalReadError::Writer)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(JournalReadError::Cancelled);
+        }
+        if self.cursor.physical_offset != self.cursor.durable_offset {
+            self.send_control(FlightKind::Barrier)
+                .await
+                .map_err(JournalReadError::Writer)?;
+            if cancellation.is_cancelled() {
+                return Err(JournalReadError::Cancelled);
+            }
+        }
+        if locator
+            .end()
+            .is_none_or(|end| end > self.cursor.durable_offset)
+        {
+            return Err(JournalReadError::NotDurable);
+        }
+
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(JournalReadError::Writer(JournalError::WriterStopped))?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalReadError::Writer(JournalError::WriterStopped))?;
+        let (ack, receiver) = oneshot::channel();
+        let owned_cancellation = cancellation.child_token();
+        permit.send(Command::ReadRow {
+            locator,
+            cancellation: owned_cancellation.clone(),
+            ack,
+        });
+        self.read_flight = Some(ReadFlight {
+            locator,
+            cancellation: owned_cancellation,
+            ack: receiver,
+        });
+        self.settle_read_flight().await
+    }
+
+    /// Copy the exact durable journal prefix into one caller-owned file.
+    ///
+    /// The worker performs positional reads, so this never moves the append
+    /// cursor. Destination failures do not poison the source journal; source
+    /// failures do. Cancellation is checked between fixed-size chunks.
+    pub(crate) async fn export_raw_to(
+        &mut self,
+        destination: File,
+        cancellation: CancellationToken,
+    ) -> Result<u64, JournalExportError> {
+        self.ensure_usable().map_err(JournalExportError::Writer)?;
+        self.settle_fork_before_other_command()
+            .await
+            .map_err(JournalExportError::Writer)?;
+        self.settle_export_before_other_command()
+            .await
+            .map_err(JournalExportError::Writer)?;
+        if self.read_flight.is_some() {
+            self.settle_read_before_other_command()
+                .await
+                .map_err(JournalExportError::Writer)?;
+        }
+        if self.pending.is_some() {
+            self.flush_staged()
+                .await
+                .map_err(JournalExportError::Writer)?;
+        } else if self.flight.is_some() {
+            self.settle_flight()
+                .await
+                .map_err(JournalExportError::Writer)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(JournalExportError::Cancelled);
+        }
+        if self.cursor.physical_offset != self.cursor.durable_offset {
+            self.send_control(FlightKind::Barrier)
+                .await
+                .map_err(JournalExportError::Writer)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(JournalExportError::Cancelled);
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(JournalExportError::Writer(JournalError::WriterStopped))?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalExportError::Writer(JournalError::WriterStopped))?;
+        let (ack, receiver) = oneshot::channel();
+        let owned_cancellation = cancellation.child_token();
+        permit.send(Command::ExportRaw {
+            destination,
+            cancellation: owned_cancellation.clone(),
+            ack,
+        });
+        self.export_flight = Some(ExportFlight {
+            cancellation: owned_cancellation,
+            ack: receiver,
+        });
+        self.settle_export_flight().await
+    }
+
+    pub(crate) async fn inspect_fork(
+        &mut self,
+        anchor: Option<u64>,
+        cancellation: CancellationToken,
+    ) -> Result<JournalForkBoundary, JournalForkError> {
+        self.prepare_fork_command(&cancellation).await?;
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(JournalForkError::Writer(JournalError::WriterStopped))?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalForkError::Writer(JournalError::WriterStopped))?;
+        let (ack, receiver) = oneshot::channel();
+        let owned_cancellation = cancellation.child_token();
+        permit.send(Command::InspectFork {
+            anchor,
+            cancellation: owned_cancellation.clone(),
+            ack,
+        });
+        self.fork_flight = Some(ForkFlight {
+            cancellation: owned_cancellation,
+            ack: receiver,
+        });
+        match self.settle_fork_flight().await? {
+            ForkFlightResult::Boundary(boundary) => Ok(boundary),
+            ForkFlightResult::Copied(_) => {
+                Err(JournalForkError::Writer(JournalError::FlightInProgress))
+            }
+        }
+    }
+
+    pub(crate) async fn copy_fork_to(
+        &mut self,
+        boundary: JournalForkBoundary,
+        destination: File,
+        header_line: Vec<u8>,
+        suffix: Vec<u8>,
+        cancellation: CancellationToken,
+    ) -> Result<u64, JournalForkError> {
+        self.prepare_fork_command(&cancellation).await?;
+        if self.cursor.durable_offset != boundary.source_durable_offset {
+            return Err(JournalForkError::Changed);
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(JournalForkError::Writer(JournalError::WriterStopped))?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalForkError::Writer(JournalError::WriterStopped))?;
+        let (ack, receiver) = oneshot::channel();
+        let owned_cancellation = cancellation.child_token();
+        permit.send(Command::CopyFork {
+            boundary,
+            destination,
+            header_line,
+            suffix,
+            cancellation: owned_cancellation.clone(),
+            ack,
+        });
+        self.fork_flight = Some(ForkFlight {
+            cancellation: owned_cancellation,
+            ack: receiver,
+        });
+        match self.settle_fork_flight().await? {
+            ForkFlightResult::Copied(bytes) => Ok(bytes),
+            ForkFlightResult::Boundary(_) => {
+                Err(JournalForkError::Writer(JournalError::FlightInProgress))
+            }
+        }
+    }
+
+    async fn prepare_fork_command(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), JournalForkError> {
+        self.ensure_usable().map_err(JournalForkError::Writer)?;
+        self.settle_export_before_other_command()
+            .await
+            .map_err(JournalForkError::Writer)?;
+        self.settle_fork_before_other_command()
+            .await
+            .map_err(JournalForkError::Writer)?;
+        if self.read_flight.is_some() {
+            self.settle_read_before_other_command()
+                .await
+                .map_err(JournalForkError::Writer)?;
+        }
+        if self.pending.is_some() {
+            self.flush_staged()
+                .await
+                .map_err(JournalForkError::Writer)?;
+        } else if self.flight.is_some() {
+            self.settle_flight()
+                .await
+                .map_err(JournalForkError::Writer)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(JournalForkError::Cancelled);
+        }
+        if self.cursor.physical_offset != self.cursor.durable_offset {
+            self.send_control(FlightKind::Barrier)
+                .await
+                .map_err(JournalForkError::Writer)?;
+        }
+        cancellation
+            .is_cancelled()
+            .then_some(())
+            .map_or(Ok(()), |_| Err(JournalForkError::Cancelled))
+    }
+
+    async fn send_control(&mut self, kind: FlightKind) -> Result<JournalCursor, JournalError> {
+        if kind != FlightKind::Finish {
+            self.ensure_usable()?;
+        }
+        let sender = self.sender.as_ref().ok_or(JournalError::WriterStopped)?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalError::WriterStopped)?;
+        let (ack, receiver) = oneshot::channel();
+        permit.send(match kind {
+            FlightKind::Finish => Command::Finish { ack },
+            FlightKind::Barrier => Command::Barrier { ack },
+            FlightKind::Append | FlightKind::PrunePrefix => {
+                return Err(JournalError::WriterStopped);
+            }
+        });
+        self.flight = Some(Flight {
+            kind,
+            ack: receiver,
+            _credit: None,
+        });
+        self.settle_flight().await
+    }
+
+    async fn settle_flight(&mut self) -> Result<JournalCursor, JournalError> {
+        let Some(flight) = self.flight.as_mut() else {
+            return Ok(self.cursor);
+        };
+        let result = (&mut flight.ack).await;
+        let kind = self
+            .flight
+            .as_ref()
+            .map(|flight| flight.kind)
+            .ok_or(JournalError::WriterStopped)?;
+        self.flight = None;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                self.poisoned = true;
+                self.sender.take();
+                let _ = self.join_worker();
+                if kind == FlightKind::Finish {
+                    self.finished = true;
+                    self.finish_error.get_or_insert(JournalError::WriterStopped);
+                }
+                return Err(JournalError::WriterStopped);
+            }
+        };
+        match result {
+            Ok(cursor) => {
+                self.cursor = cursor;
+                if kind == FlightKind::Finish {
+                    self.finished = true;
+                    self.sender.take();
+                    if let Err(error) = self.join_worker() {
+                        self.finish_error.get_or_insert(error);
+                        return Err(error);
+                    }
+                }
+                Ok(cursor)
+            }
+            Err(error) => {
+                self.poisoned = true;
+                if kind == FlightKind::Finish {
+                    self.finished = true;
+                    self.finish_error.get_or_insert(error);
+                    self.sender.take();
+                    let _ = self.join_worker();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn settle_read_flight(&mut self) -> Result<Vec<u8>, JournalReadError> {
+        let Some(flight) = self.read_flight.as_mut() else {
+            return Err(JournalReadError::Writer(JournalError::FlightInProgress));
+        };
+        let result = (&mut flight.ack).await;
+        self.read_flight = None;
+        match result {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(ReadCommandError::Cancelled)) => Err(JournalReadError::Cancelled),
+            Ok(Err(ReadCommandError::Writer(error))) => {
+                self.poisoned = true;
+                Err(JournalReadError::Writer(error))
+            }
+            Err(_) => {
+                self.poisoned = true;
+                self.sender.take();
+                let _ = self.join_worker();
+                Err(JournalReadError::Writer(JournalError::WriterStopped))
+            }
+        }
+    }
+
+    async fn settle_read_before_other_command(&mut self) -> Result<(), JournalError> {
+        if let Some(flight) = &self.read_flight {
+            flight.cancellation.cancel();
+        }
+        match self.settle_read_flight().await {
+            Ok(_) | Err(JournalReadError::Cancelled) => Ok(()),
+            Err(JournalReadError::NotDurable) => Err(JournalError::Poisoned),
+            Err(JournalReadError::Writer(error)) => Err(error),
+        }
+    }
+
+    async fn settle_export_flight(&mut self) -> Result<u64, JournalExportError> {
+        let Some(flight) = self.export_flight.as_mut() else {
+            return Err(JournalExportError::Writer(JournalError::FlightInProgress));
+        };
+        let result = (&mut flight.ack).await;
+        self.export_flight = None;
+        match result {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(JournalExportError::Cancelled)) => Err(JournalExportError::Cancelled),
+            Ok(Err(JournalExportError::Destination)) => Err(JournalExportError::Destination),
+            Ok(Err(JournalExportError::Writer(error))) => {
+                self.poisoned = true;
+                Err(JournalExportError::Writer(error))
+            }
+            Err(_) => {
+                self.poisoned = true;
+                self.sender.take();
+                let _ = self.join_worker();
+                Err(JournalExportError::Writer(JournalError::WriterStopped))
+            }
+        }
+    }
+
+    async fn settle_export_before_other_command(&mut self) -> Result<(), JournalError> {
+        let Some(flight) = &self.export_flight else {
+            return Ok(());
+        };
+        flight.cancellation.cancel();
+        match self.settle_export_flight().await {
+            Ok(_) | Err(JournalExportError::Cancelled | JournalExportError::Destination) => Ok(()),
+            Err(JournalExportError::Writer(error)) => Err(error),
+        }
+    }
+
+    async fn settle_fork_flight(&mut self) -> Result<ForkFlightResult, JournalForkError> {
+        let Some(flight) = self.fork_flight.as_mut() else {
+            return Err(JournalForkError::Writer(JournalError::FlightInProgress));
+        };
+        let result = (&mut flight.ack).await;
+        self.fork_flight = None;
+        match result {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(
+                error @ (JournalForkError::Unavailable
+                | JournalForkError::Cancelled
+                | JournalForkError::Destination
+                | JournalForkError::Changed),
+            )) => Err(error),
+            Ok(Err(JournalForkError::Writer(error))) => {
+                self.poisoned = true;
+                Err(JournalForkError::Writer(error))
+            }
+            Err(_) => {
+                self.poisoned = true;
+                self.sender.take();
+                let _ = self.join_worker();
+                Err(JournalForkError::Writer(JournalError::WriterStopped))
+            }
+        }
+    }
+
+    async fn settle_fork_before_other_command(&mut self) -> Result<(), JournalError> {
+        let Some(flight) = &self.fork_flight else {
+            return Ok(());
+        };
+        flight.cancellation.cancel();
+        match self.settle_fork_flight().await {
+            Ok(_)
+            | Err(
+                JournalForkError::Unavailable
+                | JournalForkError::Cancelled
+                | JournalForkError::Destination
+                | JournalForkError::Changed,
+            ) => Ok(()),
+            Err(JournalForkError::Writer(error)) => Err(error),
+        }
+    }
+
+    fn join_worker(&mut self) -> Result<(), JournalError> {
+        if self.join.take().is_some_and(|join| join.join().is_err()) {
+            self.poisoned = true;
+            return Err(JournalError::WriterStopped);
+        }
+        Ok(())
+    }
+
+    fn ensure_usable(&self) -> Result<(), JournalError> {
+        if self.poisoned {
+            Err(JournalError::Poisoned)
+        } else if self.finished {
+            Err(JournalError::WriterStopped)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(super) enum JournalReadError {
+    #[error("the requested journal row is not durable")]
+    NotDurable,
+    #[error("the requested journal row read was cancelled")]
+    Cancelled,
+    #[error(transparent)]
+    Writer(#[from] JournalError),
+}
+
+impl Drop for JournalWriter {
+    fn drop(&mut self) {
+        // Abnormal fallback: dropping the sole sender lets the worker finish
+        // already queued work and then release its fd/flock. Pending unsent
+        // bytes are deliberately not claimed durable.
+        if let Some(flight) = &self.read_flight {
+            flight.cancellation.cancel();
+        }
+        if let Some(flight) = &self.export_flight {
+            flight.cancellation.cancel();
+        }
+        if let Some(flight) = &self.fork_flight {
+            flight.cancellation.cancel();
+        }
+        self.sender.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn writer_main(mut file: File, initial_offset: u64, mut receiver: mpsc::Receiver<Command>) {
+    let mut cursor = JournalCursor {
+        physical_offset: initial_offset,
+        durable_offset: initial_offset,
+    };
+    let mut poisoned = false;
+    while let Some(command) = receiver.blocking_recv() {
+        match command {
+            Command::Append { bytes, ack } => {
+                let result = if poisoned {
+                    Err(JournalError::Poisoned)
+                } else {
+                    append_bytes(&mut file, &mut cursor, &bytes).inspect_err(|_| {
+                        poisoned = true;
+                    })
+                };
+                drop(bytes);
+                let _ = ack.send(result);
+            }
+            Command::AppendPrunePrefix { bytes, rows, ack } => {
+                let result = if poisoned || !valid_prune_prefix(&bytes, rows) {
+                    poisoned = true;
+                    Err(JournalError::Poisoned)
+                } else {
+                    append_bytes(&mut file, &mut cursor, &bytes).inspect_err(|_| {
+                        poisoned = true;
+                    })
+                };
+                drop(bytes);
+                let _ = ack.send(result);
+            }
+            Command::Barrier { ack } => {
+                let result = if poisoned {
+                    Err(JournalError::Poisoned)
+                } else {
+                    barrier_file(&mut file, &mut cursor).inspect_err(|_| {
+                        poisoned = true;
+                    })
+                };
+                let _ = ack.send(result);
+            }
+            Command::ReadRow {
+                locator,
+                cancellation,
+                ack,
+            } => {
+                let result = if poisoned {
+                    Err(ReadCommandError::Writer(JournalError::Poisoned))
+                } else {
+                    read_row(&file, cursor, locator, &cancellation).inspect_err(|error| {
+                        poisoned |= matches!(error, ReadCommandError::Writer(_));
+                    })
+                };
+                let _ = ack.send(result);
+            }
+            Command::ExportRaw {
+                destination,
+                cancellation,
+                ack,
+            } => {
+                let result = if poisoned {
+                    Err(JournalExportError::Writer(JournalError::Poisoned))
+                } else {
+                    export_raw(&file, cursor, destination, &cancellation).inspect_err(|error| {
+                        poisoned |= matches!(error, JournalExportError::Writer(_));
+                    })
+                };
+                let _ = ack.send(result);
+            }
+            Command::InspectFork {
+                anchor,
+                cancellation,
+                ack,
+            } => {
+                let result = if poisoned {
+                    Err(JournalForkError::Writer(JournalError::Poisoned))
+                } else {
+                    inspect_fork(&file, cursor, anchor, &cancellation)
+                        .map(ForkFlightResult::Boundary)
+                        .inspect_err(|error| {
+                            poisoned |= matches!(error, JournalForkError::Writer(_));
+                        })
+                };
+                let _ = ack.send(result);
+            }
+            Command::CopyFork {
+                boundary,
+                destination,
+                header_line,
+                suffix,
+                cancellation,
+                ack,
+            } => {
+                let result = if poisoned {
+                    Err(JournalForkError::Writer(JournalError::Poisoned))
+                } else {
+                    copy_fork(
+                        &file,
+                        cursor,
+                        boundary,
+                        destination,
+                        &header_line,
+                        &suffix,
+                        &cancellation,
+                    )
+                    .map(ForkFlightResult::Copied)
+                    .inspect_err(|error| {
+                        poisoned |= matches!(error, JournalForkError::Writer(_));
+                    })
+                };
+                let _ = ack.send(result);
+            }
+            Command::Finish { ack } => {
+                let result = if poisoned {
+                    Err(JournalError::Poisoned)
+                } else {
+                    barrier_file(&mut file, &mut cursor).inspect_err(|_| {
+                        poisoned = true;
+                    })
+                };
+                drop(file);
+                let _ = ack.send(result);
+                return;
+            }
+        }
+    }
+}
+
+fn valid_prune_prefix(bytes: &[u8], rows: usize) -> bool {
+    if !(1..=MAX_PRUNE_PREFIX_ROWS).contains(&rows)
+        || bytes.is_empty()
+        || bytes.len() > MAX_PRUNE_PREFIX_BYTES
+        || bytes.last() != Some(&b'\n')
+    {
+        return false;
+    }
+    let mut row_count = 0_usize;
+    let mut row_start = 0_usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let row_len = index + 1 - row_start;
+        if row_len == 1 || row_len > super::jsonl::MAX_JOURNAL_EVENT_LINE_BYTES {
+            return false;
+        }
+        row_count += 1;
+        row_start = index + 1;
+    }
+    row_count == rows && row_start == bytes.len()
+}
+
+fn read_row(
+    file: &File,
+    cursor: JournalCursor,
+    locator: JournalRowLocator,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, ReadCommandError> {
+    read_row_with_chunk_observer(file, cursor, locator, cancellation, |_| {})
+}
+
+fn read_row_with_chunk_observer(
+    file: &File,
+    cursor: JournalCursor,
+    locator: JournalRowLocator,
+    cancellation: &CancellationToken,
+    mut chunk_observer: impl FnMut(usize),
+) -> Result<Vec<u8>, ReadCommandError> {
+    if cancellation.is_cancelled() {
+        return Err(ReadCommandError::Cancelled);
+    }
+    if locator.end().is_none_or(|end| end > cursor.durable_offset) {
+        return Err(ReadCommandError::Writer(JournalError::Poisoned));
+    }
+    let length = usize::try_from(locator.length())
+        .map_err(|_| ReadCommandError::Writer(JournalError::Poisoned))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| ReadCommandError::Writer(JournalError::Poisoned))?;
+    bytes.resize(length, 0);
+    const READ_CHUNK_BYTES: usize = 64 * 1024;
+    let mut hasher = RawRowHasher::new();
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        if cancellation.is_cancelled() {
+            return Err(ReadCommandError::Cancelled);
+        }
+        let end = offset.saturating_add(READ_CHUNK_BYTES).min(bytes.len());
+        let physical_offset = locator
+            .offset()
+            .checked_add(
+                u64::try_from(offset)
+                    .map_err(|_| ReadCommandError::Writer(JournalError::Poisoned))?,
+            )
+            .ok_or(ReadCommandError::Writer(JournalError::Poisoned))?;
+        file.read_exact_at(&mut bytes[offset..end], physical_offset)
+            .map_err(|_| ReadCommandError::Writer(JournalError::Poisoned))?;
+        for (relative, byte) in bytes[offset..end].iter().enumerate() {
+            let index = offset + relative;
+            if (*byte == b'\n') != (index + 1 == length) {
+                return Err(ReadCommandError::Writer(JournalError::Poisoned));
+            }
+        }
+        hasher.update(&bytes[offset..end]);
+        offset = end;
+        chunk_observer(offset);
+        if offset < bytes.len() && cancellation.is_cancelled() {
+            return Err(ReadCommandError::Cancelled);
+        }
+    }
+    if hasher.finish() != locator.full_sha256() {
+        return Err(ReadCommandError::Writer(JournalError::Poisoned));
+    }
+    if cancellation.is_cancelled() {
+        return Err(ReadCommandError::Cancelled);
+    }
+    Ok(bytes)
+}
+
+const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+
+fn export_raw(
+    source: &File,
+    cursor: JournalCursor,
+    destination: File,
+    cancellation: &CancellationToken,
+) -> Result<u64, JournalExportError> {
+    export_raw_with_chunk_observer(source, cursor, destination, cancellation, |_| {})
+}
+
+fn export_raw_with_chunk_observer(
+    source: &File,
+    cursor: JournalCursor,
+    mut destination: File,
+    cancellation: &CancellationToken,
+    mut chunk_observer: impl FnMut(u64),
+) -> Result<u64, JournalExportError> {
+    if cancellation.is_cancelled() {
+        return Err(JournalExportError::Cancelled);
+    }
+    if cursor.physical_offset != cursor.durable_offset {
+        return Err(JournalExportError::Writer(JournalError::Poisoned));
+    }
+    let mut buffer = [0_u8; EXPORT_CHUNK_BYTES];
+    let mut offset = 0_u64;
+    while offset < cursor.durable_offset {
+        if cancellation.is_cancelled() {
+            return Err(JournalExportError::Cancelled);
+        }
+        let remaining = cursor.durable_offset - offset;
+        let length = usize::try_from(remaining.min(EXPORT_CHUNK_BYTES as u64))
+            .map_err(|_| JournalExportError::Writer(JournalError::Poisoned))?;
+        source
+            .read_exact_at(&mut buffer[..length], offset)
+            .map_err(|_| JournalExportError::Writer(JournalError::Poisoned))?;
+        destination
+            .write_all(&buffer[..length])
+            .map_err(|_| JournalExportError::Destination)?;
+        offset = offset
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| JournalExportError::Writer(JournalError::Poisoned))?,
+            )
+            .ok_or(JournalExportError::Writer(JournalError::Poisoned))?;
+        chunk_observer(offset);
+    }
+    if cancellation.is_cancelled() {
+        return Err(JournalExportError::Cancelled);
+    }
+    destination
+        .sync_all()
+        .map_err(|_| JournalExportError::Destination)?;
+    if cancellation.is_cancelled() {
+        return Err(JournalExportError::Cancelled);
+    }
+    Ok(offset)
+}
+
+#[derive(Clone, Copy)]
+struct ForkCut {
+    seed_end: u64,
+    seed_events: u64,
+    ends_with_end_seed: bool,
+}
+
+fn inspect_fork(
+    source: &File,
+    cursor: JournalCursor,
+    anchor: Option<u64>,
+    cancellation: &CancellationToken,
+) -> Result<JournalForkBoundary, JournalForkError> {
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    if cursor.physical_offset != cursor.durable_offset {
+        return Err(JournalForkError::Writer(JournalError::Poisoned));
+    }
+    let (_, header_end) = read_bounded_line_at(
+        source,
+        0,
+        cursor.durable_offset,
+        super::jsonl::MAX_JOURNAL_HEADER_LINE_BYTES,
+        cancellation,
+    )?;
+    let mut offset = header_end;
+    let mut source_events = 0_u64;
+    let mut last_seq = None;
+    let mut last_completed = None;
+    let mut last_completed_active = false;
+    let mut anchored = None;
+    let mut anchored_active = false;
+
+    while offset < cursor.durable_offset {
+        let (line, next) = read_bounded_line_at(
+            source,
+            offset,
+            cursor.durable_offset,
+            super::jsonl::MAX_JOURNAL_EVENT_LINE_BYTES,
+            cancellation,
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&line)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        let fields = value
+            .as_object()
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        let seq = fields
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        if seq != source_events {
+            return Err(JournalForkError::Writer(JournalError::Poisoned));
+        }
+        let event_type = fields
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        let ends_with_end_seed = event_type == "session/end-seed";
+        let current = ForkCut {
+            seed_end: next,
+            seed_events: seq
+                .checked_add(1)
+                .ok_or(JournalForkError::Writer(JournalError::Poisoned))?,
+            ends_with_end_seed,
+        };
+
+        if event_type == "turn/start" {
+            last_completed_active = false;
+            anchored_active = false;
+        } else {
+            if last_completed_active {
+                last_completed = Some(current);
+            }
+            if anchored_active {
+                anchored = Some(current);
+            }
+        }
+        if event_type == "turn/end" {
+            last_completed = Some(current);
+            last_completed_active = true;
+            if anchored.is_none() && anchor.is_some_and(|anchor| seq >= anchor) {
+                anchored = Some(current);
+                anchored_active = true;
+            }
+        }
+
+        source_events = source_events
+            .checked_add(1)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        last_seq = Some(seq);
+        offset = next;
+    }
+    if offset != cursor.durable_offset {
+        return Err(JournalForkError::Writer(JournalError::Poisoned));
+    }
+    let selected = match anchor {
+        Some(_) if anchored.is_some() => anchored,
+        Some(anchor) if last_seq.is_none_or(|last| anchor > last) => last_completed,
+        Some(_) => None,
+        None => last_completed,
+    }
+    .ok_or(JournalForkError::Unavailable)?;
+    Ok(JournalForkBoundary {
+        header_end,
+        seed_end: selected.seed_end,
+        seed_events: selected.seed_events,
+        seed_ends_with_end_seed: selected.ends_with_end_seed,
+        source_events,
+        source_durable_offset: cursor.durable_offset,
+    })
+}
+
+fn read_bounded_line_at(
+    source: &File,
+    start: u64,
+    durable_end: u64,
+    maximum: usize,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<u8>, u64), JournalForkError> {
+    if start >= durable_end || maximum == 0 {
+        return Err(JournalForkError::Writer(JournalError::Poisoned));
+    }
+    let mut line = Vec::new();
+    line.try_reserve(EXPORT_CHUNK_BYTES.min(maximum))
+        .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+    let mut buffer = [0_u8; EXPORT_CHUNK_BYTES];
+    let mut offset = start;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(JournalForkError::Cancelled);
+        }
+        let remaining = durable_end
+            .checked_sub(offset)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        if remaining == 0 || line.len() >= maximum {
+            return Err(JournalForkError::Writer(JournalError::Poisoned));
+        }
+        let available = maximum - line.len();
+        let length = usize::try_from(
+            remaining
+                .min(EXPORT_CHUNK_BYTES as u64)
+                .min(u64::try_from(available).unwrap_or(u64::MAX)),
+        )
+        .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        source
+            .read_exact_at(&mut buffer[..length], offset)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        if let Some(relative) = buffer[..length].iter().position(|byte| *byte == b'\n') {
+            let consumed = relative + 1;
+            line.try_reserve_exact(consumed)
+                .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+            line.extend_from_slice(&buffer[..consumed]);
+            let next = offset
+                .checked_add(
+                    u64::try_from(consumed)
+                        .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?,
+                )
+                .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+            return Ok((line, next));
+        }
+        line.try_reserve_exact(length)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        line.extend_from_slice(&buffer[..length]);
+        offset = offset
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?,
+            )
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+    }
+}
+
+fn copy_fork(
+    source: &File,
+    cursor: JournalCursor,
+    boundary: JournalForkBoundary,
+    destination: File,
+    header_line: &[u8],
+    suffix: &[u8],
+    cancellation: &CancellationToken,
+) -> Result<u64, JournalForkError> {
+    copy_fork_with_chunk_observer(
+        source,
+        cursor,
+        boundary,
+        destination,
+        header_line,
+        suffix,
+        cancellation,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_fork_with_chunk_observer(
+    source: &File,
+    cursor: JournalCursor,
+    boundary: JournalForkBoundary,
+    mut destination: File,
+    header_line: &[u8],
+    suffix: &[u8],
+    cancellation: &CancellationToken,
+    mut chunk_observer: impl FnMut(u64),
+) -> Result<u64, JournalForkError> {
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    if cursor.physical_offset != cursor.durable_offset
+        || cursor.durable_offset != boundary.source_durable_offset
+        || boundary.header_end > boundary.seed_end
+        || boundary.seed_end > cursor.durable_offset
+        || header_line.is_empty()
+        || header_line.last() != Some(&b'\n')
+        || (!suffix.is_empty() && suffix.last() != Some(&b'\n'))
+    {
+        return Err(JournalForkError::Changed);
+    }
+    destination
+        .write_all(header_line)
+        .map_err(|_| JournalForkError::Destination)?;
+    let mut buffer = [0_u8; EXPORT_CHUNK_BYTES];
+    let mut offset = boundary.header_end;
+    while offset < boundary.seed_end {
+        if cancellation.is_cancelled() {
+            return Err(JournalForkError::Cancelled);
+        }
+        let remaining = boundary.seed_end - offset;
+        let length = usize::try_from(remaining.min(EXPORT_CHUNK_BYTES as u64))
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        source
+            .read_exact_at(&mut buffer[..length], offset)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        destination
+            .write_all(&buffer[..length])
+            .map_err(|_| JournalForkError::Destination)?;
+        offset = offset
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?,
+            )
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        chunk_observer(offset);
+    }
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    destination
+        .write_all(suffix)
+        .map_err(|_| JournalForkError::Destination)?;
+    destination
+        .sync_all()
+        .map_err(|_| JournalForkError::Destination)?;
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    u64::try_from(header_line.len())
+        .ok()
+        .and_then(|header| header.checked_add(boundary.seed_end - boundary.header_end))
+        .and_then(|bytes| {
+            u64::try_from(suffix.len())
+                .ok()
+                .and_then(|suffix| bytes.checked_add(suffix))
+        })
+        .ok_or(JournalForkError::Destination)
+}
+
+/// Commit a pre-encoded recovery suffix before this same thread becomes the
+/// ordinary journal writer.
+///
+/// Recovery first makes the selected valid prefix durable, then appends the
+/// complete prevalidated suffix and synchronizes it. No serialization,
+/// timestamps, IDs, or capacity decisions remain after truncation starts.
+pub(super) fn commit_recovery_suffix(
+    file: &mut File,
+    valid_offset: u64,
+    suffix: &[u8],
+) -> Result<JournalCursor, JournalError> {
+    let suffix_bytes = u64::try_from(suffix.len()).map_err(|_| JournalError::Poisoned)?;
+    let final_offset = valid_offset
+        .checked_add(suffix_bytes)
+        .ok_or(JournalError::Poisoned)?;
+    file.set_len(valid_offset)
+        .map_err(|_| JournalError::Poisoned)?;
+    file.seek(SeekFrom::Start(valid_offset))
+        .map_err(|_| JournalError::Poisoned)?;
+    sync_durable(file).map_err(|_| JournalError::Poisoned)?;
+    if file.write_all(suffix).is_err() {
+        let _ = file.set_len(valid_offset);
+        let _ = file.seek(SeekFrom::Start(valid_offset));
+        let _ = sync_durable(file);
+        return Err(JournalError::Poisoned);
+    }
+    if sync_durable(file).is_err() {
+        return Err(JournalError::Poisoned);
+    }
+    Ok(JournalCursor {
+        physical_offset: final_offset,
+        durable_offset: final_offset,
+    })
+}
+
+fn append_bytes(
+    file: &mut File,
+    cursor: &mut JournalCursor,
+    bytes: &[u8],
+) -> Result<JournalCursor, JournalError> {
+    let byte_count = u64::try_from(bytes.len()).map_err(|_| JournalError::Poisoned)?;
+    let next_physical_offset = cursor
+        .physical_offset
+        .checked_add(byte_count)
+        .ok_or(JournalError::Poisoned)?;
+    file.seek(SeekFrom::Start(cursor.physical_offset))
+        .map_err(|_| poison_and_rollback(file, cursor))?;
+    if file.write_all(bytes).is_err() {
+        return Err(poison_and_rollback(file, cursor));
+    }
+    cursor.physical_offset = next_physical_offset;
+    Ok(*cursor)
+}
+
+fn barrier_file(
+    file: &mut File,
+    cursor: &mut JournalCursor,
+) -> Result<JournalCursor, JournalError> {
+    if sync_durable(file).is_err() {
+        return Err(poison_and_rollback(file, cursor));
+    }
+    cursor.durable_offset = cursor.physical_offset;
+    Ok(*cursor)
+}
+
+fn poison_and_rollback(file: &mut File, cursor: &mut JournalCursor) -> JournalError {
+    let rollback = file
+        .set_len(cursor.durable_offset)
+        .and_then(|()| file.seek(SeekFrom::Start(cursor.durable_offset)).map(drop))
+        .and_then(|()| sync_durable(file));
+    cursor.physical_offset = cursor.durable_offset;
+    let _ = rollback;
+    JournalError::Poisoned
+}
+
+#[cfg(target_os = "macos")]
+fn sync_durable(file: &File) -> std::io::Result<()> {
+    rustix::fs::fcntl_fullfsync(file).map_err(std::io::Error::from)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_durable(file: &File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::OpenOptions,
+        future::{Future as _, poll_fn},
+        io::{Read, Write},
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        task::Poll,
+        thread,
+        time::Duration,
+    };
+
+    use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
+
+    use crate::model::{
+        ContentBlock, ContentBlockType, FinishReason, FiniteNumber, LlmCallConfig, LlmFailure,
+        Message, MessageSource, NonNegativeSafeInteger, StreamChunk, StreamChunkKind, TokenUsage,
+    };
+    use crate::resident_credit::{
+        ChargedBytes, ResidentCreditLease, arc_inner_charge, string_backing_charge,
+        vec_backing_charge,
+    };
+    use crate::session::projection::{Projection, ValidationPolicy};
+    use crate::session::{
+        AppendError, AttemptDisposition, BarrierError, ClaimedAppend, Clock, ClockError,
+        EpochHeader, EventClaim, EventKind, EventSeq, EventValidationError, LlmRetryEvent,
+        LlmRetryStartedEvent, NewEvent, PreparedAttempt, PrunePairAppendError, RequestHeaderReason,
+        RetryId, RetryNumber, Session, SessionMode, SessionReservation, SessionStorage, StepId,
+        SurfaceIntent, SystemClock, TodoItem, TodoStatus, ToolResultPruneConfig, TransitionError,
+        TurnEndReason, TurnId, UnixMillis, journal_row::JournalRowLocator,
+    };
+
+    use super::{
+        COMMAND_CAPACITY, Command, EXPORT_CHUNK_BYTES, FlightKind, ForkFlightResult, JournalCursor,
+        JournalError, JournalExportError, JournalForkBoundary, JournalForkError, JournalReadError,
+        JournalWriter, ReadCommandError, append_bytes, barrier_file, copy_fork,
+        copy_fork_with_chunk_observer, export_raw, export_raw_with_chunk_observer, inspect_fork,
+        read_row, read_row_with_chunk_observer, valid_prune_prefix,
+    };
+
+    #[tokio::test]
+    async fn append_advances_physical_and_barrier_advances_durable() {
+        let (path, file) = test_file("journal-cursors");
+        let mut writer = JournalWriter::start(file, 0).unwrap();
+        writer.stage_bytes_for_test(b"one\n".to_vec()).unwrap();
+        let written = writer.flush_staged().await.unwrap();
+        assert_eq!((written.physical_offset, written.durable_offset), (4, 0));
+        let durable = writer.barrier().await.unwrap();
+        assert_eq!((durable.physical_offset, durable.durable_offset), (4, 4));
+        writer.finish().await.unwrap();
+
+        let mut bytes = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"one\n");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_row_reads_do_not_move_the_append_cursor() {
+        let (path, file) = test_file("journal-read-cursor");
+        let mut writer = JournalWriter::start(file, 0).unwrap();
+        let row = b"{\"type\":\"session/end-seed\"}\n".to_vec();
+        let locator = JournalRowLocator::new(EventSeq::new(0).unwrap(), 0, &row).unwrap();
+        writer.stage_bytes_for_test(row.clone()).unwrap();
+        assert_eq!(writer.flush_staged().await.unwrap().durable_offset, 0);
+        assert_eq!(
+            writer
+                .read_durable_row(locator, CancellationToken::new())
+                .await
+                .unwrap(),
+            row
+        );
+        writer.stage_bytes_for_test(b"next\n".to_vec()).unwrap();
+        let cursor = writer.flush_staged().await.unwrap();
+        assert_eq!(cursor.physical_offset, locator.end().unwrap() + 5);
+        writer.finish().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_export_is_exact_and_does_not_move_the_append_cursor() {
+        let (source_path, mut source) = test_file("journal-export-source");
+        let initial = b"header\nfirst\n";
+        source.write_all(initial).unwrap();
+        source.sync_all().unwrap();
+        let mut writer = JournalWriter::start(source, initial.len() as u64).unwrap();
+        let (destination_path, destination) = test_file("journal-export-destination");
+
+        assert_eq!(
+            writer
+                .export_raw_to(destination, CancellationToken::new())
+                .await
+                .unwrap(),
+            initial.len() as u64
+        );
+        writer.stage_bytes_for_test(b"later\n".to_vec()).unwrap();
+        writer.flush_staged().await.unwrap();
+        writer.barrier().await.unwrap();
+        writer.finish().await.unwrap();
+
+        assert_eq!(std::fs::read(&destination_path).unwrap(), initial);
+        assert_eq!(
+            std::fs::read(&source_path).unwrap(),
+            [initial.as_slice(), b"later\n"].concat()
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn destination_failure_does_not_poison_the_journal() {
+        let (source_path, mut source) = test_file("journal-export-destination-source");
+        source.write_all(b"header\n").unwrap();
+        source.sync_all().unwrap();
+        let mut writer = JournalWriter::start(source, 7).unwrap();
+        let (destination_path, destination) = test_file("journal-export-read-only");
+        drop(destination);
+        let destination = std::fs::File::open(&destination_path).unwrap();
+
+        assert_eq!(
+            writer
+                .export_raw_to(destination, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            JournalExportError::Destination
+        );
+        writer
+            .stage_bytes_for_test(b"still-usable\n".to_vec())
+            .unwrap();
+        writer.flush_staged().await.unwrap();
+        writer.finish().await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&source_path).unwrap(),
+            b"header\nstill-usable\n"
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[test]
+    fn raw_export_observes_cancellation_between_bounded_chunks() {
+        let (source_path, mut source) = test_file("journal-export-cancel-source");
+        let bytes = vec![b'x'; EXPORT_CHUNK_BYTES * 2 + 1];
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let (destination_path, destination) = test_file("journal-export-cancel-destination");
+        let cancellation = CancellationToken::new();
+        let observer_cancellation = cancellation.clone();
+
+        let error = export_raw_with_chunk_observer(
+            &source,
+            JournalCursor {
+                physical_offset: bytes.len() as u64,
+                durable_offset: bytes.len() as u64,
+            },
+            destination,
+            &cancellation,
+            move |offset| {
+                if offset == EXPORT_CHUNK_BYTES as u64 {
+                    observer_cancellation.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, JournalExportError::Cancelled);
+        assert_eq!(
+            std::fs::metadata(&destination_path).unwrap().len(),
+            EXPORT_CHUNK_BYTES as u64
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[test]
+    fn fork_inspection_uses_completed_turn_anchors_and_trailing_facts() {
+        let (source_path, mut source) = test_file("journal-fork-inspect");
+        let bytes = fork_test_journal(true);
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let cursor = JournalCursor {
+            physical_offset: bytes.len() as u64,
+            durable_offset: bytes.len() as u64,
+        };
+
+        let anchored = inspect_fork(&source, cursor, Some(1), &CancellationToken::new()).unwrap();
+        assert_eq!(anchored.seed_events(), 4);
+        assert_eq!(anchored.source_events(), 7);
+        assert!(!anchored.seed_ends_with_end_seed());
+        assert_eq!(
+            inspect_fork(&source, cursor, None, &CancellationToken::new())
+                .unwrap()
+                .seed_events(),
+            7
+        );
+        assert_eq!(
+            inspect_fork(&source, cursor, Some(999), &CancellationToken::new())
+                .unwrap()
+                .seed_events(),
+            7
+        );
+
+        std::fs::remove_file(source_path).unwrap();
+    }
+
+    #[test]
+    fn fork_copy_preserves_selected_event_rows_and_rejects_open_anchor() {
+        let (source_path, mut source) = test_file("journal-fork-copy-source");
+        let bytes = fork_test_journal(false);
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let cursor = JournalCursor {
+            physical_offset: bytes.len() as u64,
+            durable_offset: bytes.len() as u64,
+        };
+        assert_eq!(
+            inspect_fork(&source, cursor, Some(4), &CancellationToken::new()).unwrap_err(),
+            super::JournalForkError::Unavailable
+        );
+        let boundary = inspect_fork(&source, cursor, Some(1), &CancellationToken::new()).unwrap();
+        let (destination_path, destination) = test_file("journal-fork-copy-destination");
+        let child_header = b"child-header\n";
+        let suffix = b"end-seed\n";
+        let written = copy_fork(
+            &source,
+            cursor,
+            boundary,
+            destination,
+            child_header,
+            suffix,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let source_header_end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let selected_rows = bytes[source_header_end..]
+            .split_inclusive(|byte| *byte == b'\n')
+            .take(4)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let expected = [
+            child_header.as_slice(),
+            selected_rows.as_slice(),
+            suffix.as_slice(),
+        ]
+        .concat();
+        assert_eq!(std::fs::read(&destination_path).unwrap(), expected);
+        assert_eq!(written, expected.len() as u64);
+
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[test]
+    fn fork_copy_observes_cancellation_between_bounded_chunks() {
+        let (source_path, mut source) = test_file("journal-fork-cancel-source");
+        let bytes = vec![b'x'; EXPORT_CHUNK_BYTES * 2 + 1];
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let cursor = JournalCursor {
+            physical_offset: bytes.len() as u64,
+            durable_offset: bytes.len() as u64,
+        };
+        let boundary = JournalForkBoundary {
+            header_end: 0,
+            seed_end: bytes.len() as u64,
+            seed_events: 1,
+            seed_ends_with_end_seed: false,
+            source_events: 1,
+            source_durable_offset: bytes.len() as u64,
+        };
+        let (destination_path, destination) = test_file("journal-fork-cancel-destination");
+        let cancellation = CancellationToken::new();
+        let control = cancellation.clone();
+        let error = copy_fork_with_chunk_observer(
+            &source,
+            cursor,
+            boundary,
+            destination,
+            b"child\n",
+            b"suffix\n",
+            &cancellation,
+            move |offset| {
+                if offset == EXPORT_CHUNK_BYTES as u64 {
+                    control.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, JournalForkError::Cancelled);
+        assert_eq!(
+            std::fs::metadata(&destination_path).unwrap().len(),
+            (b"child\n".len() + EXPORT_CHUNK_BYTES) as u64
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    fn fork_test_journal(close_second_turn: bool) -> Vec<u8> {
+        let mut rows = vec![
+            "{\"type\":\"session\",\"version\":0,\"id\":\"session-550e8400-e29b-41d4-a716-446655440000\",\"createdAt\":1}",
+            "{\"type\":\"turn/start\",\"seq\":0,\"time\":1,\"data\":{}}",
+            "{\"type\":\"user/message\",\"seq\":1,\"time\":2,\"data\":{}}",
+            "{\"type\":\"turn/end\",\"seq\":2,\"time\":3,\"data\":{}}",
+            "{\"type\":\"session/title\",\"seq\":3,\"time\":4,\"data\":{}}",
+            "{\"type\":\"turn/start\",\"seq\":4,\"time\":5,\"data\":{}}",
+            "{\"type\":\"user/message\",\"seq\":5,\"time\":6,\"data\":{}}",
+        ];
+        if close_second_turn {
+            rows.push("{\"type\":\"turn/end\",\"seq\":6,\"time\":7,\"data\":{}}");
+        }
+        format!("{}\n", rows.join("\n")).into_bytes()
+    }
+
+    #[test]
+    fn durable_row_read_checks_cancellation_at_each_64_kib_boundary() {
+        fn run(
+            label: &str,
+            length: usize,
+            cancel_at: Option<usize>,
+        ) -> (Result<Vec<u8>, ReadCommandError>, Vec<usize>) {
+            let (path, mut file) = test_file(label);
+            let mut row = vec![b'x'; length - 1];
+            row.push(b'\n');
+            file.write_all(&row).unwrap();
+            file.sync_all().unwrap();
+            let locator = JournalRowLocator::new(EventSeq::new(0).unwrap(), 0, &row).unwrap();
+            let cancellation = CancellationToken::new();
+            let control = cancellation.clone();
+            let mut boundaries = Vec::new();
+            let result = read_row_with_chunk_observer(
+                &file,
+                JournalCursor {
+                    physical_offset: row.len() as u64,
+                    durable_offset: row.len() as u64,
+                },
+                locator,
+                &cancellation,
+                |offset| {
+                    boundaries.push(offset);
+                    if cancel_at == Some(offset) {
+                        control.cancel();
+                    }
+                },
+            );
+            std::fs::remove_file(path).unwrap();
+            (result, boundaries)
+        }
+
+        let (exact, exact_boundaries) = run("journal-read-chunk-exact", 64 * 1024, None);
+        assert!(exact.is_ok());
+        assert_eq!(exact_boundaries, vec![64 * 1024]);
+
+        let (one_over, one_over_boundaries) =
+            run("journal-read-chunk-one-over", 64 * 1024 + 1, None);
+        assert!(one_over.is_ok());
+        assert_eq!(one_over_boundaries, vec![64 * 1024, 64 * 1024 + 1]);
+
+        let (mid_read, mid_boundaries) =
+            run("journal-read-chunk-cancel", 64 * 1024 + 2, Some(64 * 1024));
+        assert_eq!(mid_read, Err(ReadCommandError::Cancelled));
+        assert_eq!(mid_boundaries, vec![64 * 1024]);
+
+        let (at_end, end_boundaries) = run(
+            "journal-read-complete-cancel",
+            64 * 1024 + 1,
+            Some(64 * 1024 + 1),
+        );
+        assert_eq!(at_end, Err(ReadCommandError::Cancelled));
+        assert_eq!(end_boundaries, vec![64 * 1024, 64 * 1024 + 1]);
+    }
+
+    #[test]
+    fn prune_prefix_shape_and_byte_limits_are_exact() {
+        assert!(valid_prune_prefix(b"a\n", 1));
+        assert!(valid_prune_prefix(b"a\nb\n", 2));
+        assert!(!valid_prune_prefix(b"", 1));
+        assert!(!valid_prune_prefix(b"a\n", 0));
+        assert!(!valid_prune_prefix(b"a\n", 3));
+        assert!(!valid_prune_prefix(b"a", 1));
+        assert!(!valid_prune_prefix(b"\n", 1));
+        assert!(!valid_prune_prefix(b"a\n\n", 2));
+        assert!(!valid_prune_prefix(b"a\nb\nc\n", 2));
+
+        let mut exact_row = vec![b'x'; super::super::jsonl::MAX_JOURNAL_EVENT_LINE_BYTES - 1];
+        exact_row.push(b'\n');
+        assert!(valid_prune_prefix(&exact_row, 1));
+        exact_row.insert(exact_row.len() - 1, b'x');
+        assert!(!valid_prune_prefix(&exact_row, 1));
+
+        let half = super::MAX_PRUNE_PREFIX_BYTES / 2;
+        let mut exact_pair = vec![b'x'; half - 1];
+        exact_pair.push(b'\n');
+        exact_pair.extend(std::iter::repeat_n(b'y', half - 1));
+        exact_pair.push(b'\n');
+        assert_eq!(exact_pair.len(), super::MAX_PRUNE_PREFIX_BYTES);
+        assert!(valid_prune_prefix(&exact_pair, 2));
+        exact_pair.insert(exact_pair.len() - 1, b'y');
+        assert!(!valid_prune_prefix(&exact_pair, 2));
+    }
+
+    #[tokio::test]
+    async fn invalid_prune_prefix_stays_poisoned_through_finish() {
+        let (path, file) = test_file("journal-invalid-prune-prefix");
+        let mut writer = JournalWriter::start(file, 0).unwrap();
+        assert_eq!(
+            writer.stage_prune_prefix_bytes_for_test(b"\n".to_vec(), 1),
+            Err(JournalError::Poisoned)
+        );
+        assert_eq!(
+            writer.stage_bytes_for_test(b"later\n".to_vec()),
+            Err(JournalError::Poisoned)
+        );
+        assert_eq!(writer.barrier().await, Err(JournalError::Poisoned));
+        assert_eq!(writer.finish().await, Err(JournalError::Poisoned));
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_prune_pair_is_one_adjacent_owned_writer_command() {
+        let (path, file) = test_file("session-prune-pair");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::PrunePrefix);
+        let (mut session, result_seq) =
+            prunable_session("session-prune-pair", SystemClock, writer).await;
+
+        let mut reservation = session.reservation();
+        let raw = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = raw
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        let receipt = reservation.append_prune_pair(replacement).unwrap();
+        assert_eq!(
+            receipt.marker().seq().get() + 1,
+            receipt.replacement().seq().get()
+        );
+        assert_eq!(receipt.outcome().original_code_points, 51);
+        assert_eq!(receipt.outcome().pruned_code_points, 46);
+
+        {
+            let mut barrier = Box::pin(reservation.flush_barrier());
+            poll_fn(|context| match barrier.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("prune prefix unexpectedly settled: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::PrunePrefix
+        );
+        release.send(()).unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        assert_eq!(counts.prune_prefix.load(Ordering::SeqCst), 1);
+        let events = std::fs::read(&path).unwrap();
+        let rows = events
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .collect::<Vec<_>>();
+        let marker_index = usize::try_from(receipt.marker().seq().get()).unwrap();
+        let replacement_index = usize::try_from(receipt.replacement().seq().get()).unwrap();
+        assert_eq!(rows[marker_index]["type"], "compaction/prune");
+        assert_eq!(rows[replacement_index]["type"], "tool/result");
+        assert_eq!(
+            rows[replacement_index]["sourceEventSeqs"],
+            serde_json::json!([result_seq.get()])
+        );
+        assert_eq!(
+            rows[replacement_index]["surfaceOp"],
+            serde_json::json!({
+                "op":"replace",
+                "start":result_seq.get(),
+                "end":result_seq.get()
+            })
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_overflow_prune_atomically_closes_the_failed_attempt() {
+        let (path, file) = test_file("session-overflow-prune-pair");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, result_seq) =
+            prunable_session("session-overflow-prune-pair", SystemClock, writer).await;
+        let turn = TurnId::new(1).unwrap();
+        let first_step = StepId::new(1).unwrap();
+        let overflow_step = StepId::new(2).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, overflow_step)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let failed = reservation.begin_attempt(turn, overflow_step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &failed,
+                StreamChunk::finish(
+                    FinishReason::error(
+                        LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _sealed = reservation.seal_attempt(&failed).unwrap();
+        let row = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = row
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        let before = reservation.session().next_seq();
+        assert!(reservation.append_prune_pair(replacement).is_err());
+        assert_eq!(reservation.session().next_seq(), before);
+        let row = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = row
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        let receipt = reservation
+            .append_prune_pair_with_attempt(replacement, Some(&failed))
+            .unwrap();
+        assert_eq!(
+            receipt.marker().seq().get() + 1,
+            receipt.replacement().seq().get()
+        );
+        assert!(reservation.retire_attempt(&failed).is_err());
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&failed).unwrap();
+
+        let replay = reservation.begin_attempt(turn, overflow_step).unwrap();
+        reservation
+            .append_attempt_closure_settled(
+                &replay,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, overflow_step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&replay).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_overflow_marker_only_cannot_replay_without_surface_progress() {
+        let (path, file) = test_file("session-overflow-marker-only");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, result_seq) =
+            prunable_session("session-overflow-marker-only", clock.clone(), writer).await;
+        let turn = TurnId::new(1).unwrap();
+        let first_step = StepId::new(1).unwrap();
+        let overflow_step = StepId::new(2).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, overflow_step)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let failed = reservation.begin_attempt(turn, overflow_step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &failed,
+                StreamChunk::finish(
+                    FinishReason::error(
+                        LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.seal_attempt(&failed).unwrap();
+        let row = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = row
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        clock.fail_after(1);
+        assert!(matches!(
+            reservation.append_prune_pair_with_attempt(replacement, Some(&failed)),
+            Err(PrunePairAppendError::MarkerCommitted {
+                source: AppendError::Clock(_),
+                ..
+            })
+        ));
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&failed).unwrap();
+        assert!(reservation.begin_attempt(turn, overflow_step).is_err());
+
+        reservation
+            .append_settled(NewEvent::surface(
+                EventKind::user_message(
+                    Message::user(
+                        "unrelated-after-overflow",
+                        vec![ContentBlock::text("this is not compaction progress").unwrap()],
+                        MessageSource::user().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append(),
+            ))
+            .await
+            .unwrap();
+        assert!(reservation.begin_attempt(turn, overflow_step).is_err());
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, overflow_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_anchor_matches_hot_and_cold_token_measurement() {
+        let (path, file) = test_file("attempt-token-anchor");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let mut session =
+            Session::new_active_for_test("attempt-token-anchor", SystemClock, writer).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let first_step = StepId::new(1).unwrap();
+        let second_step = StepId::new(2).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::surface(
+                EventKind::user_message(
+                    Message::user(
+                        "old-user",
+                        vec![ContentBlock::text("abcd").unwrap()],
+                        MessageSource::user().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append(),
+            ))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::surface(
+                EventKind::user_message(
+                    Message::user(
+                        "current-user",
+                        vec![ContentBlock::text("abcdefgh").unwrap()],
+                        MessageSource::user().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append(),
+            ))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: Some("abcd".to_owned()),
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let usage = TokenUsage::from_parts(
+            NonNegativeSafeInteger::new(20).unwrap(),
+            NonNegativeSafeInteger::new(7).unwrap(),
+            Some(NonNegativeSafeInteger::new(3).unwrap()),
+            Some(NonNegativeSafeInteger::new(4).unwrap()),
+            Some(NonNegativeSafeInteger::new(6).unwrap()),
+        )
+        .unwrap();
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, second_step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, ContentBlock::text("abcd").unwrap()).unwrap(),
+            StreamChunk::usage(usage).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        let assistant =
+            finish_only_assistant(turn, second_step, reservation.seal_attempt(&token).unwrap());
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, assistant)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, second_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(reservation.session().context_total_tokens().unwrap(), 44);
+        assert!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test()
+                > 0
+        );
+        let hot_messages = reservation.session().messages();
+        assert!(
+            hot_messages
+                .last()
+                .is_some_and(|message| message.charged_surface_bytes().is_some())
+        );
+        assert!(reservation.session().surface_resident_bytes_for_test() > 0);
+        drop(hot_messages);
+        drop(reservation);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let mut cold =
+            Projection::for_session(ValidationPolicy::DurableStrict, session.id().clone());
+        for (index, row) in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .enumerate()
+        {
+            let value = serde_json::from_slice(row).unwrap();
+            let event = crate::session::codec::decode_event(value, index).unwrap();
+            cold.apply_scanned_event(&event).unwrap();
+        }
+        assert_eq!(cold.context_total_tokens().unwrap(), 44);
+        assert_eq!(cold.token_anchor_resident_bytes_for_test(), 0);
+        assert_eq!(cold.surface_resident_bytes(), 0);
+        assert!(
+            cold.messages()
+                .last()
+                .is_some_and(|message| message.charged_surface_bytes().is_none())
+        );
+
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn marker_only_failure_keeps_closure_claims_usable() {
+        let (path, file) = test_file("session-prune-marker-only");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, result_seq) =
+            prunable_session("session-prune-marker-only", clock.clone(), writer).await;
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut reservation = session.reservation();
+        let mut closure = reservation
+            .claim_batch([
+                NewEvent::log(EventKind::step_end(turn, step)),
+                NewEvent::log(EventKind::turn_end(turn, TurnEndReason::Completed)),
+            ])
+            .unwrap();
+        let raw = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = raw
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        clock.fail_after(1);
+        let marker_seq = match reservation.append_prune_pair(replacement).unwrap_err() {
+            PrunePairAppendError::MarkerCommitted {
+                marker,
+                source: AppendError::Clock(_),
+            } => marker.seq(),
+            error => panic!("unexpected prune failure: {error:?}"),
+        };
+        assert_eq!(
+            reservation.session().state().surface_nodes().last(),
+            Some(&result_seq)
+        );
+
+        reservation
+            .settle_exact_settled(&mut closure[0])
+            .await
+            .unwrap();
+        reservation
+            .settle_exact_settled(&mut closure[1])
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        let events = std::fs::read(&path).unwrap();
+        let rows = events
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows[usize::try_from(marker_seq.get()).unwrap()]["type"],
+            "compaction/prune"
+        );
+        assert_eq!(rows.last().unwrap()["type"], "turn/end");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["type"] == "tool/result")
+                .count(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_prune_pass_handles_multiple_results_in_surface_order_and_is_idempotent() {
+        let (path, file) = test_file("session-prune-pass");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, result_seqs) = prunable_session_with_text_lengths(
+            "session-prune-pass",
+            SystemClock,
+            writer,
+            &[8_193, 8_194],
+        )
+        .await;
+
+        let mut reservation = session.reservation();
+        let report = reservation
+            .prune_oversized_tool_results(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(report.replacements(), 2);
+        assert_eq!(report.original_code_points(), 16_387);
+        assert_eq!(report.pruned_code_points(), 10_318);
+        assert_eq!(
+            reservation
+                .prune_oversized_tool_results(&CancellationToken::new())
+                .await
+                .unwrap()
+                .replacements(),
+            0
+        );
+        let state = reservation.session().state();
+        let surface = state.surface_nodes();
+        assert!(!surface.contains(&result_seqs[0]));
+        assert!(!surface.contains(&result_seqs[1]));
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        let rows = std::fs::read(&path)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .collect::<Vec<_>>();
+        let pairs = rows
+            .windows(2)
+            .filter(|pair| {
+                pair[0]["type"] == "compaction/prune" && pair[1]["type"] == "tool/result"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs[0][1]["sourceEventSeqs"],
+            serde_json::json!([result_seqs[0].get()])
+        );
+        assert_eq!(
+            pairs[1][1]["sourceEventSeqs"],
+            serde_json::json!([result_seqs[1].get()])
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_prune_pairs_stops_new_work_and_a_later_pass_converges() {
+        let (path, file) = test_file("session-prune-pass-cancel");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::PrunePrefix);
+        let (mut session, result_seqs) = prunable_session_with_text_lengths(
+            "session-prune-pass-cancel",
+            SystemClock,
+            writer,
+            &[8_193, 8_194],
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let mut reservation = session.reservation();
+        let mut pass = Box::pin(reservation.prune_oversized_tool_results(&cancellation));
+        let arrived = tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(Duration::from_secs(10)).unwrap()
+        });
+        tokio::select! {
+            kind = arrived => assert_eq!(kind.unwrap(), FlightKind::PrunePrefix),
+            result = &mut pass => panic!("prune pass completed before its first pair was gated: {result:?}"),
+        }
+        cancellation.cancel();
+        release.send(()).unwrap();
+        let error = pass.as_mut().await.unwrap_err();
+        assert_eq!(
+            error.cause(),
+            &crate::session::ToolResultPrunePassCause::Cancelled
+        );
+        assert_eq!(error.progress().replacements(), 1);
+        drop(pass);
+        let state = reservation.session().state();
+        let surface = state.surface_nodes();
+        assert!(!surface.contains(&result_seqs[0]));
+        assert!(surface.contains(&result_seqs[1]));
+        assert_eq!(counts.prune_prefix.load(Ordering::SeqCst), 1);
+
+        let retry = reservation
+            .prune_oversized_tool_results(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(retry.replacements(), 1);
+        assert_eq!(counts.prune_prefix.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            reservation
+                .prune_oversized_tool_results(&CancellationToken::new())
+                .await
+                .unwrap()
+                .replacements(),
+            0
+        );
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_row_read_settles_the_same_physical_command_once() {
+        let (path, mut file) = test_file("journal-read-cancel-safe");
+        let row = b"{\"type\":\"session/end-seed\"}\n".to_vec();
+        file.write_all(&row).unwrap();
+        file.sync_all().unwrap();
+        let offset = row.len() as u64;
+        let locator = JournalRowLocator::new(EventSeq::new(0).unwrap(), 0, &row).unwrap();
+        let (sender, mut receiver) = tokio_mpsc::channel(COMMAND_CAPACITY);
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let worker_reads = Arc::clone(&reads);
+        let join = thread::spawn(move || {
+            let mut cursor = JournalCursor {
+                physical_offset: offset,
+                durable_offset: offset,
+            };
+            while let Some(command) = receiver.blocking_recv() {
+                match command {
+                    Command::ReadRow {
+                        locator,
+                        cancellation,
+                        ack,
+                    } => {
+                        worker_reads.fetch_add(1, Ordering::SeqCst);
+                        arrived_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        let _ = ack.send(read_row(&file, cursor, locator, &cancellation));
+                    }
+                    Command::Finish { ack } => {
+                        let result = barrier_file(&mut file, &mut cursor);
+                        drop(file);
+                        let _ = ack.send(result);
+                        return;
+                    }
+                    Command::Append { bytes, ack } => {
+                        let _ = ack.send(append_bytes(&mut file, &mut cursor, &bytes));
+                    }
+                    Command::AppendPrunePrefix { bytes, rows, ack } => {
+                        let result = if valid_prune_prefix(&bytes, rows) {
+                            append_bytes(&mut file, &mut cursor, &bytes)
+                        } else {
+                            Err(JournalError::Poisoned)
+                        };
+                        let _ = ack.send(result);
+                    }
+                    Command::Barrier { ack } => {
+                        let _ = ack.send(barrier_file(&mut file, &mut cursor));
+                    }
+                    Command::ExportRaw {
+                        destination,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
+                    }
+                    Command::InspectFork {
+                        anchor,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            inspect_fork(&file, cursor, anchor, &cancellation)
+                                .map(ForkFlightResult::Boundary),
+                        );
+                    }
+                    Command::CopyFork {
+                        boundary,
+                        destination,
+                        header_line,
+                        suffix,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            copy_fork(
+                                &file,
+                                cursor,
+                                boundary,
+                                destination,
+                                &header_line,
+                                &suffix,
+                                &cancellation,
+                            )
+                            .map(ForkFlightResult::Copied),
+                        );
+                    }
+                }
+            }
+        });
+        let mut writer = JournalWriter::from_running(
+            sender,
+            join,
+            JournalCursor {
+                physical_offset: offset,
+                durable_offset: offset,
+            },
+        );
+        {
+            let mut read = Box::pin(writer.read_durable_row(locator, CancellationToken::new()));
+            poll_fn(|context| match read.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("read unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        arrived_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            writer
+                .read_durable_row(locator, CancellationToken::new())
+                .await
+                .unwrap(),
+            row
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        writer.finish().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn finish_cancels_an_abandoned_row_read_and_joins_once() {
+        let (path, mut file) = test_file("journal-read-finish-cancel");
+        let row = b"{\"type\":\"session/end-seed\"}\n".to_vec();
+        file.write_all(&row).unwrap();
+        file.sync_all().unwrap();
+        let offset = row.len() as u64;
+        let locator = JournalRowLocator::new(EventSeq::new(0).unwrap(), 0, &row).unwrap();
+        let (sender, mut receiver) = tokio_mpsc::channel(COMMAND_CAPACITY);
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let finishes = Arc::new(AtomicUsize::new(0));
+        let worker_reads = Arc::clone(&reads);
+        let worker_finishes = Arc::clone(&finishes);
+        let join = thread::spawn(move || {
+            let mut cursor = JournalCursor {
+                physical_offset: offset,
+                durable_offset: offset,
+            };
+            while let Some(command) = receiver.blocking_recv() {
+                match command {
+                    Command::ReadRow {
+                        locator,
+                        cancellation,
+                        ack,
+                    } => {
+                        worker_reads.fetch_add(1, Ordering::SeqCst);
+                        arrived_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        let _ = ack.send(read_row(&file, cursor, locator, &cancellation));
+                    }
+                    Command::Finish { ack } => {
+                        worker_finishes.fetch_add(1, Ordering::SeqCst);
+                        let result = barrier_file(&mut file, &mut cursor);
+                        drop(file);
+                        let _ = ack.send(result);
+                        return;
+                    }
+                    Command::Append { bytes, ack } => {
+                        let _ = ack.send(append_bytes(&mut file, &mut cursor, &bytes));
+                    }
+                    Command::AppendPrunePrefix { bytes, rows, ack } => {
+                        let result = if valid_prune_prefix(&bytes, rows) {
+                            append_bytes(&mut file, &mut cursor, &bytes)
+                        } else {
+                            Err(JournalError::Poisoned)
+                        };
+                        let _ = ack.send(result);
+                    }
+                    Command::Barrier { ack } => {
+                        let _ = ack.send(barrier_file(&mut file, &mut cursor));
+                    }
+                    Command::ExportRaw {
+                        destination,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
+                    }
+                    Command::InspectFork {
+                        anchor,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            inspect_fork(&file, cursor, anchor, &cancellation)
+                                .map(ForkFlightResult::Boundary),
+                        );
+                    }
+                    Command::CopyFork {
+                        boundary,
+                        destination,
+                        header_line,
+                        suffix,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            copy_fork(
+                                &file,
+                                cursor,
+                                boundary,
+                                destination,
+                                &header_line,
+                                &suffix,
+                                &cancellation,
+                            )
+                            .map(ForkFlightResult::Copied),
+                        );
+                    }
+                }
+            }
+        });
+        let mut writer = JournalWriter::from_running(
+            sender,
+            join,
+            JournalCursor {
+                physical_offset: offset,
+                durable_offset: offset,
+            },
+        );
+        {
+            let mut read = Box::pin(writer.read_durable_row(locator, CancellationToken::new()));
+            poll_fn(|context| match read.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("read unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        arrived_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut finish = Box::pin(writer.finish());
+        poll_fn(|context| match finish.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => panic!("finish unexpectedly completed: {result:?}"),
+        })
+        .await;
+        release_tx.send(()).unwrap();
+        finish.await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(finishes.load(Ordering::SeqCst), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pre_cancelled_row_read_starts_no_command_and_keeps_the_writer_usable() {
+        let (path, mut file) = test_file("journal-read-pre-cancel");
+        let row = b"{\"type\":\"session/end-seed\"}\n".to_vec();
+        file.write_all(&row).unwrap();
+        file.sync_all().unwrap();
+        let offset = row.len() as u64;
+        let locator = JournalRowLocator::new(EventSeq::new(0).unwrap(), 0, &row).unwrap();
+        let mut writer = JournalWriter::start(file, offset).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            writer.read_durable_row(locator, cancellation).await,
+            Err(JournalReadError::Cancelled)
+        );
+        assert!(writer.read_flight.is_none());
+        writer.stage_bytes_for_test(b"later\n".to_vec()).unwrap();
+        assert_eq!(writer.barrier().await.unwrap().durable_offset, offset + 6);
+        writer.finish().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_corruption_remains_sticky_after_the_first_barrier_reports_it() {
+        let (path, file) = test_file("session-read-corruption-sticky");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let mut session =
+            Session::new_active_for_test("session-read-corruption-sticky", SystemClock, writer)
+                .unwrap();
+        session.latch_durable_corruption();
+        assert_eq!(
+            session.flush_barrier().await,
+            Err(BarrierError::Append(AppendError::DurablePoisoned))
+        );
+        assert_eq!(
+            session
+                .append_settled(NewEvent::log(EventKind::turn_start(
+                    TurnId::new(1).unwrap(),
+                )))
+                .await,
+            Err(AppendError::DurablePoisoned)
+        );
+        assert!(session.shutdown().await.is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_token_owned_finish_closes_only_after_its_durable_barrier() {
+        let (path, file) = test_file("attempt-token-lifecycle");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-token-lifecycle", writer).await;
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let finish = reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        assert_eq!(receipt.seq().get(), finish.seq().get() + 1);
+        assert!(reservation.retire_attempt(&token).is_err());
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_bookkeeping_resident_begin_is_exact_and_atomic() {
+        let baseline = Session::attempt_bookkeeping_baseline_for_test();
+        assert!(baseline > 0);
+        let resident_limit = baseline + 1024 * 1024;
+
+        let (over_path, over_file) = test_file("attempt-bookkeeping-begin-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let (mut over, turn, step) =
+            attempt_ready_session("attempt-bookkeeping-begin-over", over_writer).await;
+        let over_pool = over.set_resident_limit_for_test(resident_limit);
+        let over_filler = over_pool
+            .try_acquire(resident_limit - (baseline - 1))
+            .unwrap();
+        let before_nonce = over.next_attempt_nonce;
+        {
+            let mut reservation = over.reservation();
+            assert!(matches!(
+                reservation.begin_attempt(turn, step),
+                Err(AppendError::DurableResidentLimit { maximum }) if maximum == resident_limit
+            ));
+            assert_eq!(
+                reservation
+                    .session()
+                    .active_attempt_bookkeeping_bytes_for_test(),
+                None
+            );
+            assert_eq!(reservation.session().next_attempt_nonce, before_nonce);
+            assert_eq!(reservation.session().state().open_step(), Some(step));
+        }
+        assert_eq!(over_pool.used_for_test(), over_filler.bytes());
+        drop(over_filler);
+        over.append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        over.append_settled(NewEvent::log(EventKind::turn_end(
+            turn,
+            TurnEndReason::Error {
+                error: LlmFailure::new("attempt was not admitted", "ATTEMPT_LIMIT").unwrap(),
+            },
+        )))
+        .await
+        .unwrap();
+        over.flush_barrier().await.unwrap();
+        assert_eq!(over_pool.used_for_test(), 0);
+        over.shutdown().await.unwrap();
+        std::fs::remove_file(over_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("attempt-bookkeeping-begin-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let (mut exact, turn, step) =
+            attempt_ready_session("attempt-bookkeeping-begin-exact", exact_writer).await;
+        let exact_pool = exact.set_resident_limit_for_test(resident_limit);
+        let exact_filler = exact_pool.try_acquire(resident_limit - baseline).unwrap();
+        let mut reservation = exact.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline)
+        );
+        assert_eq!(exact_pool.used_for_test(), resident_limit);
+        drop(exact_filler);
+        assert_eq!(exact_pool.used_for_test(), baseline);
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        assert!(reservation.retire_attempt(&token).is_err());
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline)
+        );
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(exact_pool.used_for_test(), baseline);
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        drop(reservation);
+        exact.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_attempt_bookkeeping_delta_rolls_back_before_clock_retry() {
+        let (path, file) = test_file("attempt-bookkeeping-delta-clock");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, step) = attempt_ready_session_with_clock(
+            "attempt-bookkeeping-delta-clock",
+            clock.clone(),
+            writer,
+        )
+        .await;
+        let pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let baseline = reservation
+            .session()
+            .active_attempt_bookkeeping_bytes_for_test()
+            .unwrap();
+        assert_eq!(pool.used_for_test(), baseline);
+
+        let chunk =
+            StreamChunk::block_start(0, ContentBlockType::Other("vendor-extension".to_owned()))
+                .unwrap();
+        let expected_delta = match chunk.kind() {
+            StreamChunkKind::BlockStart {
+                block_type: ContentBlockType::Other(value),
+                ..
+            } => string_backing_charge(value.capacity()).unwrap(),
+            _ => panic!("the fixture must be an extension block start"),
+        };
+        let prepared = Session::prepare_event(NewEvent::log(EventKind::assistant_chunk(
+            turn,
+            step,
+            chunk.clone(),
+        )))
+        .unwrap();
+        let original_data_charge = prepared.original_data.resident_bytes();
+        drop(prepared);
+        let before_resident_rejection = clock.calls.load(Ordering::SeqCst);
+        let resident_filler = pool
+            .try_acquire(32 * 1024 * 1024 - baseline - original_data_charge - expected_delta + 1)
+            .unwrap();
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::DurableResidentLimit { maximum })
+                if maximum == 32 * 1024 * 1024
+        ));
+        assert_eq!(
+            clock.calls.load(Ordering::SeqCst),
+            before_resident_rejection
+        );
+        assert_eq!(pool.used_for_test(), baseline + resident_filler.bytes());
+        drop(resident_filler);
+        assert_eq!(pool.used_for_test(), baseline);
+
+        clock.fail_after(0);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(pool.used_for_test(), baseline);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline)
+        );
+
+        reservation
+            .append_attempt_chunk_settled(&token, chunk)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), baseline + expected_delta);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline + expected_delta)
+        );
+
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), baseline + expected_delta);
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_payload_credit_rolls_back_then_moves_through_seal_once() {
+        let (path, file) = test_file("attempt-payload-transfer");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, step) =
+            attempt_ready_session_with_clock("attempt-payload-transfer", clock.clone(), writer)
+                .await;
+        let limit = 32 * 1024 * 1024;
+        let pool = session.set_resident_limit_for_test(limit);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let baseline = reservation
+            .session()
+            .active_attempt_resident_bytes_for_test()
+            .unwrap();
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(0)
+        );
+
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), baseline);
+
+        let semantic_filler = pool.try_acquire(limit - baseline).unwrap();
+        let clock_before = clock.calls.load(Ordering::SeqCst);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(
+                    &token,
+                    StreamChunk::block_end(1, ContentBlock::text("wrong block index").unwrap(),)
+                        .unwrap(),
+                )
+                .await,
+            Err(AppendError::Validation(_))
+        ));
+        assert_eq!(clock.calls.load(Ordering::SeqCst), clock_before);
+        assert_eq!(pool.used_for_test(), limit);
+        drop(semantic_filler);
+
+        let block = ContentBlock::text("retained payload".repeat(4096)).unwrap();
+        let block_charge = block.resident_bytes().unwrap();
+        let chunk = StreamChunk::block_end(0, block).unwrap();
+        let typed_charge = chunk.resident_bytes();
+        assert_eq!(chunk.attempt_retained_resident_bytes(), block_charge);
+        let prepared = Session::prepare_event(NewEvent::log(EventKind::assistant_chunk(
+            turn,
+            step,
+            chunk.clone(),
+        )))
+        .unwrap();
+        let original_charge = prepared.original_data.resident_bytes();
+        drop(prepared);
+        let filler_bytes = limit
+            .checked_sub(baseline + original_charge + typed_charge - 1)
+            .unwrap();
+        let filler = pool.try_acquire(filler_bytes).unwrap();
+        let clock_before = clock.calls.load(Ordering::SeqCst);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::DurableResidentLimit { maximum }) if maximum == limit
+        ));
+        assert_eq!(clock.calls.load(Ordering::SeqCst), clock_before);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(0)
+        );
+        assert_eq!(pool.used_for_test(), baseline + filler.bytes());
+        drop(filler);
+
+        clock.fail_after(0);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(pool.used_for_test(), baseline);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(0)
+        );
+
+        reservation
+            .append_attempt_chunk_settled(&token, chunk)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(block_charge)
+        );
+        assert_eq!(pool.used_for_test(), baseline + block_charge);
+
+        let reason = FinishReason::stop().unwrap();
+        let finish_charge = reason.resident_bytes();
+        let content_vec_charge = vec_backing_charge::<ContentBlock>(1).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(reason.clone(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let expected_payload = block_charge + finish_charge + content_vec_charge;
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(expected_payload)
+        );
+
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let parts = prepared.into_parts();
+        assert!(parts.usage.is_none());
+        assert_eq!(parts.finish, reason);
+        assert!(parts.replay_state.is_none());
+        let guard = parts
+            .resident_guard
+            .expect("a durable sealed attempt must pin its resident account");
+        let guarded_bytes = guard.total_bytes();
+        let assistant =
+            Message::assistant("assistant", parts.content, "mock", "mock-model").unwrap();
+        let receipt = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::surface(
+                    EventKind::AssistantMessage {
+                        turn,
+                        step,
+                        message: assistant,
+                        usage: None,
+                    },
+                    SurfaceIntent::append().with_sources(parts.sources),
+                ),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(pool.used_for_test(), guarded_bytes);
+        drop(guard);
+        assert_eq!(pool.used_for_test(), 0);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(receipt);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_token_anchor_has_its_own_limit_and_outlives_attempt_retirement() {
+        fn usage() -> TokenUsage {
+            TokenUsage::from_parts(
+                NonNegativeSafeInteger::new(50_000).unwrap(),
+                NonNegativeSafeInteger::new(2_000).unwrap(),
+                Some(NonNegativeSafeInteger::new(500).unwrap()),
+                Some(NonNegativeSafeInteger::new(250).unwrap()),
+                Some(NonNegativeSafeInteger::new(1_000).unwrap()),
+            )
+            .unwrap()
+        }
+
+        let usage_charge = usage()
+            .resident_bytes()
+            .checked_add(arc_inner_charge::<ResidentCreditLease>().unwrap())
+            .unwrap();
+        assert!(usage_charge > 1);
+
+        async fn rejected_case(label: &str, high_water: usize, steady: usize, expected: usize) {
+            let (path, file) = test_file(label);
+            let writer = JournalWriter::start(file, 0).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (mut session, turn, step) =
+                attempt_ready_session_with_clock(label, CountingClock(Arc::clone(&calls)), writer)
+                    .await;
+            let anchor_pool =
+                session.set_validation_other_resident_limits_for_test(high_water, steady);
+            let mut reservation = session.reservation();
+            let token = reservation.begin_attempt(turn, step).unwrap();
+            for chunk in [
+                StreamChunk::usage(usage()).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ] {
+                reservation
+                    .append_attempt_chunk_settled(&token, chunk)
+                    .await
+                    .unwrap();
+            }
+            reservation.flush_barrier().await.unwrap();
+            let closure =
+                finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+            let seq_before = reservation.session().next_seq();
+            let clock_before = calls.load(Ordering::SeqCst);
+            assert!(matches!(
+                reservation
+                    .append_attempt_closure_settled(
+                        &token,
+                        AttemptDisposition::Committed,
+                        closure,
+                    )
+                    .await,
+                Err(AppendError::DurableResidentLimit { maximum }) if maximum == expected
+            ));
+            assert_eq!(reservation.session().next_seq(), seq_before);
+            assert_eq!(calls.load(Ordering::SeqCst), clock_before);
+            assert_eq!(anchor_pool.used_for_test(), 0);
+            reservation
+                .append_attempt_closure_settled(
+                    &token,
+                    AttemptDisposition::Failed,
+                    NewEvent::log(EventKind::step_end(turn, step)),
+                )
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            reservation.retire_attempt(&token).unwrap();
+            reservation
+                .append_settled(NewEvent::log(EventKind::turn_end(
+                    turn,
+                    TurnEndReason::Error {
+                        error: LlmFailure::new("token anchor limit", "TOKEN_ANCHOR_LIMIT").unwrap(),
+                    },
+                )))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            drop(reservation);
+            session.shutdown().await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+
+        rejected_case(
+            "attempt-token-anchor-steady-one-over",
+            usage_charge * 2,
+            usage_charge - 1,
+            usage_charge - 1,
+        )
+        .await;
+        rejected_case(
+            "attempt-token-anchor-high-water-one-over",
+            usage_charge - 1,
+            usage_charge,
+            usage_charge - 1,
+        )
+        .await;
+
+        {
+            let (path, file) = test_file("attempt-token-anchor-replacement-one-over");
+            let writer = JournalWriter::start(file, 0).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (mut session, turn, first_step) = attempt_ready_session_with_clock(
+                "attempt-token-anchor-replacement-one-over",
+                CountingClock(Arc::clone(&calls)),
+                writer,
+            )
+            .await;
+            let anchor_pool = session
+                .set_validation_other_resident_limits_for_test(usage_charge * 2 - 1, usage_charge);
+            let mut reservation = session.reservation();
+            commit_empty_attempt(&mut reservation, turn, first_step, Some(usage())).await;
+            assert_eq!(anchor_pool.used_for_test(), usage_charge);
+            reservation
+                .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+                .await
+                .unwrap();
+            let second_step = StepId::new(2).unwrap();
+            reservation
+                .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+
+            let token = reservation.begin_attempt(turn, second_step).unwrap();
+            for chunk in [
+                StreamChunk::usage(usage()).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ] {
+                reservation
+                    .append_attempt_chunk_settled(&token, chunk)
+                    .await
+                    .unwrap();
+            }
+            reservation.flush_barrier().await.unwrap();
+            let closure =
+                finish_only_assistant(turn, second_step, reservation.seal_attempt(&token).unwrap());
+            let seq_before = reservation.session().next_seq();
+            let clock_before = calls.load(Ordering::SeqCst);
+            let context_before = reservation.session().context_total_tokens().unwrap();
+            assert!(matches!(
+                reservation
+                    .append_attempt_closure_settled(
+                        &token,
+                        AttemptDisposition::Committed,
+                        closure,
+                    )
+                    .await,
+                Err(AppendError::DurableResidentLimit { maximum })
+                    if maximum == usage_charge * 2 - 1
+            ));
+            assert_eq!(reservation.session().next_seq(), seq_before);
+            assert_eq!(calls.load(Ordering::SeqCst), clock_before);
+            assert_eq!(
+                reservation.session().context_total_tokens().unwrap(),
+                context_before
+            );
+            assert_eq!(anchor_pool.used_for_test(), usage_charge);
+            assert_eq!(
+                reservation
+                    .session()
+                    .projection
+                    .token_anchor_resident_bytes_for_test(),
+                usage_charge
+            );
+            reservation
+                .append_attempt_closure_settled(
+                    &token,
+                    AttemptDisposition::Failed,
+                    NewEvent::log(EventKind::step_end(turn, second_step)),
+                )
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            reservation.retire_attempt(&token).unwrap();
+            assert_eq!(anchor_pool.used_for_test(), usage_charge);
+            reservation
+                .append_settled(NewEvent::log(EventKind::turn_end(
+                    turn,
+                    TurnEndReason::Error {
+                        error: LlmFailure::new("token anchor limit", "TOKEN_ANCHOR_LIMIT").unwrap(),
+                    },
+                )))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            drop(reservation);
+            session.shutdown().await.unwrap();
+            drop(session);
+            assert_eq!(anchor_pool.used_for_test(), 0);
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let (path, file) = test_file("attempt-token-anchor-exact");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-token-anchor-exact", writer).await;
+        let attempt_pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let anchor_pool =
+            session.set_validation_other_resident_limits_for_test(usage_charge * 2, usage_charge);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::usage(usage()).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let parts = prepared.into_parts();
+        assert_eq!(parts.finish, FinishReason::stop().unwrap());
+        assert!(parts.replay_state.is_none());
+        let guard = parts
+            .resident_guard
+            .expect("the sealed attempt must keep its typed payload credit");
+        let assistant =
+            Message::assistant("assistant", parts.content, "mock", "mock-model").unwrap();
+        let receipt = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::surface(
+                    EventKind::AssistantMessage {
+                        turn,
+                        step,
+                        message: assistant,
+                        usage: parts.usage,
+                    },
+                    SurfaceIntent::append().with_sources(parts.sources),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        assert_eq!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test(),
+            usage_charge
+        );
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert!(attempt_pool.used_for_test() > 0);
+        drop(guard);
+        assert_eq!(attempt_pool.used_for_test(), 0);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        drop(receipt);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        let second_step = StepId::new(2).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        commit_empty_attempt(&mut reservation, turn, second_step, Some(usage())).await;
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, second_step)))
+            .await
+            .unwrap();
+        let third_step = StepId::new(3).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, third_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let token = reservation.begin_attempt(turn, third_step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, ContentBlock::text("estimated anchor").unwrap()).unwrap(),
+            StreamChunk::usage(TokenUsage::new(0, 0).unwrap()).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure =
+            finish_only_assistant(turn, third_step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        drop(receipt);
+        assert_eq!(anchor_pool.used_for_test(), 0);
+        assert_eq!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test(),
+            0
+        );
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, third_step)))
+            .await
+            .unwrap();
+        let fourth_step = StepId::new(4).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, fourth_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        commit_empty_attempt(&mut reservation, turn, fourth_step, Some(usage())).await;
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        let projection_clone = reservation.session().projection.clone();
+        assert_eq!(projection_clone, reservation.session().projection);
+        let mut uncharged_projection = projection_clone.clone();
+        uncharged_projection.clear_token_anchor_credit_for_test();
+        assert_eq!(uncharged_projection, projection_clone);
+        assert_eq!(
+            uncharged_projection.token_anchor_resident_bytes_for_test(),
+            0
+        );
+        drop(uncharged_projection);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        let projection_debug = format!("{projection_clone:?}");
+        assert!(!projection_debug.contains("resident_credit"));
+        assert!(!projection_debug.contains("ResidentCreditLease"));
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, fourth_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(session);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        drop(projection_clone);
+        assert_eq!(anchor_pool.used_for_test(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_token_anchor_clock_rejection_preserves_the_old_owner() {
+        let old_usage = TokenUsage::from_parts(
+            NonNegativeSafeInteger::new(50_000).unwrap(),
+            NonNegativeSafeInteger::new(2_000).unwrap(),
+            Some(NonNegativeSafeInteger::new(500).unwrap()),
+            Some(NonNegativeSafeInteger::new(250).unwrap()),
+            Some(NonNegativeSafeInteger::new(1_000).unwrap()),
+        )
+        .unwrap();
+        let new_usage = TokenUsage::from_parts(
+            NonNegativeSafeInteger::new(60_000).unwrap(),
+            NonNegativeSafeInteger::new(3_000).unwrap(),
+            Some(NonNegativeSafeInteger::new(500).unwrap()),
+            Some(NonNegativeSafeInteger::new(250).unwrap()),
+            Some(NonNegativeSafeInteger::new(1_000).unwrap()),
+        )
+        .unwrap();
+        let usage_charge = old_usage
+            .resident_bytes()
+            .checked_add(arc_inner_charge::<ResidentCreditLease>().unwrap())
+            .unwrap();
+        assert_eq!(new_usage.resident_bytes(), old_usage.resident_bytes());
+        let (path, file) = test_file("attempt-token-anchor-clock-rollback");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, first_step) = attempt_ready_session_with_clock(
+            "attempt-token-anchor-clock-rollback",
+            clock.clone(),
+            writer,
+        )
+        .await;
+        let anchor_pool =
+            session.set_validation_other_resident_limits_for_test(usage_charge * 2, usage_charge);
+        let mut reservation = session.reservation();
+        commit_empty_attempt(&mut reservation, turn, first_step, Some(old_usage)).await;
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        let second_step = StepId::new(2).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+
+        let token = reservation.begin_attempt(turn, second_step).unwrap();
+        for chunk in [
+            StreamChunk::usage(new_usage).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure =
+            finish_only_assistant(turn, second_step, reservation.seal_attempt(&token).unwrap());
+        let mut claims = reservation.claim_batch(vec![closure]).unwrap();
+        let mut claim = claims.remove(0);
+        let seq_before = reservation.session().next_seq();
+        let context_before = reservation.session().context_total_tokens().unwrap();
+        let projection_before = reservation.session().projection.clone();
+        clock.fail_after(0);
+        assert!(matches!(
+            reservation
+                .settle_attempt_closure_exact_settled(
+                    &mut claim,
+                    &token,
+                    AttemptDisposition::Committed,
+                )
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(reservation.session().next_seq(), seq_before);
+        assert_eq!(
+            reservation.session().context_total_tokens().unwrap(),
+            context_before
+        );
+        assert_eq!(reservation.session().projection, projection_before);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        drop(projection_before);
+
+        let receipt = reservation
+            .settle_attempt_closure_exact_settled(&mut claim, &token, AttemptDisposition::Committed)
+            .await
+            .unwrap();
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        assert!(reservation.session().context_total_tokens().unwrap() > context_before);
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, second_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(session);
+        assert_eq!(anchor_pool.used_for_test(), 0);
+        drop(receipt);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_attempt_surface_credit_has_separate_steady_and_high_water_limits() {
+        async fn run_rejected_case(label: &str, high_water: usize, steady: usize, expected: usize) {
+            let (path, file) = test_file(label);
+            let writer = JournalWriter::start(file, 0).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let clock = CountingClock(Arc::clone(&calls));
+            let (mut session, turn, step) =
+                attempt_ready_session_with_clock(label, clock, writer).await;
+            let surface_pool = session.set_surface_resident_limits_for_test(high_water, steady);
+            let block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+            let mut reservation = session.reservation();
+            let token = reservation.begin_attempt(turn, step).unwrap();
+            for chunk in [
+                StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+                StreamChunk::block_end(0, block).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ] {
+                reservation
+                    .append_attempt_chunk_settled(&token, chunk)
+                    .await
+                    .unwrap();
+            }
+            reservation.flush_barrier().await.unwrap();
+            let closure =
+                finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+            let before_seq = reservation.session().next_seq();
+            let before_clock = calls.load(Ordering::SeqCst);
+
+            assert!(matches!(
+                reservation
+                    .append_attempt_closure_settled(
+                        &token,
+                        AttemptDisposition::Committed,
+                        closure,
+                    )
+                    .await,
+                Err(AppendError::DurableResidentLimit { maximum }) if maximum == expected
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), before_clock);
+            assert_eq!(reservation.session().next_seq(), before_seq);
+            assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+            assert_eq!(surface_pool.used_for_test(), 0);
+
+            reservation
+                .append_attempt_closure_settled(
+                    &token,
+                    AttemptDisposition::Failed,
+                    NewEvent::log(EventKind::step_end(turn, step)),
+                )
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            reservation.retire_attempt(&token).unwrap();
+            reservation
+                .append_settled(NewEvent::log(EventKind::turn_end(
+                    turn,
+                    TurnEndReason::Error {
+                        error: LlmFailure::new("surface limit", "SURFACE_LIMIT").unwrap(),
+                    },
+                )))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            drop(reservation);
+            session.shutdown().await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let probe_block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+        let probe =
+            Message::assistant("assistant", vec![probe_block], "mock", "mock-model").unwrap();
+        let charge = probe.surface_credit_bytes();
+        assert!(charge > 1);
+
+        run_rejected_case(
+            "attempt-surface-steady-one-over",
+            charge * 2,
+            charge - 1,
+            charge - 1,
+        )
+        .await;
+        run_rejected_case(
+            "attempt-surface-high-water-one-over",
+            charge - 1,
+            charge,
+            charge - 1,
+        )
+        .await;
+
+        let (path, file) = test_file("attempt-surface-exact");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-surface-exact", writer).await;
+        let attempt_pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let surface_pool = session.set_surface_resident_limits_for_test(charge, charge);
+        let block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, block).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        assert_eq!(surface_pool.used_for_test(), charge);
+        assert_eq!(
+            reservation.session().surface_resident_bytes_for_test(),
+            charge
+        );
+        let visible = reservation.session().messages();
+        assert_eq!(visible.len(), 1);
+        let committed = receipt.committed_message().unwrap();
+        assert!(committed.shares_payload_with(&visible[0]));
+        assert!(committed.shares_surface_credit_with(&visible[0]));
+
+        assert!(reservation.retire_attempt(&token).is_err());
+        reservation.flush_barrier().await.unwrap();
+        assert!(attempt_pool.used_for_test() > 0);
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(attempt_pool.used_for_test(), 0);
+        assert_eq!(surface_pool.used_for_test(), charge);
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(visible);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(session);
+        assert_eq!(surface_pool.used_for_test(), charge);
+        drop(receipt);
+        assert_eq!(surface_pool.used_for_test(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_nonclaim_clock_rejection_releases_the_uncommitted_surface_credit() {
+        let (path, file) = test_file("attempt-surface-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, step) = attempt_ready_session_with_clock(
+            "attempt-surface-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .await;
+        let block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+        let charge = Message::assistant("assistant", vec![block.clone()], "mock", "mock-model")
+            .unwrap()
+            .surface_credit_bytes();
+        let surface_pool = session.set_surface_resident_limits_for_test(charge, charge);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, block).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let before_seq = reservation.session().next_seq();
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation
+                .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure,)
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(reservation.session().next_seq(), before_seq);
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+        assert_eq!(surface_pool.used_for_test(), 0);
+
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("clock failed", "CLOCK_FAILED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_durable_admission_rejects_all_attempt_rows() {
+        let (path, file) = test_file("attempt-ordinary-bypass");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-ordinary-bypass", writer).await;
+        let mut reservation = session.reservation();
+        let failure = LlmFailure::new("retry", "TRANSIENT").unwrap();
+        let retry = LlmRetryEvent::normal(
+            RetryId::new("retry-ordinary-bypass"),
+            turn,
+            step,
+            "mock",
+            "policy",
+            RetryNumber::new(1).unwrap(),
+            RetryNumber::new(2).unwrap(),
+            FiniteNumber::new(0.0).unwrap(),
+            failure,
+        )
+        .unwrap();
+        let candidates = [
+            NewEvent::log(EventKind::assistant_chunk(
+                turn,
+                step,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )),
+            NewEvent::surface(
+                EventKind::AssistantMessage {
+                    turn,
+                    step,
+                    message: Message::assistant(
+                        "forged-assistant",
+                        Vec::new(),
+                        "mock",
+                        "mock-model",
+                    )
+                    .unwrap(),
+                    usage: None,
+                },
+                SurfaceIntent::append(),
+            ),
+            NewEvent::log(EventKind::llm_retry(retry)),
+        ];
+
+        for candidate in candidates {
+            let expected_type = candidate.kind.event_type().to_owned();
+            let before = reservation.session().next_seq();
+            let error = reservation
+                .append_settled(candidate.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AppendError::Validation(EventValidationError::Transition(
+                    TransitionError::DurableAttemptEventNotAllowed { event_type }
+                )) if event_type == expected_type
+            ));
+            assert_eq!(reservation.session().next_seq(), before);
+
+            let mut claim = reservation.claim_batch([candidate]).unwrap().remove(0);
+            let error = reservation
+                .settle_exact_settled(&mut claim)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AppendError::Validation(EventValidationError::Transition(
+                    TransitionError::DurableAttemptEventNotAllowed { event_type }
+                )) if event_type == expected_type
+            ));
+            assert_eq!(reservation.session().next_seq(), before);
+            reservation.release(&mut claim).unwrap();
+        }
+
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_memory_admission_cannot_bypass_a_live_attempt_token() {
+        let mut session = Session::with_clock("attempt-memory-bypass", SystemClock).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::step_start(turn, step)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .unwrap();
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let failure = LlmFailure::new("retry", "TRANSIENT").unwrap();
+        let retry = LlmRetryEvent::normal(
+            RetryId::new("retry-memory-bypass"),
+            turn,
+            step,
+            "mock",
+            "policy",
+            RetryNumber::new(1).unwrap(),
+            RetryNumber::new(2).unwrap(),
+            FiniteNumber::new(0.0).unwrap(),
+            failure,
+        )
+        .unwrap();
+        let candidates = [
+            NewEvent::log(EventKind::assistant_chunk(
+                turn,
+                step,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )),
+            NewEvent::surface(
+                EventKind::AssistantMessage {
+                    turn,
+                    step,
+                    message: Message::assistant(
+                        "forged-memory-assistant",
+                        Vec::new(),
+                        "mock",
+                        "mock-model",
+                    )
+                    .unwrap(),
+                    usage: None,
+                },
+                SurfaceIntent::append(),
+            ),
+            NewEvent::log(EventKind::llm_retry(retry)),
+        ];
+
+        for candidate in candidates {
+            let expected_type = candidate.kind.event_type().to_owned();
+            let before = reservation.session().next_seq();
+            let error = reservation.append_settled(candidate).await.unwrap_err();
+            assert!(matches!(
+                error,
+                AppendError::Validation(EventValidationError::Transition(
+                    TransitionError::DurableAttemptEventNotAllowed { event_type }
+                )) if event_type == expected_type
+            ));
+            assert_eq!(reservation.session().next_seq(), before);
+        }
+
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("attempt stopped", "ATTEMPT_FAILED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_memory_attempt_commits_an_unleased_assistant_message() {
+        let mut session =
+            Session::with_clock("attempt-memory-surface-unleased", SystemClock).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::step_start(turn, step)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .unwrap();
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, ContentBlock::text("memory assistant").unwrap()).unwrap(),
+            StreamChunk::usage(TokenUsage::new(50_000, 2_000).unwrap()).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        assert!(
+            receipt
+                .committed_message()
+                .is_some_and(|message| message.charged_surface_bytes().is_none())
+        );
+        assert!(
+            reservation
+                .session()
+                .messages()
+                .last()
+                .is_some_and(|message| message.charged_surface_bytes().is_none())
+        );
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+        assert_eq!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test(),
+            0
+        );
+        assert!(reservation.session().context_total_tokens().unwrap() > 0);
+
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_chunk_attempt_closes_through_owned_step_end() {
+        let (path, file) = test_file("attempt-zero-chunk-close");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-zero-chunk-close", writer).await;
+        let mut reservation = session.reservation();
+        let mut step_end = reservation
+            .claim_batch([NewEvent::log(EventKind::step_end(turn, step))])
+            .unwrap()
+            .remove(0);
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .settle_step_end_with_attempt_settled(
+                &mut step_end,
+                Some(&token),
+                Some(AttemptDisposition::Failed),
+            )
+            .await
+            .unwrap();
+        assert!(reservation.retire_attempt(&token).is_err());
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(reservation.session().state().open_step(), None);
+        assert_eq!(
+            reservation.release(&mut step_end),
+            Err(AppendError::InvalidClaim)
+        );
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("provider failed", "AGENT_PROVIDER_STREAM").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_owned_step_end_resumes_without_a_local_fallback_payload() {
+        let (path, file) = test_file("attempt-step-end-drop");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-step-end-drop", writer).await;
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer_at(&path, FlightKind::Append, offset);
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let mut step_end = reservation
+            .claim_batch([NewEvent::log(EventKind::step_end(turn, step))])
+            .unwrap()
+            .remove(0);
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "flush before the owned step closure".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            }))
+            .await
+            .unwrap();
+
+        {
+            let mut waiting = Box::pin(reservation.settle_step_end_with_attempt_settled(
+                &mut step_end,
+                Some(&token),
+                Some(AttemptDisposition::Failed),
+            ));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    panic!("owned step closure unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            reservation.flush_barrier().await,
+            Err(BarrierError::Append(AppendError::NeedsAppendSettle))
+        );
+
+        reservation
+            .settle_step_end_with_attempt_settled(
+                &mut step_end,
+                Some(&token),
+                Some(AttemptDisposition::Failed),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(reservation.session().state().open_step(), None);
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("provider failed", "AGENT_PROVIDER_STREAM").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retry_reopens_the_same_step_only_after_its_owned_attempt_closes() {
+        let (path, file) = test_file("attempt-retry-lifecycle");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-retry-lifecycle", writer).await;
+        let mut reservation = session.reservation();
+        let failure = LlmFailure::new("try again", "TRANSIENT").unwrap();
+        let first = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &first,
+                StreamChunk::finish(FinishReason::error(failure.clone()).unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let _failed = reservation.seal_attempt(&first).unwrap();
+        let retry_id = RetryId::new("retry-attempt-1");
+        let retry_number = RetryNumber::new(1).unwrap();
+        let retry = LlmRetryEvent::normal(
+            retry_id.clone(),
+            turn,
+            step,
+            "mock",
+            "policy",
+            retry_number,
+            RetryNumber::new(2).unwrap(),
+            FiniteNumber::new(0.0).unwrap(),
+            failure,
+        )
+        .unwrap();
+        reservation
+            .append_attempt_closure_settled(
+                &first,
+                AttemptDisposition::Retry,
+                NewEvent::log(EventKind::llm_retry(retry)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&first).unwrap();
+
+        let started = LlmRetryStartedEvent::new(retry_id, turn, step, retry_number).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::llm_retry_started(started)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+
+        let second = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &second,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&second).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        reservation
+            .append_attempt_closure_settled(&second, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&second).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_closure_can_consume_the_same_claim_that_protects_its_row() {
+        let (path, file) = test_file("attempt-claim-lifecycle");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-claim-lifecycle", writer).await;
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        let mut claims = reservation.claim_batch([closure]).unwrap();
+        let mut assistant = claims.remove(0);
+        reservation
+            .settle_attempt_closure_exact_settled(
+                &mut assistant,
+                &token,
+                AttemptDisposition::Committed,
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(
+            reservation.release(&mut assistant),
+            Err(AppendError::InvalidClaim)
+        );
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_claim_aware_closure_remains_owned_by_the_same_claim() {
+        let (path, file) = test_file("attempt-claim-drop");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) = attempt_ready_session("attempt-claim-drop", writer).await;
+        let surface_charge = Message::assistant("assistant", Vec::new(), "mock", "mock-model")
+            .unwrap()
+            .surface_credit_bytes();
+        let surface_pool =
+            session.set_surface_resident_limits_for_test(surface_charge, surface_charge);
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer_at(&path, FlightKind::Append, offset);
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let mut assistant = reservation.claim_batch([closure]).unwrap().remove(0);
+        {
+            let mut waiting = Box::pin(reservation.settle_attempt_closure_exact_settled(
+                &mut assistant,
+                &token,
+                AttemptDisposition::Committed,
+            ));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("claim closure unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
+        assert_eq!(
+            reservation.flush_barrier().await,
+            Err(BarrierError::Append(AppendError::NeedsAppendSettle))
+        );
+        assert!(reservation.retire_attempt(&token).is_err());
+
+        reservation
+            .settle_attempt_closure_exact_settled(
+                &mut assistant,
+                &token,
+                AttemptDisposition::Committed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(surface_pool.used_for_test(), 0);
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(
+            reservation.release(&mut assistant),
+            Err(AppendError::InvalidClaim)
+        );
+        assert_eq!(counts.append.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.barrier.load(Ordering::SeqCst), 2);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_token_cannot_cross_its_reservation_owner() {
+        let (path, file) = test_file("attempt-reservation-owner");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-reservation-owner", writer).await;
+        let token = {
+            let mut first = session.reservation();
+            first.begin_attempt(turn, step).unwrap()
+        };
+        let mut second = session.reservation();
+        let error = second
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppendError::Validation(_)));
+        assert_eq!(second.session().next_seq().unwrap().get(), 3);
+        drop(second);
+        assert!(session.shutdown().await.is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_attempt_closure_wait_still_closes_the_same_token_once() {
+        let (path, file) = test_file("attempt-closure-drop");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) = attempt_ready_session("attempt-closure-drop", writer).await;
+        let surface_charge = Message::assistant("assistant", Vec::new(), "mock", "mock-model")
+            .unwrap()
+            .surface_credit_bytes();
+        let surface_pool =
+            session.set_surface_resident_limits_for_test(surface_charge, surface_charge);
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let gated = gated_writer_at(&path, FlightKind::Append, offset);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated;
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        {
+            let mut waiting = Box::pin(reservation.append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                closure.clone(),
+            ));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("closure unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
+        let invalid_replacement = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::log(EventKind::Unknown {
+                    event_type: "future/required".to_owned(),
+                    data: crate::model::JsonValue::null(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_replacement, AppendError::NeedsAppendSettle);
+        let mismatch = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "different pending closure".to_owned(),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch, AppendError::NeedsAppendSettle);
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(surface_pool.used_for_test(), 0);
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(counts.append.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.barrier.load(Ordering::SeqCst), 1);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pending_attempt_chunk_cannot_be_settled_by_a_different_payload() {
+        let (path, file) = test_file("attempt-chunk-payload");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-chunk-payload", writer).await;
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer_at(&path, FlightKind::Append, offset);
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "force the next attempt row to settle storage".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            }))
+            .await
+            .unwrap();
+        let original = StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap();
+        {
+            let mut waiting =
+                Box::pin(reservation.append_attempt_chunk_settled(&token, original.clone()));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("chunk unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+
+        let different = StreamChunk::finish(FinishReason::max_tokens().unwrap(), None).unwrap();
+        assert_eq!(
+            reservation
+                .append_attempt_chunk_settled(&token, different)
+                .await,
+            Err(AppendError::NeedsAppendSettle)
+        );
+        reservation
+            .append_attempt_chunk_settled(&token, original)
+            .await
+            .unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(counts.append.load(Ordering::SeqCst), 3);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_disposition_cannot_close_with_an_unrelated_event() {
+        let (path, file) = test_file("attempt-closure-kind");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let (mut session, turn, step) = attempt_ready_session_with_clock(
+            "attempt-closure-kind",
+            CountingClock(Arc::clone(&clock_calls)),
+            writer,
+        )
+        .await;
+        let surface_pool = session.set_surface_resident_limits_for_test(1024 * 1024, 1024 * 1024);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        let before = reservation.session().next_seq();
+        let before_clock = clock_calls.load(Ordering::SeqCst);
+        let error = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "still open".to_owned(),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppendError::Validation(_)));
+        assert_eq!(reservation.session().next_seq(), before);
+        assert_eq!(clock_calls.load(Ordering::SeqCst), before_clock);
+        assert_eq!(surface_pool.used_for_test(), 0);
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_row_digest_mismatch_poison_is_not_lost_when_the_read_returns() {
+        let (path, mut file) = test_file("journal-read-corrupt");
+        let actual = b"{\"x\":1}\n";
+        file.write_all(actual).unwrap();
+        file.sync_all().unwrap();
+        let mut writer = JournalWriter::start(file, actual.len() as u64).unwrap();
+        let wrong = JournalRowLocator::new(EventSeq::new(0).unwrap(), 0, b"{\"x\":2}\n").unwrap();
+        assert_eq!(
+            writer
+                .read_durable_row(wrong, CancellationToken::new())
+                .await,
+            Err(JournalReadError::Writer(JournalError::Poisoned))
+        );
+        assert_eq!(writer.barrier().await, Err(JournalError::Poisoned));
+        assert_eq!(writer.finish().await, Err(JournalError::Poisoned));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_flush_wait_leaves_the_owned_flight_settleable() {
+        let (path, file) = test_file("journal-cancel-safe");
+        drop(file);
+        let GatedWriter {
+            mut writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Append);
+        writer.stage_bytes_for_test(vec![b'x'; 64 * 1024]).unwrap();
+        {
+            let mut wait = Box::pin(writer.flush_staged());
+            poll_fn(|context| match wait.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("flush unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        let cursor = writer.barrier().await.unwrap();
+        assert_eq!(cursor.durable_offset, 64 * 1024);
+        writer.finish().await.unwrap();
+        assert_eq!(counts.append.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 * 1024);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_write_flight_keeps_its_resident_credit_until_settled() {
+        let (path, file) = test_file("journal-flight-resident-credit");
+        drop(file);
+        let GatedWriter {
+            mut writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer(&path, FlightKind::Append);
+        let pool = writer.resident_pool();
+        let bytes = ChargedBytes::try_new(b"charged\n".to_vec(), &pool).unwrap();
+        writer.stage(bytes).unwrap();
+        let charged = pool.used_for_test();
+        assert!(charged > 0);
+
+        {
+            let mut flush = Box::pin(writer.flush_staged());
+            poll_fn(|context| match flush.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("flush unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        assert_eq!(pool.used_for_test(), charged);
+
+        release.send(()).unwrap();
+        writer.settle_before_stage().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        writer.finish().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_prune_prefix_flight_keeps_its_resident_credit_until_settled() {
+        let (path, file) = test_file("journal-prune-flight-resident-credit");
+        drop(file);
+        let GatedWriter {
+            mut writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer(&path, FlightKind::PrunePrefix);
+        let pool = writer.resident_pool();
+        let bytes = ChargedBytes::try_new(b"marker\nreplacement\n".to_vec(), &pool).unwrap();
+        writer.stage_prune_prefix(bytes, 2).unwrap();
+        let charged = pool.used_for_test();
+        assert!(charged > 0);
+
+        {
+            let mut flush = Box::pin(writer.flush_staged());
+            poll_fn(|context| match flush.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("flush unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::PrunePrefix
+        );
+        assert_eq!(pool.used_for_test(), charged);
+
+        release.send(()).unwrap();
+        writer.settle_before_stage().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        writer.finish().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"marker\nreplacement\n");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_finish_wait_settles_the_same_finish_command() {
+        let (path, file) = test_file("journal-finish-cancel-safe");
+        drop(file);
+        let GatedWriter {
+            mut writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Finish);
+        {
+            let mut wait = Box::pin(writer.finish());
+            poll_fn(|context| match wait.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("finish unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Finish
+        );
+        release.send(()).unwrap();
+        assert_eq!(writer.finish().await.unwrap().durable_offset, 0);
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_flush_keeps_the_exact_prepared_operation_until_resumed() {
+        let (path, file) = test_file("session-batch-cancel-safe");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer(&path, FlightKind::Append);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = Session::new_active_for_test(
+            "session-batch-cancel-safe",
+            CountingClock(Arc::clone(&calls)),
+            writer,
+        )
+        .unwrap();
+        let mut observer = session.attach_ui_observer_for_test(2).unwrap();
+
+        let first = session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(first.seq(), EventSeq::new(0).unwrap());
+        assert_eq!(observer.recv().await.unwrap().seq, first.seq());
+
+        {
+            let mut second = Box::pin(session.append_settled(NewEvent::log(
+                EventKind::step_start(TurnId::new(1).unwrap(), StepId::new(1).unwrap()),
+            )));
+            poll_fn(|context| match second.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("second append unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        assert_eq!(session.logical_event_count(), 1);
+        assert_eq!(session.next_seq(), EventSeq::new(1).ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(observer.try_recv().is_err());
+
+        release.send(()).unwrap();
+        session.flush_barrier().await.unwrap();
+        assert_eq!(session.logical_event_count(), 2);
+        assert_eq!(session.next_seq(), EventSeq::new(2).ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            observer.recv().await.unwrap().seq,
+            EventSeq::new(1).unwrap()
+        );
+        session.shutdown().await.unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        let second_line = bytes.split(|byte| *byte == b'\n').nth(1).unwrap();
+        let event: serde_json::Value = serde_json::from_slice(second_line).unwrap();
+        assert_eq!(event["type"], "step/start");
+        assert_eq!(event["data"]["turn"], 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resident_row_limit_is_exact_and_fails_before_clock_or_session_commit() {
+        let event = NewEvent::log(EventKind::turn_start(TurnId::new(1).unwrap()));
+        let prepared = Session::prepare_event(event.clone()).unwrap();
+        let payload_charge = prepared.original_data.resident_bytes();
+        assert!(payload_charge > 0);
+
+        let (probe_path, probe_file) = test_file("session-resident-row-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = Session::new_active_for_test(
+            "session-resident-row-probe",
+            CountingClock(Arc::clone(&probe_calls)),
+            probe_writer,
+        )
+        .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        probe.append_settled(event.clone()).await.unwrap();
+        let row_charge = probe_pool.used_for_test();
+        let exact = row_charge.checked_add(payload_charge).unwrap();
+        assert!(row_charge > 0);
+        probe.flush_barrier().await.unwrap();
+        assert_eq!(probe_pool.used_for_test(), 0);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("session-resident-row-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let exact_calls = Arc::new(AtomicUsize::new(0));
+        let mut exact_session = Session::new_active_for_test(
+            "session-resident-row-exact",
+            CountingClock(Arc::clone(&exact_calls)),
+            exact_writer,
+        )
+        .unwrap();
+        let exact_pool = exact_session.set_resident_limit_for_test(exact);
+        exact_session.append_settled(event.clone()).await.unwrap();
+        assert_eq!(exact_pool.used_for_test(), row_charge);
+        exact_session.flush_barrier().await.unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        exact_session.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+
+        let (over_path, over_file) = test_file("session-resident-row-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let over_calls = Arc::new(AtomicUsize::new(0));
+        let mut over = Session::new_active_for_test(
+            "session-resident-row-one-over",
+            CountingClock(Arc::clone(&over_calls)),
+            over_writer,
+        )
+        .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact - 1);
+        let calls_before = over_calls.load(Ordering::SeqCst);
+        let next_before = over.next_seq();
+        let error = over.append_settled(event).await.unwrap_err();
+        assert_eq!(
+            error,
+            AppendError::DurableResidentLimit { maximum: exact - 1 }
+        );
+        assert_eq!(over_calls.load(Ordering::SeqCst), calls_before);
+        assert_eq!(over.next_seq(), next_before);
+        assert_eq!(over.logical_event_count(), 0);
+        assert_eq!(over_pool.used_for_test(), 0);
+        over.shutdown().await.unwrap();
+        assert_eq!(std::fs::metadata(&over_path).unwrap().len(), 0);
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_batch_resident_one_over_rolls_back_every_candidate() {
+        let fallbacks = || {
+            [
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "first resident claim".repeat(32),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "second resident claim".repeat(32),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            ]
+        };
+
+        let (probe_path, probe_file) = test_file("claim-batch-resident-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let mut probe =
+            Session::new_active_for_test("claim-batch-resident-probe", SystemClock, probe_writer)
+                .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut probe_reservation = probe.reservation();
+        let mut claims = probe_reservation.claim_batch(fallbacks()).unwrap();
+        let exact = probe_pool.used_for_test();
+        assert!(exact > 1);
+        for claim in &mut claims {
+            probe_reservation.release(claim).unwrap();
+        }
+        assert_eq!(probe_pool.used_for_test(), 0);
+        drop(probe_reservation);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (over_path, over_file) = test_file("claim-batch-resident-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let mut over =
+            Session::new_active_for_test("claim-batch-resident-one-over", SystemClock, over_writer)
+                .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact - 1);
+        let mut reservation = over.reservation();
+        let counters_before = (
+            reservation.reserved_events,
+            reservation.reserved_retained_json_bytes,
+            reservation.reserved_row_bytes,
+            reservation.next_claim_token,
+        );
+        assert_eq!(
+            reservation.claim_batch(fallbacks()).unwrap_err(),
+            AppendError::DurableResidentLimit { maximum: exact - 1 }
+        );
+        assert_eq!(
+            (
+                reservation.reserved_events,
+                reservation.reserved_retained_json_bytes,
+                reservation.reserved_row_bytes,
+                reservation.next_claim_token,
+            ),
+            counters_before
+        );
+        assert_eq!(over_pool.used_for_test(), 0);
+        drop(reservation);
+        over.shutdown().await.unwrap();
+        assert_eq!(std::fs::metadata(&over_path).unwrap().len(), 0);
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn growing_a_claim_row_is_charged_before_an_atomic_swap() {
+        let requested_growth = 4 * 1024;
+        let fallback = || NewEvent::log(EventKind::EndSeed);
+
+        let (probe_path, probe_file) = test_file("claim-row-grow-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let mut probe =
+            Session::new_active_for_test("claim-row-grow-probe", SystemClock, probe_writer)
+                .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut probe_reservation = probe.reservation();
+        let mut probe_claim = probe_reservation
+            .claim_batch([fallback()])
+            .unwrap()
+            .remove(0);
+        let baseline = probe_pool.used_for_test();
+        let old_row = claim_row_allocation(&probe_claim);
+        let requested = probe_claim
+            .reserved_retained_json_bytes
+            .checked_add(requested_growth)
+            .unwrap();
+        probe_reservation
+            .reserve_claim_retained_json_bytes(&mut probe_claim, requested)
+            .unwrap();
+        let new_row = claim_row_allocation(&probe_claim);
+        assert_ne!(new_row.0, old_row.0);
+        assert!(new_row.1 > old_row.1);
+        let final_used = probe_pool.used_for_test();
+        assert_eq!(final_used, baseline - old_row.2 + new_row.2);
+        let exact_peak = baseline.checked_add(new_row.2).unwrap();
+        probe_reservation
+            .rebind_claim_fallback(
+                &mut probe_claim,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "the grown row survives fallback rebinding".to_owned(),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            )
+            .unwrap();
+        assert_eq!(claim_row_allocation(&probe_claim), new_row);
+        probe_reservation.release(&mut probe_claim).unwrap();
+        assert_eq!(probe_pool.used_for_test(), 0);
+        drop(probe_reservation);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("claim-row-grow-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let mut exact_session =
+            Session::new_active_for_test("claim-row-grow-exact", SystemClock, exact_writer)
+                .unwrap();
+        let exact_pool = exact_session.set_resident_limit_for_test(exact_peak);
+        let mut exact_reservation = exact_session.reservation();
+        let mut exact_claim = exact_reservation
+            .claim_batch([fallback()])
+            .unwrap()
+            .remove(0);
+        exact_reservation
+            .reserve_claim_retained_json_bytes(&mut exact_claim, requested)
+            .unwrap();
+        assert_eq!(exact_pool.used_for_test(), final_used);
+        exact_reservation.release(&mut exact_claim).unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        drop(exact_reservation);
+        exact_session.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+
+        let (over_path, over_file) = test_file("claim-row-grow-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let mut over =
+            Session::new_active_for_test("claim-row-grow-one-over", SystemClock, over_writer)
+                .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact_peak - 1);
+        let mut over_reservation = over.reservation();
+        let mut over_claim = over_reservation
+            .claim_batch([fallback()])
+            .unwrap()
+            .remove(0);
+        let row_before = claim_row_allocation(&over_claim);
+        let claim_before = (
+            over_claim.reserved_retained_json_bytes,
+            over_claim.reserved_row_bytes,
+        );
+        let reservation_before = (
+            over_reservation.reserved_retained_json_bytes,
+            over_reservation.reserved_row_bytes,
+        );
+        let used_before = over_pool.used_for_test();
+        assert_eq!(
+            over_reservation.reserve_claim_retained_json_bytes(&mut over_claim, requested),
+            Err(AppendError::DurableResidentLimit {
+                maximum: exact_peak - 1,
+            })
+        );
+        assert_eq!(claim_row_allocation(&over_claim), row_before);
+        assert_eq!(
+            (
+                over_claim.reserved_retained_json_bytes,
+                over_claim.reserved_row_bytes,
+            ),
+            claim_before
+        );
+        assert_eq!(
+            (
+                over_reservation.reserved_retained_json_bytes,
+                over_reservation.reserved_row_bytes,
+            ),
+            reservation_before
+        );
+        assert_eq!(over_pool.used_for_test(), used_before);
+        assert!(matches!(
+            &over_claim.ready_fallback().unwrap().event.kind,
+            EventKind::EndSeed
+        ));
+        over_reservation.release(&mut over_claim).unwrap();
+        assert_eq!(over_pool.used_for_test(), 0);
+        drop(over_reservation);
+        over.shutdown().await.unwrap();
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebinding_a_claim_charges_the_new_json_before_an_atomic_swap() {
+        let initial = || {
+            NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "initial fallback keeps the larger reserved row".repeat(64),
+                    status: TodoStatus::Pending,
+                }],
+            })
+        };
+        let replacement = || {
+            NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "replacement fallback owns a distinct JSON tree".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })
+        };
+        let replacement_charge = Session::prepare_event(replacement())
+            .unwrap()
+            .original_data
+            .resident_bytes();
+
+        let (probe_path, probe_file) = test_file("claim-rebind-resident-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let mut probe =
+            Session::new_active_for_test("claim-rebind-resident-probe", SystemClock, probe_writer)
+                .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut probe_reservation = probe.reservation();
+        let mut probe_claim = probe_reservation
+            .claim_batch([initial()])
+            .unwrap()
+            .remove(0);
+        let baseline = probe_pool.used_for_test();
+        let exact_peak = baseline.checked_add(replacement_charge).unwrap();
+        probe_reservation.release(&mut probe_claim).unwrap();
+        assert_eq!(probe_pool.used_for_test(), 0);
+        drop(probe_reservation);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("claim-rebind-resident-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let mut exact_session =
+            Session::new_active_for_test("claim-rebind-resident-exact", SystemClock, exact_writer)
+                .unwrap();
+        let exact_pool = exact_session.set_resident_limit_for_test(exact_peak);
+        let mut exact_reservation = exact_session.reservation();
+        let mut exact_claim = exact_reservation
+            .claim_batch([initial()])
+            .unwrap()
+            .remove(0);
+        let exact_row = claim_row_allocation(&exact_claim);
+        exact_reservation
+            .rebind_claim_fallback(&mut exact_claim, replacement())
+            .unwrap();
+        assert_eq!(claim_row_allocation(&exact_claim), exact_row);
+        let EventKind::TodoWrite { todos } = &exact_claim.ready_fallback().unwrap().event.kind
+        else {
+            panic!("the replacement todo fallback must be installed");
+        };
+        assert!(todos[0].content.starts_with("replacement fallback"));
+        exact_reservation.release(&mut exact_claim).unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        drop(exact_reservation);
+        exact_session.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+
+        let (over_path, over_file) = test_file("claim-rebind-resident-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let mut over = Session::new_active_for_test(
+            "claim-rebind-resident-one-over",
+            SystemClock,
+            over_writer,
+        )
+        .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact_peak - 1);
+        let mut over_reservation = over.reservation();
+        let mut over_claim = over_reservation.claim_batch([initial()]).unwrap().remove(0);
+        let row_before = claim_row_allocation(&over_claim);
+        let counters_before = (
+            over_claim.reserved_retained_json_bytes,
+            over_claim.reserved_row_bytes,
+            over_reservation.reserved_retained_json_bytes,
+            over_reservation.reserved_row_bytes,
+        );
+        let used_before = over_pool.used_for_test();
+        assert_eq!(
+            over_reservation.rebind_claim_fallback(&mut over_claim, replacement()),
+            Err(AppendError::DurableResidentLimit {
+                maximum: exact_peak - 1,
+            })
+        );
+        let EventKind::TodoWrite { todos } = &over_claim.ready_fallback().unwrap().event.kind
+        else {
+            panic!("the original todo fallback must survive");
+        };
+        assert!(todos[0].content.starts_with("initial fallback"));
+        assert_eq!(claim_row_allocation(&over_claim), row_before);
+        assert_eq!(
+            (
+                over_claim.reserved_retained_json_bytes,
+                over_claim.reserved_row_bytes,
+                over_reservation.reserved_retained_json_bytes,
+                over_reservation.reserved_row_bytes,
+            ),
+            counters_before
+        );
+        assert_eq!(over_pool.used_for_test(), used_before);
+        over_reservation.release(&mut over_claim).unwrap();
+        assert_eq!(over_pool.used_for_test(), 0);
+        drop(over_reservation);
+        over.shutdown().await.unwrap();
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clock_failure_releases_the_charged_row_without_hiding_batch_capacity() {
+        let (path, file) = test_file("session-resident-row-clock-failure");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-resident-row-clock-failure",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let event = NewEvent::log(EventKind::turn_start(TurnId::new(1).unwrap()));
+        let next_before = session.next_seq();
+        clock.fail_after(0);
+
+        assert!(matches!(
+            session.append_settled(event.clone()).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(session.next_seq(), next_before);
+        assert_eq!(session.logical_event_count(), 0);
+        assert_eq!(pool.used_for_test(), 0);
+
+        session.append_settled(event).await.unwrap();
+        assert!(pool.used_for_test() > 0);
+        session.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        session.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read(&path)
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+                .filter(|row| !row.is_empty())
+                .count(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clock_rejection_restores_the_exact_claim_payload_without_copying_it() {
+        let (path, file) = test_file("session-claim-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session =
+            Session::new_active_for_test("session-claim-clock-rejection", clock.clone(), writer)
+                .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "clock rejection keeps this allocation".repeat(64),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let (before_pointer, before_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a new claim must own its fallback")
+                .event
+                .kind,
+        );
+        let row_before = claim_row_allocation(&claim);
+        let next_before = reservation.session().next_seq();
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(reservation.session().next_seq(), next_before);
+        assert!(!reservation.session.has_pending_durable_operation());
+        let (after_pointer, after_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a rejected operation must return the fallback")
+                .event
+                .kind,
+        );
+        assert_eq!(
+            (after_pointer, after_capacity),
+            (before_pointer, before_capacity)
+        );
+        assert_eq!(claim_row_allocation(&claim), row_before);
+
+        reservation.settle_exact_settled(&mut claim).await.unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_preferred_claim_keeps_its_exact_fallback_available() {
+        let (path, file) = test_file("session-preferred-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-preferred-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "fallback survives".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        clock.fail_after(0);
+        let preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "preferred is rejected by the clock".repeat(8),
+                status: TodoStatus::InProgress,
+            }],
+        });
+
+        let rejected = reservation.settle_settled(&mut claim, preferred).await;
+        assert!(
+            matches!(rejected, Err(AppendError::Clock(_))),
+            "unexpected preferred rejection: {rejected:?}"
+        );
+        let receipt = reservation.settle_exact_settled(&mut claim).await.unwrap();
+        assert_eq!(receipt.event_type(), "todo/write");
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        let rows = std::fs::read(&path).unwrap();
+        let todo = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .find(|row| row["type"] == "todo/write")
+            .expect("the restored fallback must be durable");
+        assert_eq!(todo["data"]["todos"][0]["content"], "fallback survives");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clock_rejection_restores_a_fallback_selected_by_durable_room() {
+        let (path, file) = test_file("session-selected-fallback-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-selected-fallback-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let fallback = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "selected fallback".to_owned(),
+                status: TodoStatus::Pending,
+            }],
+        });
+        let fallback_row =
+            Session::durable_row_upper_bound(&Session::prepare_event(fallback.clone()).unwrap())
+                .unwrap();
+        let turn_end = NewEvent::log(EventKind::turn_end(turn, TurnEndReason::Completed));
+        let turn_end_row =
+            Session::durable_row_upper_bound(&Session::prepare_event(turn_end.clone()).unwrap())
+                .unwrap();
+        session.set_durable_byte_room_for_test(fallback_row + turn_end_row);
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation.claim_batch([fallback]).unwrap().remove(0);
+        let preferred = || {
+            NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "preferred cannot fit".repeat(4_096),
+                    status: TodoStatus::InProgress,
+                }],
+            })
+        };
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation.settle_settled(&mut claim, preferred()).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert!(matches!(
+            reservation.settle_settled(&mut claim, preferred()).await,
+            Ok(ClaimedAppend::Fallback(_))
+        ));
+        reservation.append_settled(turn_end).await.unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_preferred_uses_precharged_fallback_when_resident_pool_is_full() {
+        let (path, file) = test_file("session-preferred-resident-fallback");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = Session::new_active_for_test(
+            "session-preferred-resident-fallback",
+            CountingClock(Arc::clone(&calls)),
+            writer,
+        )
+        .unwrap();
+        let resident_limit = 1024 * 1024;
+        let pool = session.set_resident_limit_for_test(resident_limit);
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "precharged resident fallback".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let used = pool.used_for_test();
+        assert!(used < resident_limit);
+        let filler = pool.try_acquire(resident_limit - used).unwrap();
+        assert_eq!(pool.used_for_test(), resident_limit);
+        let calls_before = calls.load(Ordering::SeqCst);
+
+        let settlement = reservation
+            .settle_settled(
+                &mut claim,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "preferred needs fresh resident credit".to_owned(),
+                        status: TodoStatus::InProgress,
+                    }],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(settlement, ClaimedAppend::Fallback(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), calls_before + 1);
+
+        drop(filler);
+        reservation.flush_barrier().await.unwrap();
+
+        let mut row_limited_claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "fallback when only the payload fits".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let row_limited_preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "preferred payload fits but its row does not".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        });
+        let preferred_charge = Session::prepare_event(row_limited_preferred.clone())
+            .unwrap()
+            .original_data
+            .resident_bytes();
+        let used = pool.used_for_test();
+        assert!(used + preferred_charge < resident_limit);
+        let row_filler = pool
+            .try_acquire(resident_limit - used - preferred_charge)
+            .unwrap();
+        assert_eq!(pool.used_for_test() + preferred_charge, resident_limit);
+        let calls_before = calls.load(Ordering::SeqCst);
+
+        let settlement = reservation
+            .settle_settled(&mut row_limited_claim, row_limited_preferred)
+            .await
+            .unwrap();
+        assert!(matches!(settlement, ClaimedAppend::Fallback(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), calls_before + 1);
+
+        drop(row_filler);
+        reservation.flush_barrier().await.unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        let rows = std::fs::read(&path).unwrap();
+        let todos = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .filter(|row| row["type"] == "todo/write")
+            .map(|row| row["data"]["todos"][0]["content"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            todos,
+            vec![
+                serde_json::Value::String("precharged resident fallback".to_owned()),
+                serde_json::Value::String("fallback when only the payload fits".to_owned()),
+            ]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_preferred_only_candidate_remains_session_owned() {
+        let (path, file) = test_file("session-preferred-only-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-preferred-only-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "preferred-only fallback".repeat(16),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        clock.fail_after(0);
+        let preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "preferred-only candidate".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        });
+
+        assert!(matches!(
+            reservation
+                .settle_preferred_only_settled(&mut claim, preferred)
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::InvalidClaim)
+        );
+        reservation
+            .resume_preferred_only_settled(&mut claim)
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        let rows = std::fs::read(&path).unwrap();
+        let todo = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .find(|row| row["type"] == "todo/write")
+            .expect("the exact preferred-only candidate must be durable");
+        assert_eq!(
+            todo["data"]["todos"][0]["content"],
+            "preferred-only candidate"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preferred_only_reuses_its_claim_row_when_the_pool_is_full() {
+        let (path, file) = test_file("session-preferred-only-reserved-row");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-preferred-only-reserved-row",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let resident_limit = 1024 * 1024;
+        let pool = session.set_resident_limit_for_test(resident_limit);
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "fallback row is deliberately larger than the truth".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let row_before = claim_row_allocation(&claim);
+        let preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "truthful preferred-only result".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        });
+        let preferred_charge = Session::prepare_event(preferred.clone())
+            .unwrap()
+            .original_data
+            .resident_bytes();
+        let used = pool.used_for_test();
+        let filler = pool
+            .try_acquire(resident_limit - used - preferred_charge)
+            .unwrap();
+        assert_eq!(pool.used_for_test() + preferred_charge, resident_limit);
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation
+                .settle_preferred_only_settled(&mut claim, preferred)
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        let SessionMode::Durable {
+            pending_operation: Some(operation),
+            ..
+        } = &reservation.session.mode
+        else {
+            panic!("the truthful preferred-only candidate must remain Session-owned");
+        };
+        assert_eq!(
+            operation
+                .reserved_row
+                .as_ref()
+                .expect("the exact result must own the reserved row")
+                .allocation_for_test(),
+            row_before
+        );
+        reservation
+            .resume_preferred_only_settled(&mut claim)
+            .await
+            .unwrap();
+        drop(filler);
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        let rows = std::fs::read(&path).unwrap();
+        let todo = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .find(|row| row["type"] == "todo/write")
+            .expect("the truthful preferred-only result must be durable");
+        assert_eq!(
+            todo["data"]["todos"][0]["content"],
+            "truthful preferred-only result"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_writer_returns_the_session_owned_fallback_to_its_claim() {
+        let (path, file) = test_file("session-claim-poison-restore");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer(&path, FlightKind::Append);
+        let mut session =
+            Session::new_active_for_test("session-claim-poison-restore", SystemClock, writer)
+                .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "the poisoned writer must not trap this fallback".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let (before_pointer, before_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a new claim must own its fallback")
+                .event
+                .kind,
+        );
+        {
+            let mut settlement = Box::pin(reservation.settle_exact_settled(&mut claim));
+            poll_fn(|context| match settlement.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("claim unexpectedly settled: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        reservation.session.latch_durable_corruption();
+        release.send(()).unwrap();
+
+        assert_eq!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::DurablePoisoned)
+        );
+        assert!(!reservation.session.has_pending_durable_operation());
+        let (after_pointer, after_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a rejected poisoned operation must restore its fallback")
+                .event
+                .kind,
+        );
+        assert_eq!(
+            (after_pointer, after_capacity),
+            (before_pointer, before_capacity)
+        );
+
+        drop(reservation);
+        assert!(session.shutdown().await.is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clock_panic_becomes_a_rejection_and_restores_the_exact_claim() {
+        let (path, file) = test_file("session-claim-clock-panic");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = PanicOnceClock::new();
+        let mut session =
+            Session::new_active_for_test("session-claim-clock-panic", clock.clone(), writer)
+                .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "panic-safe fallback".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        clock.panic_after(0);
+
+        assert!(matches!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert!(!reservation.session.has_pending_durable_operation());
+        reservation.settle_exact_settled(&mut claim).await.unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_claim_clock_rejection_keeps_both_owners_retryable() {
+        let (path, file) = test_file("attempt-claim-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session =
+            Session::new_active_for_test("attempt-claim-clock-rejection", clock.clone(), writer)
+                .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let empty_surface_charge =
+            Message::assistant("assistant", Vec::new(), "mock", "mock-model")
+                .unwrap()
+                .surface_credit_bytes();
+        let surface_pool = session
+            .set_surface_resident_limits_for_test(empty_surface_charge, empty_surface_charge);
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let mut claim = reservation.claim_batch([closure]).unwrap().remove(0);
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation
+                .settle_attempt_closure_exact_settled(
+                    &mut claim,
+                    &token,
+                    AttemptDisposition::Committed,
+                )
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(surface_pool.used_for_test(), empty_surface_charge);
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+        assert!(reservation.retire_attempt(&token).is_err());
+        let receipt = reservation
+            .settle_attempt_closure_exact_settled(&mut claim, &token, AttemptDisposition::Committed)
+            .await
+            .unwrap();
+        assert_eq!(surface_pool.used_for_test(), empty_surface_charge);
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+        drop(receipt);
+        assert_eq!(surface_pool.used_for_test(), 0);
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_claim_settlement_resumes_the_same_candidate_once() {
+        let (path, file) = test_file("session-claim-cancel-safe");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Append);
+        let mut session =
+            Session::new_active_for_test("session-claim-cancel-safe", SystemClock, writer).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claims = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "the exact fallback allocation must move into Session".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap();
+        let mut claim = claims.remove(0);
+        let (fallback_pointer, fallback_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a new claim must own its fallback")
+                .event
+                .kind,
+        );
+        {
+            let mut settlement = Box::pin(reservation.settle_exact_settled(&mut claim));
+            poll_fn(|context| match settlement.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("claim unexpectedly settled: {result:?}"),
+            })
+            .await;
+        }
+        let SessionMode::Durable {
+            pending_operation: Some(operation),
+            ..
+        } = &reservation.session.mode
+        else {
+            panic!("the cancelled settlement must remain Session-owned");
+        };
+        let (pending_pointer, pending_capacity) =
+            todo_content_allocation(&operation.prepared.event.kind);
+        assert_eq!(pending_pointer, fallback_pointer);
+        assert_eq!(pending_capacity, fallback_capacity);
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        assert_eq!(
+            reservation.release(&mut claim),
+            Err(crate::session::AppendError::NeedsAppendSettle)
+        );
+        assert_eq!(
+            reservation.rebind_claim_fallback(
+                &mut claim,
+                NewEvent::log(EventKind::step_start(
+                    TurnId::new(1).unwrap(),
+                    StepId::new(1).unwrap(),
+                )),
+            ),
+            Err(crate::session::AppendError::NeedsAppendSettle)
+        );
+        let larger_reservation = claim.reserved_retained_json_bytes + 1;
+        assert_eq!(
+            reservation.reserve_claim_retained_json_bytes(&mut claim, larger_reservation),
+            Err(crate::session::AppendError::NeedsAppendSettle)
+        );
+
+        release.send(()).unwrap();
+        let receipt = reservation.settle_exact_settled(&mut claim).await.unwrap();
+        assert_eq!(receipt.seq(), EventSeq::new(1).unwrap());
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        assert_eq!(counts.append.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_a_session_owned_claim_after_the_caller_is_dropped() {
+        let (path, file) = test_file("session-claim-shutdown-owner");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Append);
+        let mut session =
+            Session::new_active_for_test("session-claim-shutdown-owner", SystemClock, writer)
+                .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+
+        {
+            let mut reservation = session.reservation();
+            let mut claim = reservation
+                .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "Session remains the only owner".repeat(32),
+                        status: TodoStatus::Pending,
+                    }],
+                })])
+                .unwrap()
+                .remove(0);
+            let mut settlement = Box::pin(reservation.settle_exact_settled(&mut claim));
+            poll_fn(|context| match settlement.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("claim unexpectedly settled: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        session.shutdown().await.unwrap();
+
+        assert_eq!(counts.append.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        let rows = std::fs::read_to_string(&path).unwrap();
+        assert!(rows.contains("Session remains the only owner"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn todo_content_allocation(kind: &EventKind) -> (*const u8, usize) {
+        let EventKind::TodoWrite { todos } = kind else {
+            panic!("test event must be todo/write");
+        };
+        let content = &todos.first().expect("test todo must exist").content;
+        (content.as_ptr(), content.capacity())
+    }
+
+    fn claim_row_allocation(claim: &EventClaim) -> (*const u8, usize, usize) {
+        claim
+            .ready_fallback_bundle()
+            .expect("the claim must own its ready fallback")
+            .reserved_row
+            .as_ref()
+            .expect("a durable claim must own its empty reserved row")
+            .allocation_for_test()
+    }
+
+    #[tokio::test]
+    async fn durable_settlement_uses_unclaimed_global_space_for_a_preferred_result() {
+        let (path, file) = test_file("session-preferred-global-space");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let mut session =
+            Session::new_active_for_test("session-preferred-global-space", SystemClock, writer)
+                .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+        let mut reservation = session.reservation();
+        let mut claims = reservation
+            .claim_batch([NewEvent::log(EventKind::EndSeed)])
+            .unwrap();
+        let mut claim = claims.remove(0);
+        let preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "preferred result is larger than its tiny fallback".repeat(32),
+                status: TodoStatus::Pending,
+            }],
+        });
+
+        let settlement = reservation
+            .settle_settled(&mut claim, preferred)
+            .await
+            .unwrap();
+        assert!(matches!(settlement, ClaimedAppend::Preferred(_)));
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let event: serde_json::Value = serde_json::from_slice(
+            bytes
+                .split(|byte| *byte == b'\n')
+                .nth(1)
+                .expect("the preferred event should be written"),
+        )
+        .unwrap();
+        assert_eq!(event["type"], "todo/write");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn barrier_reports_a_sticky_observer_fault_after_the_event_is_durable() {
+        let (path, file) = test_file("session-observer-barrier");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let mut session =
+            Session::new_active_for_test("session-observer-barrier", SystemClock, writer).unwrap();
+        let observer = session.attach_ui_observer_for_test(1).unwrap();
+        observer.fail_next_projection_for_test();
+
+        let receipt = session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+        assert!(receipt.observer_faulted());
+        assert_eq!(
+            session.flush_barrier().await,
+            Err(BarrierError::ObserverUnavailable)
+        );
+        session.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read(&path)
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_barrier_wait_settles_the_same_barrier_command() {
+        let (path, file) = test_file("journal-barrier-cancel-safe");
+        drop(file);
+        let GatedWriter {
+            mut writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Barrier);
+        writer.stage_bytes_for_test(b"fact\n".to_vec()).unwrap();
+        assert_eq!(writer.flush_staged().await.unwrap().durable_offset, 0);
+        {
+            let mut barrier = Box::pin(writer.barrier());
+            poll_fn(|context| match barrier.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("barrier unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Barrier
+        );
+        release.send(()).unwrap();
+        assert_eq!(writer.barrier().await.unwrap().durable_offset, 5);
+        assert_eq!(counts.barrier.load(Ordering::SeqCst), 1);
+        writer.finish().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_session_finish_stays_owned_and_is_sent_once() {
+        let (path, file) = test_file("session-finish-cancel-safe");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Finish);
+        let mut session =
+            Session::new_active_for_test("session-finish-cancel-safe", SystemClock, writer)
+                .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        {
+            let mut shutdown = Box::pin(session.shutdown());
+            poll_fn(|context| match shutdown.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("shutdown unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Finish
+        );
+        release.send(()).unwrap();
+        session.shutdown().await.unwrap();
+
+        assert_eq!(counts.append.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(&path)
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_barrier_cannot_reopen_a_cancelled_session_finish() {
+        let (path, file) = test_file("session-finish-barrier-order");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Finish);
+        let mut session =
+            Session::new_active_for_test("session-finish-barrier-order", SystemClock, writer)
+                .unwrap();
+
+        {
+            let mut shutdown = Box::pin(session.shutdown());
+            poll_fn(|context| match shutdown.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("shutdown unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Finish
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            session.flush_barrier().await,
+            Err(BarrierError::Storage(
+                crate::session::StoreError::WriterStopped
+            ))
+        );
+        session.shutdown().await.unwrap();
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_an_abandoned_invalid_append_after_joining() {
+        let (path, file) = test_file("session-invalid-pending-shutdown");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Append);
+        let mut session =
+            Session::new_active_for_test("session-invalid-pending-shutdown", SystemClock, writer)
+                .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+
+        {
+            let mut invalid = Box::pin(session.append_settled(NewEvent::log(EventKind::turn_end(
+                TurnId::new(2).unwrap(),
+                TurnEndReason::Completed,
+            ))));
+            poll_fn(|context| match invalid.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("invalid append unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        let error = session.shutdown().await.unwrap_err();
+        assert!(matches!(
+            error,
+            crate::session::SessionIoError::Append(crate::session::AppendError::Validation(_))
+        ));
+        assert_eq!(counts.append.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(&path)
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_barrier_retains_the_first_pending_append_error() {
+        let (path, file) = test_file("session-barrier-error-cancel-safe");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Barrier);
+        let mut session =
+            Session::new_active_for_test("session-barrier-error-cancel-safe", SystemClock, writer)
+                .unwrap();
+        let invalid = Session::prepare_event(NewEvent::log(EventKind::turn_end(
+            TurnId::new(1).unwrap(),
+            TurnEndReason::Completed,
+        )))
+        .unwrap();
+        let SessionMode::Durable {
+            pending_operation, ..
+        } = &mut session.mode
+        else {
+            panic!("test session must be durable");
+        };
+        *pending_operation = Some(crate::session::PendingDurableOperation {
+            prepared: invalid,
+            reserved_row: None,
+            protected_events: 0,
+            protected_row_bytes: 0,
+            owner: crate::session::DurableOperationOwner::Ordinary,
+        });
+
+        {
+            let mut barrier = Box::pin(session.flush_barrier());
+            poll_fn(|context| match barrier.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("barrier unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Barrier
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            session.flush_barrier().await,
+            Err(BarrierError::Append(
+                crate::session::AppendError::Validation(_)
+            ))
+        ));
+        assert_eq!(counts.barrier.load(Ordering::SeqCst), 1);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    struct GatedWriter {
+        writer: JournalWriter,
+        arrived: mpsc::Receiver<FlightKind>,
+        release: mpsc::Sender<()>,
+        counts: Arc<CommandCounts>,
+    }
+
+    #[derive(Default)]
+    struct CommandCounts {
+        append: AtomicUsize,
+        prune_prefix: AtomicUsize,
+        barrier: AtomicUsize,
+        finish: AtomicUsize,
+    }
+
+    struct CompletedCommand {
+        kind: FlightKind,
+        result: Result<JournalCursor, JournalError>,
+        ack: oneshot::Sender<Result<JournalCursor, JournalError>>,
+        finish: bool,
+    }
+
+    impl CommandCounts {
+        fn increment(&self, kind: FlightKind) {
+            match kind {
+                FlightKind::Append => &self.append,
+                FlightKind::PrunePrefix => &self.prune_prefix,
+                FlightKind::Barrier => &self.barrier,
+                FlightKind::Finish => &self.finish,
+            }
+            .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn gated_writer(path: &PathBuf, target: FlightKind) -> GatedWriter {
+        gated_writer_at(path, target, 0)
+    }
+
+    fn gated_writer_at(path: &PathBuf, target: FlightKind, offset: u64) -> GatedWriter {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let (sender, mut receiver) = tokio_mpsc::channel(COMMAND_CAPACITY);
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let counts = Arc::new(CommandCounts::default());
+        let worker_counts = Arc::clone(&counts);
+        let join = thread::spawn(move || {
+            let mut cursor = JournalCursor {
+                physical_offset: offset,
+                durable_offset: offset,
+            };
+            let mut gated = false;
+            while let Some(command) = receiver.blocking_recv() {
+                let completed = match command {
+                    Command::Append { bytes, ack } => CompletedCommand {
+                        kind: FlightKind::Append,
+                        result: append_bytes(&mut file, &mut cursor, &bytes),
+                        ack,
+                        finish: false,
+                    },
+                    Command::AppendPrunePrefix { bytes, rows, ack } => CompletedCommand {
+                        kind: FlightKind::PrunePrefix,
+                        result: if valid_prune_prefix(&bytes, rows) {
+                            append_bytes(&mut file, &mut cursor, &bytes)
+                        } else {
+                            Err(JournalError::Poisoned)
+                        },
+                        ack,
+                        finish: false,
+                    },
+                    Command::Barrier { ack } => CompletedCommand {
+                        kind: FlightKind::Barrier,
+                        result: barrier_file(&mut file, &mut cursor),
+                        ack,
+                        finish: false,
+                    },
+                    Command::ReadRow {
+                        locator,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(read_row(&file, cursor, locator, &cancellation));
+                        continue;
+                    }
+                    Command::ExportRaw {
+                        destination,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
+                        continue;
+                    }
+                    Command::InspectFork {
+                        anchor,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            inspect_fork(&file, cursor, anchor, &cancellation)
+                                .map(ForkFlightResult::Boundary),
+                        );
+                        continue;
+                    }
+                    Command::CopyFork {
+                        boundary,
+                        destination,
+                        header_line,
+                        suffix,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            copy_fork(
+                                &file,
+                                cursor,
+                                boundary,
+                                destination,
+                                &header_line,
+                                &suffix,
+                                &cancellation,
+                            )
+                            .map(ForkFlightResult::Copied),
+                        );
+                        continue;
+                    }
+                    Command::Finish { ack } => CompletedCommand {
+                        kind: FlightKind::Finish,
+                        result: barrier_file(&mut file, &mut cursor),
+                        ack,
+                        finish: true,
+                    },
+                };
+                worker_counts.increment(completed.kind);
+                if !gated && completed.kind == target {
+                    arrived_tx.send(completed.kind).unwrap();
+                    if release_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                        return;
+                    }
+                    gated = true;
+                }
+                let _ = completed.ack.send(completed.result);
+                if completed.finish {
+                    return;
+                }
+            }
+        });
+        GatedWriter {
+            writer: JournalWriter::from_running(
+                sender,
+                join,
+                JournalCursor {
+                    physical_offset: offset,
+                    durable_offset: offset,
+                },
+            ),
+            arrived: arrived_rx,
+            release: release_tx,
+            counts,
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingClock(Arc<AtomicUsize>);
+
+    impl Clock for CountingClock {
+        fn now(&self) -> Result<UnixMillis, ClockError> {
+            let next = self.0.fetch_add(1, Ordering::SeqCst);
+            UnixMillis::new(i64::try_from(next).unwrap()).map_err(|_| ClockError::new("clock"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingClock {
+        calls: Arc<AtomicUsize>,
+        fail_at: Arc<AtomicUsize>,
+    }
+
+    impl FailingClock {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail_at: Arc::new(AtomicUsize::new(usize::MAX)),
+            }
+        }
+
+        fn fail_after(&self, successful_calls: usize) {
+            self.fail_at.store(
+                self.calls.load(Ordering::SeqCst) + successful_calls,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    impl Clock for FailingClock {
+        fn now(&self) -> Result<UnixMillis, ClockError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == self.fail_at.load(Ordering::SeqCst) {
+                return Err(ClockError::new("injected clock failure"));
+            }
+            UnixMillis::new(i64::try_from(call).unwrap()).map_err(|_| ClockError::new("clock"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicOnceClock {
+        calls: Arc<AtomicUsize>,
+        panic_at: Arc<AtomicUsize>,
+    }
+
+    impl PanicOnceClock {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                panic_at: Arc::new(AtomicUsize::new(usize::MAX)),
+            }
+        }
+
+        fn panic_after(&self, successful_calls: usize) {
+            self.panic_at.store(
+                self.calls.load(Ordering::SeqCst) + successful_calls,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    impl Clock for PanicOnceClock {
+        fn now(&self) -> Result<UnixMillis, ClockError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(
+                call,
+                self.panic_at.load(Ordering::SeqCst),
+                "injected clock panic"
+            );
+            UnixMillis::new(i64::try_from(call).unwrap()).map_err(|_| ClockError::new("clock"))
+        }
+    }
+
+    async fn attempt_ready_session(id: &str, writer: JournalWriter) -> (Session, TurnId, StepId) {
+        attempt_ready_session_with_clock(id, SystemClock, writer).await
+    }
+
+    async fn attempt_ready_session_with_clock(
+        id: &str,
+        clock: impl Clock + 'static,
+        writer: JournalWriter,
+    ) -> (Session, TurnId, StepId) {
+        let mut session = Session::new_active_for_test(id, clock, writer).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+        (session, turn, step)
+    }
+
+    fn finish_only_assistant(turn: TurnId, step: StepId, prepared: PreparedAttempt) -> NewEvent {
+        let parts = prepared.into_parts();
+        assert_eq!(parts.finish, FinishReason::stop().unwrap());
+        assert!(parts.replay_state.is_none());
+        let message = Message::assistant("assistant", parts.content, "mock", "mock-model").unwrap();
+        NewEvent::surface(
+            EventKind::AssistantMessage {
+                turn,
+                step,
+                message,
+                usage: parts.usage,
+            },
+            SurfaceIntent::append().with_sources(parts.sources),
+        )
+    }
+
+    async fn commit_empty_attempt(
+        reservation: &mut SessionReservation<'_>,
+        turn: TurnId,
+        step: StepId,
+        usage: Option<TokenUsage>,
+    ) {
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        if let Some(usage) = usage {
+            reservation
+                .append_attempt_chunk_settled(&token, StreamChunk::usage(usage).unwrap())
+                .await
+                .unwrap();
+        }
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        drop(receipt);
+    }
+
+    async fn prunable_session(
+        id: &str,
+        clock: impl Clock + 'static,
+        writer: JournalWriter,
+    ) -> (Session, EventSeq) {
+        let (session, mut results) =
+            prunable_session_with_text_lengths(id, clock, writer, &[51]).await;
+        (session, results.remove(0))
+    }
+
+    async fn prunable_session_with_text_lengths(
+        id: &str,
+        clock: impl Clock + 'static,
+        writer: JournalWriter,
+        text_lengths: &[usize],
+    ) -> (Session, Vec<EventSeq>) {
+        let mut session = Session::new_active_for_test(id, clock, writer).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+        let calls = text_lengths
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                ContentBlock::tool_call(format!("call-{}", index + 1), "read", "{}").unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for (index, call) in calls.iter().cloned().enumerate() {
+            let index = u64::try_from(index).unwrap();
+            reservation
+                .append_attempt_chunk_settled(
+                    &token,
+                    StreamChunk::block_start(index, ContentBlockType::ToolCall).unwrap(),
+                )
+                .await
+                .unwrap();
+            reservation
+                .append_attempt_chunk_settled(&token, StreamChunk::block_end(index, call).unwrap())
+                .await
+                .unwrap();
+        }
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let parts = prepared.into_parts();
+        assert_eq!(parts.finish, FinishReason::tool_calls().unwrap());
+        assert!(parts.replay_state.is_none());
+        let assistant =
+            Message::assistant("assistant-1", parts.content, "mock", "mock-model").unwrap();
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::surface(
+                    EventKind::AssistantMessage {
+                        turn,
+                        step,
+                        message: assistant,
+                        usage: parts.usage,
+                    },
+                    SurfaceIntent::append().with_sources(parts.sources),
+                ),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        let mut results = Vec::with_capacity(text_lengths.len());
+        for (index, text_length) in text_lengths.iter().copied().enumerate() {
+            let call_id = format!("call-{}", index + 1);
+            let call = reservation
+                .append_settled(NewEvent::log(EventKind::tool_call(
+                    turn,
+                    step,
+                    call_id.clone(),
+                    "read",
+                    "{}",
+                )))
+                .await
+                .unwrap();
+            let result = Message::tool_result(
+                format!("result-{}", index + 1),
+                call_id,
+                vec![ContentBlock::text("x".repeat(text_length)).unwrap()],
+                false,
+            )
+            .unwrap();
+            let result = reservation
+                .append_settled(NewEvent::surface(
+                    EventKind::tool_result(turn, step, result),
+                    SurfaceIntent::append().with_sources(vec![call.seq()]),
+                ))
+                .await
+                .unwrap();
+            results.push(result.seq());
+        }
+        drop(reservation);
+        (session, results)
+    }
+
+    fn test_file(label: &str) -> (PathBuf, std::fs::File) {
+        let path = std::env::temp_dir().join(format!("dsh-{label}-{}", uuid::Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        (path, file)
+    }
+}

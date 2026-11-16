@@ -1,0 +1,8 @@
+[package]
+name = "slowcode-cognition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Plan phases and cognitive task allocation for slowcode"
+license = "MIT"
+publish = false

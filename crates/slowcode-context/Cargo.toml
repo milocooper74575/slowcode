@@ -1,0 +1,15 @@
+[package]
+name = "slowcode-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Project context loading for slowcode"
+license = "MIT"
+publish = false
+
+[lib]
+name = "slowcode_context"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2.0"

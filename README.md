@@ -1,0 +1,212 @@
+# slowcode
+
+Rust 写的认知协作式 coding agent。
+
+> 人创造未知，AI 实现已知。
+
+slowcode 不是让 AI 多写代码。它在关键节点停下来，把创造空间留给人类：先拆认知任务，再区分已知域、半已知域与未知域，跳过需要人判断的部分，只实现已经讲清楚的部分。
+
+![status](https://img.shields.io/badge/status-early%20preview-orange)
+
+## 它能做什么
+
+- **Plan workflow**：`/plan` 生成认知任务分配表，逐题访谈，`/approve` 后按分类进入脚手架或测试修复，最后用 `/distill` 做 Teach-back 与理解漏洞报告。
+- **阶段门禁**：未批准不能 scaffold，未实现核心不能继续，测试未绿不能 distill，预算耗尽进入可恢复的 Blocked。
+- **角色切换**：navigator 只读，driver 读写并运行 shell，同一会话内按阶段或用户命令切换。
+- **TUI**：流式文本与推理，工具卡片，内联审批与补全，鼠标选区复制，上下文占比，`/session switch`，`/quit` handoff。
+- **会话持久化**：JSONL 会话，session id 即 traceId，支持 `--resume`。
+- **MCP**：用户级与项目级配置合并，stdio 与 Streamable HTTP，项目级 server 默认 dormant，工具按风险分级审批。
+- **Skills**：本地 skill 安装、校验、锁文件、`--name` 改名与 `--dry-run` 预览。
+- **Plan artifact 与审计**：workflow 事件、run journal、审批记录与模型调用归档。
+
+## 快速开始
+
+### 安装预编译包
+
+macOS 与 Linux 用户不需要安装 Rust。下载 GitHub Release 中的
+`slowcode-<target>.tar.gz`，或使用安装脚本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/milocooper74575/slowcode/main/install.sh -o install.sh
+sh install.sh
+
+# 固定版本
+SLOWCODE_VERSION=v0.1.0 sh install.sh
+
+# 自定义安装目录，默认 ~/.local/bin
+SLOWCODE_INSTALL_DIR="$HOME/bin" sh install.sh
+```
+
+脚本会校验 sha256，然后安装 `slowcode` 并打印版本。支持：
+
+- macOS Apple Silicon：`aarch64-apple-darwin`
+- macOS Intel：`x86_64-apple-darwin`
+- Linux x86_64：`x86_64-unknown-linux-musl`
+- Linux aarch64：`aarch64-unknown-linux-musl`
+
+fork 或镜像可以用 `SLOWCODE_REPO=owner/slowcode` 覆盖仓库。
+
+Windows 原生包暂未提供。
+
+macOS 预编译包当前未做 Apple 签名与 notarization。如果 Gatekeeper 拦截，
+可以在系统设置中允许，或改为从源码构建。签名会在拿到证书后补上。
+
+### 从源码构建
+
+从源码构建需要 Rust 1.88 或更高。
+
+```bash
+git clone <your-repo-url>
+cd slowcode
+
+cp .env.example .env
+# 在 .env 中填写 DEEPSEEK_API_KEY
+
+cargo build --release -p slowcode-cli
+./target/release/slowcode --workspace /path/to/project
+```
+
+没有参数、只有 flag 或使用 `tui` 子命令都会进入 TUI。
+
+也可以直接从环境变量读取 key：
+
+```bash
+export DEEPSEEK_API_KEY=...
+```
+
+默认模型是 `deepseek-flash`，可用 `--model` 覆盖。`--max-tokens` 与 `--context-window` 可覆盖限制。
+
+## 使用方式
+
+```bash
+# TUI
+cargo run -p slowcode-cli -- --workspace <dir>
+
+# headless 单次任务
+cargo run -p slowcode-cli -- run --workspace <dir> "任务"
+
+# 简单 REPL
+cargo run -p slowcode-cli -- repl --workspace <dir>
+
+# 写文件与 shell 前审批
+cargo run -p slowcode-cli -- --ask --workspace <dir>
+
+# 只读
+cargo run -p slowcode-cli -- --read-only --workspace <dir> "只读任务"
+
+# 新建会话并打印 session id
+cargo run -p slowcode-cli -- run --workspace <dir> --session new "任务"
+
+# 恢复同一会话
+cargo run -p slowcode-cli -- run --workspace <dir> --session <id> --resume "继续"
+```
+
+`--ask` 需要可交互终端。非 TTY 环境会以 `approval_required` 退出，而不是静默放行。
+
+## Plan workflow
+
+```text
+/plan <task>
+  -> Interview：逐个回答半已知域与未知域问题
+  -> /approve：批准分类，绑定任务表 hash
+  -> /scaffold：生成框架、契约测试与 TODO(user) 核心区
+  -> 用户实现核心
+  -> /continue：检查标记、文件 hash 与契约翻绿
+  -> /test 或 /fix 或 /execute：固定测试命令，只修已知域失败
+  -> /distill <explanation>：输出理解漏洞报告
+  -> /answer：回答追问或接受剩余缺口，进入 Done
+```
+
+常用命令：
+
+| 命令 | 作用 |
+|---|---|
+| `/plan <task>` | 创建 workflow，生成任务表与问题队列 |
+| `/next` / `/status` | 查看下一个问题或当前阶段 |
+| `/answer [<text>]` | 回答当前问题，支持 `#id` 与 `@file` |
+| `/reclassify <text>` | 主动提出新的未知域 |
+| `/approve` | 批准当前分类表 |
+| `/scaffold` | 生成脚手架与测试契约 |
+| `/continue` | 用户声明核心已完成，触发检查 |
+| `/test` / `/fix` / `/execute` | 运行固定测试，修复已知域失败 |
+| `/distill <explanation>` | Teach-back 与理解漏洞报告 |
+| `/workflow [list\|use <id>\|end]` | 管理 workspace 内的 workflow |
+
+workflow 状态写在目标 workspace 的 `.scratch/workflows/<workflow_id>/`，计划 artifact 写在 `.scratch/plans/`。artifact 是人读视图，`state.json` 加 `events.jsonl` 才是事实源。
+
+## 角色与安全
+
+- navigator 只读，driver 可写。
+- MCP 项目级 server 默认 dormant，`/mcp enable` 激活并按配置指纹缓存信任。
+- MCP 工具按风险分级。只读注解与用户级 `trusted` 自动放行，其余本会话首次调用询问。
+- 密钥从 `.env` 或环境变量读取。`.env`、本地 session、`.scratch/` 与反馈包都不应提交。
+- 反馈包可能包含对话内容，发布前需要人工检查。
+
+## 项目结构
+
+| 路径 | 内容 |
+|---|---|
+| `crates/slowcode-kernel` | vendored 的 dsh-rs 非 UI 内核，上游信息见 `UPSTREAM.md` |
+| `crates/slowcode-roles` | navigator / driver 装配、Cordis fiber、会话续接与 cache 报告 |
+| `crates/slowcode-runtime` | run 状态、转移表、预算、审批与模型调用归档 |
+| `crates/slowcode-cognition` | Plan 输出校验、认知任务分配表与 artifact 渲染 |
+| `crates/slowcode-app` | 会话装配、命令注册表、Plan workflow 与模型切换 |
+| `crates/slowcode-cli` | CLI 入口，二进制 `slowcode` |
+| `crates/slowcode-tui` | ratatui TUI |
+| `crates/slowcode-context` | AGENTS.md、GLOSSARY.md 与 HANDOFF.md 指针 |
+| `crates/slowcode-mcp` | MCP 配置、连接与工具调用 |
+| `crates/slowcode-skills` | 本地 skill 安装、校验与锁文件 |
+| `crates/slowcode-tests` | 跨 crate 集成测试 |
+
+## 开发与测试
+
+```bash
+cargo fmt --all -- --check
+scripts/clippy.sh
+cargo test --workspace --exclude slowcode-kernel
+```
+
+`slowcode-kernel` 是 vendored 上游代码。改动它之前先读 `crates/slowcode-kernel/UPSTREAM.md`，并单独运行：
+
+```bash
+cargo test -p slowcode-kernel --lib
+```
+
+真实 provider 测试默认 ignored，需要 key：
+
+```bash
+cargo test -p slowcode-cli --test e2e_deepseek -- --ignored --nocapture
+cargo test -p slowcode-cli --test plan_flow_deepseek -- --ignored --nocapture
+```
+
+端到端脚本：
+
+```bash
+scripts/e2e.sh            # 真实模型主链路
+scripts/e2e-tui.sh        # macOS PTY 冒烟
+scripts/e2e-tui-turn.sh   # 真实模型审批
+scripts/e2e-tui-handoff.sh
+scripts/e2e-tui-session.sh
+scripts/e2e-mcp.sh
+```
+
+后几个脚本会消耗 provider token，部分依赖 macOS PTY 与 `python3`。
+
+## 贡献
+
+欢迎 issue 与 pull request。提交前请：
+
+1. 保持改动聚焦，一个 PR 解决一件事。
+2. 补上覆盖改动的测试，单元测试放代码旁，跨 crate 测试放 `crates/slowcode-tests/tests/`。
+3. 跑 `cargo fmt --all -- --check`、`scripts/clippy.sh` 与 `cargo test --workspace --exclude slowcode-kernel`。
+4. 不提交密钥、session JSONL、`.scratch/` 现场或本地 skill 安装目录。
+
+领域术语见 `GLOSSARY.md`，代码风格见 `CODING_STANDARDS.md`。
+
+## Vendored code
+
+`crates/slowcode-kernel` 来自 [`deepseek-harness-rs`](https://github.com/xizheyin/deepseek-harness-rs)，按 MIT 许可证 vendor。改动记录在 `crates/slowcode-kernel/UPSTREAM.md` 与同目录的 `LICENSE`。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。

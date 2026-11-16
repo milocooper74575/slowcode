@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["excerise"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.dependencies]
+slowcode-cognition = { path = "crates/slowcode-cognition" }
+slowcode-kernel = { path = "crates/slowcode-kernel" }
+slowcode-roles = { path = "crates/slowcode-roles" }
+slowcode-runtime = { path = "crates/slowcode-runtime" }
+
+# Keep `target/` bounded. Dev and test artifacts dominate disk usage because
+# every rlib and integration-test binary carries a full debuginfo copy.
+# `line-tables-only` keeps file and line numbers for panic backtraces while
+# dropping variable and type information. Dependencies carry no debuginfo at
+# all, so third-party code cannot be stepped through but local code can.
+# `incremental` stays at its default. It costs about 1 GiB after a clean build
+# of this workspace but keeps the edit-compile loop fast. Set it to false only
+# if disk is tighter than compile latency.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false
+
+[profile.release]
+strip = "debuginfo"
