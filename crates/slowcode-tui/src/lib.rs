@@ -121,14 +121,34 @@ async fn run_inner(
     let mut event_stream = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ui_events_closed = false;
 
     loop {
         terminal.draw(|frame| app.draw(frame))?;
 
         tokio::select! {
-            event = events.recv() => {
-                if let Some(event) = event {
-                    app.handle_ui_event(event);
+            event = events.recv(), if !ui_events_closed => {
+                match event {
+                    Some(event) => {
+                        app.handle_ui_event(event);
+                        // Stream deltas can arrive far faster than a frame can
+                        // render. Drain a bounded batch before drawing so one
+                        // frame covers many deltas instead of one redraw each.
+                        let mut drained = 0;
+                        while drained < 512 {
+                            let Ok(event) = events.try_recv() else {
+                                break;
+                            };
+                            app.handle_ui_event(event);
+                            drained += 1;
+                        }
+                    }
+                    None => {
+                        ui_events_closed = true;
+                        app.push_error(
+                            "UI event stream closed; the running command cannot finish. Press Ctrl-C to exit.".to_owned(),
+                        );
+                    }
                 }
             }
             approval = approval_rx.recv() => {
