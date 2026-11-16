@@ -9,9 +9,10 @@
 //! rename.
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use slowcode_kernel::provider::deepseek::{
@@ -235,7 +236,12 @@ fn write_private(path: &Path, contents: &str) -> Result<(), CredentialError> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(".env");
-    let temporary = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp.{}.{sequence}",
+        std::process::id()
+    ));
     // A leftover from a crashed run would block create_new; it is never live.
     let _ = fs::remove_file(&temporary);
 
@@ -253,7 +259,7 @@ fn write_private(path: &Path, contents: &str) -> Result<(), CredentialError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            File::open(&temporary)?.set_permissions(fs::Permissions::from_mode(0o600))?;
+            fs::File::open(&temporary)?.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         fs::rename(&temporary, path)?;
         Ok(())
@@ -447,6 +453,44 @@ mod tests {
             save_api_key(&missing, "sk-key"),
             Err(CredentialError::Io(_))
         ));
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_leave_one_intact_key_line() {
+        let workspace = temp_workspace("concurrent");
+        let handles = (0..8)
+            .map(|index| {
+                let workspace = workspace.clone();
+                std::thread::spawn(move || {
+                    save_api_key(&workspace, &format!("sk-concurrent-{index}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("thread").expect("save");
+        }
+
+        let contents = fs::read_to_string(workspace.join(".env")).expect("read");
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.starts_with("DEEPSEEK_API_KEY="))
+                .count(),
+            1
+        );
+        assert!(
+            workspace_key(&workspace.join(".env"))
+                .expect("key")
+                .starts_with("sk-concurrent-")
+        );
+        let leftovers = fs::read_dir(&workspace)
+            .expect("listing")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         fs::remove_dir_all(workspace).ok();
     }
 
