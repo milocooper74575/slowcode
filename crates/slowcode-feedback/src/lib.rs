@@ -1125,6 +1125,45 @@ mod tests {
         )
     }
 
+    fn many_error_journal() -> String {
+        let mut journal = format!(
+            concat!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"createdAt\":1792466172940,",
+                "\"cwd\":\"/tmp/example-project\"}}\n",
+                "{{\"type\":\"request/header\",\"seq\":0,\"time\":1,\"data\":{{\"header\":",
+                "{{\"config\":{{\"model\":\"deepseek-flash\",\"provider\":\"deepseek-official\"}}}}}}}}\n",
+                "{{\"type\":\"user/message\",\"seq\":1,\"time\":2,\"data\":{{\"content\":[",
+                "{{\"type\":\"text\",\"text\":\"run the shell\"}}]}}}}\n"
+            ),
+            id = SESSION_ID
+        );
+        let mut seq = 2;
+        for step in 0..10 {
+            journal.push_str(&format!(
+                concat!(
+                    "{{\"type\":\"tool/result\",\"seq\":{seq},\"time\":{seq},\"data\":",
+                    "{{\"error\":{{\"code\":\"TOOL_{step}\"}},\"message\":{{\"content\":[",
+                    "{{\"content\":[{{\"text\":\"failed with sk-abcdefghijklmnopqrstuv",
+                    " at /tmp/example-project\",\"type\":\"text\"}}]}}]}},",
+                    "\"turn\":1,\"step\":{step}}}}}\n"
+                ),
+                step = step,
+                seq = seq,
+            ));
+            seq += 1;
+        }
+        journal.push_str(&format!(
+            concat!(
+                "{{\"type\":\"turn/end\",\"seq\":{seq},\"time\":{seq},\"data\":{{\"reason\":",
+                "{{\"error\":{{\"code\":\"TURN_ERROR\",\"message\":",
+                "\"failed in /tmp/example-project\"}},\"kind\":\"error\"}},",
+                "\"turn\":1}}}}\n"
+            ),
+            seq = seq,
+        ));
+        journal
+    }
+
     #[test]
     fn writes_a_complete_bundle_with_redaction_and_manifest() {
         let base = temp_dir("complete");
@@ -1237,6 +1276,53 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
         assert_eq!(metadata["errors"][0]["code"], "ABORTED_BEFORE_DISPATCH");
         assert_eq!(metadata["errors"][1]["code"], "AGENT_TOOL_EXECUTOR");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn redacts_error_messages_and_caps_the_error_list() {
+        let base = temp_dir("errors-redacted");
+        let out = base.join("out");
+        let journal = many_error_journal();
+        let mut request = request(&out, journal.as_bytes());
+        request.workspace = Some("/tmp/example-project");
+        let outcome = write_bundle(request).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        assert!(!issue.contains("sk-abcdefghijklmnopqrstuv"), "{issue}");
+        assert!(!issue.contains("/tmp/example-project"), "{issue}");
+        assert!(issue.contains("<redacted>"), "{issue}");
+        assert!(issue.contains("<workspace>"), "{issue}");
+        assert!(issue.contains("older error(s) omitted"), "{issue}");
+        let section = issue
+            .split("## 关键错误")
+            .nth(1)
+            .expect("error section")
+            .split("## 期望")
+            .next()
+            .expect("error body");
+        assert_eq!(
+            section
+                .lines()
+                .filter(|line| line.starts_with("- ["))
+                .count(),
+            8,
+            "{section}"
+        );
+        assert!(section.contains("`TURN_ERROR` (turn 1)"), "{section}");
+        assert!(!section.contains("`TOOL_0`"), "{section}");
+
+        let metadata: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
+        let errors = metadata["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 11);
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error["message"].as_str().unwrap().contains("sk-")),
+            "{metadata}"
+        );
         let _ = fs::remove_dir_all(base);
     }
 

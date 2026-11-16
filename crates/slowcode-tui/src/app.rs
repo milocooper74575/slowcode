@@ -4608,6 +4608,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_successful_turn_does_not_point_at_feedback() {
+        let mut app = test_app().await;
+        app.running = true;
+
+        app.handle_app_event(AppEvent::TurnFinished(Ok(())));
+        app.handle_ui_event(ui_event(UiEventKind::TurnEnd {
+            turn: 1,
+            reason: UiTurnEnd::Completed,
+        }));
+
+        assert!(!app.running);
+        assert_eq!(app.state, RunState::Idle);
+        assert!(!app.messages.iter().any(
+            |message| matches!(message, MessageBlock::System(text) if text.contains("/feedback"))
+        ));
+    }
+
+    #[tokio::test]
     async fn compaction_retry_approval_and_todo_events_append_expected_notes() {
         let mut app = test_app().await;
         let before = app.messages.len();
