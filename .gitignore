@@ -1,6 +1,7 @@
 # Rust build output
 /excerise/target/
 **/target/
+/dist/
 
 # LLVM coverage/profiling artifacts that can land in a crate directory
 *.profraw
