@@ -352,7 +352,7 @@ fn argument_description(command: &str, candidate: &str) -> Option<&'static str> 
     match (command, candidate) {
         ("/feedback", "--plan") => Some("attach a plan artifact"),
         ("/feedback", "--title") => Some("override the derived title"),
-        ("/feedback", "--note") => Some("same as typing free text"),
+        ("/feedback", "--note") => Some("same as typing what actually happened"),
         _ => None,
     }
 }
@@ -981,7 +981,7 @@ mod tests {
         assert_eq!(completion.full, "/feedback --note");
         assert_eq!(
             completion.description.as_deref(),
-            Some("same as typing free text")
+            Some("same as typing what actually happened")
         );
 
         assert_eq!(complete("/feedback the plan", 18), None);

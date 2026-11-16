@@ -64,6 +64,17 @@ pub struct BundlePreview {
     pub last_seq: Option<u64>,
 }
 
+/// One error event worth carrying into the issue draft.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ErrorFact {
+    /// `turn` for a `turn/end` error, `tool` for a failed `tool/result`.
+    pub source: &'static str,
+    pub code: String,
+    pub message: String,
+    pub turn: Option<u64>,
+    pub step: Option<u64>,
+}
+
 /// Bundle failures. Incomplete journals are not errors; they are reported in
 /// [`BundleOutcome`].
 #[derive(Debug, Error)]
@@ -92,6 +103,7 @@ struct Analysis {
     user_messages: Vec<String>,
     assistant_messages: Vec<String>,
     tool_names: BTreeMap<String, usize>,
+    errors: Vec<ErrorFact>,
     tool_calls: usize,
     turn_reasons: BTreeMap<String, usize>,
     usage: BTreeMap<String, u64>,
@@ -222,6 +234,9 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
     {
         *message = redact(message, workspace.as_deref());
     }
+    for error in &mut analysis.errors {
+        error.message = redact(&error.message, workspace.as_deref());
+    }
     let title = request
         .title
         .clone()
@@ -347,6 +362,7 @@ impl Analysis {
             user_messages: Vec::new(),
             assistant_messages: Vec::new(),
             tool_names: BTreeMap::new(),
+            errors: Vec::new(),
             tool_calls: 0,
             turn_reasons: BTreeMap::new(),
             usage: BTreeMap::new(),
@@ -379,6 +395,7 @@ fn scan_event(analysis: &mut Analysis, scan: &mut ScanState, value: &Value) {
         "session/title" => apply_title(analysis, data),
         "user/message" => apply_user_message(analysis, data),
         "assistant/message" => apply_assistant_message(analysis, data),
+        "tool/result" => apply_tool_result(analysis, data),
         "turn/end" => apply_turn_end(analysis, scan, data),
         _ => {}
     }
@@ -441,10 +458,62 @@ fn apply_assistant_message(analysis: &mut Analysis, data: &Value) {
     if let Some(content) = message.get("content").and_then(Value::as_array) {
         analysis.tool_calls += content
             .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_call"))
+            .filter(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("tool_call" | "tool-call")
+                )
+            })
             .count();
     }
     record_usage(analysis, data);
+}
+
+fn apply_tool_result(analysis: &mut Analysis, data: &Value) {
+    let Some(error) = data.get("error").and_then(Value::as_object) else {
+        return;
+    };
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("TOOL_ERROR")
+        .to_owned();
+    let message = tool_error_text(data).unwrap_or_else(|| {
+        error
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool failed")
+            .to_owned()
+    });
+    analysis.errors.push(ErrorFact {
+        source: "tool",
+        code,
+        message,
+        turn: data.get("turn").and_then(Value::as_u64),
+        step: data.get("step").and_then(Value::as_u64),
+    });
+}
+
+/// Pull the human-readable text out of a tool-result message envelope.
+fn tool_error_text(data: &Value) -> Option<String> {
+    let blocks = data
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)?;
+    let mut parts = Vec::new();
+    for block in blocks {
+        let nested = block
+            .get("content")
+            .and_then(Value::as_array)
+            .map_or(std::slice::from_ref(block), Vec::as_slice);
+        for inner in nested {
+            if let Some(text) = inner.get("text").and_then(Value::as_str) {
+                parts.push(text.to_owned());
+            }
+        }
+    }
+    let text = parts.join("\n");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 fn record_usage(analysis: &mut Analysis, data: &Value) {
@@ -460,12 +529,31 @@ fn record_usage(analysis: &mut Analysis, data: &Value) {
 
 fn apply_turn_end(analysis: &mut Analysis, scan: &mut ScanState, data: &Value) {
     scan.saw_turn_end = true;
-    let reason = data
-        .get("reason")
-        .and_then(|reason| reason.get("kind"))
+    let reason = data.get("reason").unwrap_or(&Value::Null);
+    let kind = reason
+        .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    *analysis.turn_reasons.entry(reason.to_owned()).or_default() += 1;
+    *analysis.turn_reasons.entry(kind.to_owned()).or_default() += 1;
+    if kind == "error"
+        && let Some(error) = reason.get("error")
+    {
+        analysis.errors.push(ErrorFact {
+            source: "turn",
+            code: error
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("TURN_ERROR")
+                .to_owned(),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("turn failed without a message")
+                .to_owned(),
+            turn: data.get("turn").and_then(Value::as_u64),
+            step: None,
+        });
+    }
 }
 
 fn finish_checks(analysis: &mut Analysis, scan: &ScanState) {
@@ -506,7 +594,7 @@ fn blocks_text(content: Option<&Value>, tool_names: &mut BTreeMap<String, usize>
                     parts.push(text.to_owned());
                 }
             }
-            Some("tool_call") => {
+            Some("tool_call" | "tool-call") => {
                 let name = block
                     .get("name")
                     .and_then(Value::as_str)
@@ -585,11 +673,14 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
             .unwrap_or_else(|| "unknown".to_owned()),
         context.plan.unwrap_or("none"),
     ));
+    issue.push_str("\n## 关键错误\n\n");
+    issue.push_str(&render_errors(&analysis.errors));
     issue.push_str(&format!(
-        "\n## 期望\n\n{}\n",
-        context.note.unwrap_or("请补充你期望的行为。")
+        "\n## 期望\n\n请补充你期望的行为。\n\n## 实际\n\n{}\n",
+        context
+            .note
+            .unwrap_or("请补充实际行为，例如报错、耗时、输出差异。")
     ));
-    issue.push_str("\n## 实际\n\n请补充实际行为，例如报错、耗时、输出差异。\n");
     issue.push_str("\n## 复现步骤\n\n1. \n2. \n3. \n");
 
     let turns: usize = analysis.turn_reasons.values().sum();
@@ -644,6 +735,45 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
     issue
 }
 
+/// Render the most recent errors, newest first. This is the part a reader
+/// needs most, so it stays near the top of the issue.
+fn render_errors(errors: &[ErrorFact]) -> String {
+    const LIMIT: usize = 8;
+    if errors.is_empty() {
+        return "- none\n".to_owned();
+    }
+    let mut text = String::new();
+    for error in errors.iter().rev().take(LIMIT) {
+        let mut location = String::new();
+        if let Some(turn) = error.turn {
+            location.push_str(&format!("turn {turn}"));
+        }
+        if let Some(step) = error.step {
+            if !location.is_empty() {
+                location.push(' ');
+            }
+            location.push_str(&format!("step {step}"));
+        }
+        let location = if location.is_empty() {
+            String::new()
+        } else {
+            format!(" ({location})")
+        };
+        let message = clip(&error.message.replace('\n', " "), 800);
+        text.push_str(&format!(
+            "- [{}] `{}`{}: {message}\n",
+            error.source, error.code, location
+        ));
+    }
+    if errors.len() > LIMIT {
+        text.push_str(&format!(
+            "- ... {} older error(s) omitted\n",
+            errors.len() - LIMIT
+        ));
+    }
+    text
+}
+
 fn recent(messages: &[String], limit: usize, max_chars: usize) -> String {
     if messages.is_empty() {
         return "- none".to_owned();
@@ -693,6 +823,13 @@ fn render_metadata(
         "events": analysis.event_count,
         "turnReasons": analysis.turn_reasons,
         "toolCalls": analysis.tool_names,
+        "errors": analysis.errors.iter().map(|error| serde_json::json!({
+            "source": error.source,
+            "code": error.code,
+            "message": error.message,
+            "turn": error.turn,
+            "step": error.step,
+        })).collect::<Vec<_>>(),
         "usage": analysis.usage,
         "complete": analysis.complete,
         "hardFailures": analysis.hard_failures,
@@ -959,6 +1096,35 @@ mod tests {
         }
     }
 
+    fn error_journal() -> String {
+        format!(
+            concat!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"createdAt\":1792466172940,",
+                "\"cwd\":\"/tmp/example-project\"}}\n",
+                "{{\"type\":\"request/header\",\"seq\":0,\"time\":1,\"data\":{{\"header\":",
+                "{{\"config\":{{\"model\":\"deepseek-flash\",\"provider\":\"deepseek-official\"}}}}}}}}\n",
+                "{{\"type\":\"user/message\",\"seq\":1,\"time\":2,\"data\":{{\"content\":[",
+                "{{\"type\":\"text\",\"text\":\"run the shell\"}}]}}}}\n",
+                "{{\"type\":\"assistant/message\",\"seq\":2,\"time\":3,\"data\":{{\"message\":",
+                "{{\"content\":[{{\"type\":\"text\",\"text\":\"checking\"}},",
+                "{{\"type\":\"tool-call\",\"name\":\"readonly_shell\",\"id\":\"call-1\",",
+                "\"arguments\":\"{{}}\"}}]}}}}}}\n",
+                "{{\"type\":\"tool/call\",\"seq\":3,\"time\":4,\"data\":{{\"name\":\"readonly_shell\",",
+                "\"callId\":\"call-1\",\"turn\":1,\"step\":1}}}}\n",
+                "{{\"type\":\"tool/result\",\"seq\":4,\"time\":5,\"data\":{{\"error\":",
+                "{{\"code\":\"ABORTED_BEFORE_DISPATCH\",\"name\":\"AbortError\"}},\"message\":",
+                "{{\"content\":[{{\"content\":[{{\"text\":\"tool was not started because the turn was stopping\",",
+                "\"type\":\"text\"}}],\"isError\":true,\"toolCallId\":\"call-1\",\"type\":\"tool-result\"}}]}},",
+                "\"step\":1,\"turn\":1}}}}\n",
+                "{{\"type\":\"turn/end\",\"seq\":5,\"time\":6,\"data\":{{\"reason\":",
+                "{{\"error\":{{\"code\":\"AGENT_TOOL_EXECUTOR\",\"message\":",
+                "\"the tool executor failed before producing a result\"}},\"kind\":\"error\"}},",
+                "\"turn\":1}}}}\n"
+            ),
+            id = SESSION_ID
+        )
+    }
+
     #[test]
     fn writes_a_complete_bundle_with_redaction_and_manifest() {
         let base = temp_dir("complete");
@@ -981,7 +1147,17 @@ mod tests {
         );
         assert!(!issue.contains("/tmp/example-project"), "{issue}");
         assert!(!issue.contains("sk-abcdefghijklmnopqrstuv"), "{issue}");
-        assert!(issue.contains("expected success"), "{issue}");
+        let actual = issue.split("## 实际").nth(1).expect("actual section");
+        assert!(actual.contains("expected success"), "{issue}");
+        let expected = issue
+            .split("## 期望")
+            .nth(1)
+            .expect("expected section")
+            .split("## 实际")
+            .next()
+            .expect("expected body");
+        assert!(!expected.contains("expected success"), "{issue}");
+        assert!(issue.contains("## 关键错误\n\n- none"), "{issue}");
         assert!(issue.contains("turns: 1 (completed x1)"), "{issue}");
         assert!(
             issue.contains("input 10, output 2, cache read 5"),
@@ -1011,6 +1187,56 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn carries_turn_and_tool_errors_into_the_issue() {
+        let base = temp_dir("errors");
+        let out = base.join("out");
+        let journal = error_journal();
+        let mut request = request(&out, journal.as_bytes());
+        request.note = Some("the shell call was interrupted".to_owned());
+        let outcome = write_bundle(request).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        let section = issue
+            .split("## 关键错误")
+            .nth(1)
+            .expect("error section")
+            .split("## 期望")
+            .next()
+            .expect("error body");
+        assert!(
+            section.contains("[turn] `AGENT_TOOL_EXECUTOR` (turn 1)"),
+            "{issue}"
+        );
+        assert!(
+            section.contains("[tool] `ABORTED_BEFORE_DISPATCH` (turn 1 step 1)"),
+            "{issue}"
+        );
+        assert!(
+            section.contains("tool was not started because the turn was stopping"),
+            "{issue}"
+        );
+        assert!(
+            issue
+                .split("## 实际")
+                .nth(1)
+                .unwrap()
+                .contains("the shell call was interrupted"),
+            "{issue}"
+        );
+        assert!(
+            issue.contains("tool calls: 1 (readonly_shell x1)"),
+            "{issue}"
+        );
+
+        let metadata: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(metadata["errors"][0]["code"], "ABORTED_BEFORE_DISPATCH");
+        assert_eq!(metadata["errors"][1]["code"], "AGENT_TOOL_EXECUTOR");
         let _ = fs::remove_dir_all(base);
     }
 
