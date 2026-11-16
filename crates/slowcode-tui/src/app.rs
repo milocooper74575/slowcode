@@ -13,8 +13,9 @@ use ratatui::{
 };
 use slowcode_app::workflow::{ApprovalDecision, ApprovalRecord, ApprovalStatus, WorkflowStore};
 use slowcode_app::{
-    Command, CommandCompletion, Runtime, SessionCommand, command_specs, complete, complete_answer,
-    escape_terminal, parse_command,
+    Command, CommandCompletion, CredentialSourceKind, CredentialStatus, LoginCommand, Runtime,
+    SessionCommand, command_specs, complete, complete_answer, credential_status, escape_terminal,
+    parse_command, remove_api_key, save_api_key,
 };
 use slowcode_feedback::{BundlePreview, BundleRequest, clip, preview, write_bundle};
 use slowcode_kernel::ui::{
@@ -243,6 +244,11 @@ struct PendingFeedback {
     prompt: String,
 }
 
+/// Masked credential entry opened by `/login`.
+struct PendingLogin {
+    replacing: bool,
+}
+
 #[derive(Debug)]
 struct SkillInstallRequest {
     path: String,
@@ -302,6 +308,7 @@ pub struct App {
     recovered_approval: Option<ApprovalRecord>,
     pending_skill: Option<PendingSkillInstall>,
     pending_feedback: Option<PendingFeedback>,
+    pending_login: Option<PendingLogin>,
     pending_mcp: Option<PendingMcpInstall>,
     mcp_busy: bool,
     running: bool,
@@ -347,6 +354,7 @@ impl App {
             recovered_approval: None,
             pending_skill: None,
             pending_feedback: None,
+            pending_login: None,
             pending_mcp: None,
             mcp_busy: false,
             running: false,
@@ -369,6 +377,13 @@ impl App {
             app.push(MessageBlock::System(
                 "slowcode TUI. Type a task, or /help for commands.".to_owned(),
             ));
+            let status = credential_status(&app.workspace());
+            if !status.configured() {
+                app.push(MessageBlock::System(format!(
+                    "no DeepSeek API key is configured. Type /login to enter one; it is saved to {} and never printed.",
+                    status.env_path.display()
+                )));
+            }
         } else {
             app.push(MessageBlock::System(format!(
                 "resumed session: {}",
@@ -766,6 +781,10 @@ impl App {
             return Some(KeyAction::none());
         }
         if key.code == KeyCode::Esc {
+            if self.pending_login.is_some() {
+                self.cancel_login();
+                return Some(KeyAction::none());
+            }
             self.cancel_current_turn();
             return Some(KeyAction::none());
         }
@@ -938,6 +957,12 @@ impl App {
         if input.is_empty() {
             return KeyAction::none();
         }
+        if self.pending_login.is_some() {
+            self.composer.clear();
+            self.composer_cursor = 0;
+            self.finish_login(&input);
+            return KeyAction::none();
+        }
         if self.pending_approval.is_some()
             || self.pending_skill.is_some()
             || self.pending_feedback.is_some()
@@ -948,13 +973,18 @@ impl App {
             self.respond_to_prompt(&input).await;
             return KeyAction::none();
         }
+        let command = parse_command(&input);
+        let needs_credential = command.as_ref().is_none_or(command_needs_credential);
+        if needs_credential && !self.credential_ready() {
+            return KeyAction::none();
+        }
         self.composer.clear();
         self.composer_cursor = 0;
         self.history.push(input.clone());
         self.history_cursor = None;
         self.scroll_to_bottom();
 
-        if let Some(command) = parse_command(&input) {
+        if let Some(command) = command {
             return self.handle_command(command).await;
         }
         if self.running {
@@ -1458,26 +1488,121 @@ impl App {
                     self.usage.output_tokens
                 )));
             }
-            Command::Login => {
-                let status = if std::env::var_os("DEEPSEEK_API_KEY").is_some() {
-                    "DEEPSEEK_API_KEY is set"
-                } else {
-                    "DEEPSEEK_API_KEY is not set; put it in .env or the environment"
-                };
-                self.push(MessageBlock::System(status.to_owned()));
-            }
-            Command::Logout => {
-                self.push(MessageBlock::System(
-                    "logout is not implemented; remove DEEPSEEK_API_KEY from .env or the environment"
-                        .to_owned(),
-                ));
-            }
+            Command::Login(mode) => self.handle_login(mode),
+            Command::Logout => self.handle_logout(),
             Command::Unknown(name) => {
                 self.push(MessageBlock::Error(format!("unknown command: {name}")));
             }
             _ => {}
         }
         KeyAction::none()
+    }
+
+    fn handle_login(&mut self, mode: LoginCommand) {
+        let status = credential_status(&self.workspace());
+        match mode {
+            LoginCommand::Show if status.configured() => {
+                self.push(MessageBlock::System(credential_report(&status)));
+                self.push(MessageBlock::System(
+                    "type /login key to replace the configured key".to_owned(),
+                ));
+            }
+            LoginCommand::Show => self.start_login(false),
+            LoginCommand::Key => self.start_login(status.configured()),
+        }
+    }
+
+    fn start_login(&mut self, replacing: bool) {
+        self.composer.clear();
+        self.composer_cursor = 0;
+        let status = credential_status(&self.workspace());
+        let path = status.env_path.display();
+        let prompt = if replacing {
+            format!(
+                "DEEPSEEK_API_KEY is configured. Paste a new key to replace it, or press Esc to keep the current key. The key is saved to {path} and never printed."
+            )
+        } else {
+            format!(
+                "no DeepSeek API key is configured. Paste your DeepSeek API key and press Enter. The key is saved to {path} with mode 0600 and never printed. Esc cancels."
+            )
+        };
+        self.pending_login = Some(PendingLogin { replacing });
+        self.push(MessageBlock::Prompt(prompt));
+    }
+
+    fn finish_login(&mut self, value: &str) {
+        let replacing = self
+            .pending_login
+            .as_ref()
+            .is_some_and(|pending| pending.replacing);
+        match save_api_key(&self.workspace(), value) {
+            Ok(path) => {
+                self.pending_login = None;
+                let verb = if replacing { "replaced" } else { "saved" };
+                self.push(MessageBlock::System(format!(
+                    "credential {verb}: {}; the next request uses it, no restart needed",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                self.push(MessageBlock::Error(format!(
+                    "credential not saved: {error}; try again or press Esc"
+                )));
+            }
+        }
+    }
+
+    fn cancel_login(&mut self) {
+        if self.pending_login.take().is_some() {
+            self.composer.clear();
+            self.composer_cursor = 0;
+            self.push(MessageBlock::System(
+                "credential entry cancelled".to_owned(),
+            ));
+        }
+    }
+
+    fn handle_logout(&mut self) {
+        let status = credential_status(&self.workspace());
+        match remove_api_key(&self.workspace()) {
+            Ok(true) => {
+                let mut message = format!(
+                    "removed DEEPSEEK_API_KEY from {}",
+                    status.env_path.display()
+                );
+                if std::env::var_os(slowcode_app::API_KEY_ENV).is_some() {
+                    message.push_str(
+                        "; this process still has DEEPSEEK_API_KEY in its environment, so restart slowcode to clear it (unset it in your shell too if you exported it there)",
+                    );
+                }
+                self.push(MessageBlock::System(message));
+            }
+            Ok(false) if status.configured() => {
+                self.push(MessageBlock::System(
+                    "the workspace .env has no key; the current credential comes from the environment. Unset DEEPSEEK_API_KEY to log out.".to_owned(),
+                ));
+            }
+            Ok(false) => {
+                self.push(MessageBlock::System(
+                    "no credential is configured".to_owned(),
+                ));
+            }
+            Err(error) => {
+                self.push(MessageBlock::Error(format!("logout: {error}")));
+            }
+        }
+    }
+
+    fn credential_ready(&mut self) -> bool {
+        let status = credential_status(&self.workspace());
+        if status.configured() {
+            return true;
+        }
+        self.push(MessageBlock::Error(format!(
+            "no DeepSeek API key is configured. Type /login to enter one; it is saved to {} and never printed.",
+            status.env_path.display()
+        )));
+        false
     }
 
     async fn switch_model(&mut self, model: String) {
@@ -2452,13 +2577,18 @@ impl App {
     }
 
     fn draw_composer(&self, frame: &mut Frame, area: Rect) {
-        let completion = self.completion();
-        let view = composer_view(
-            &self.composer,
-            self.composer_cursor,
-            completion.as_ref(),
-            area,
-        );
+        let (display, cursor, completion) = if self.pending_login.is_some() {
+            let masked = masked_input(&self.composer);
+            let cursor = masked.len();
+            (masked, cursor, None)
+        } else {
+            (
+                self.composer.clone(),
+                self.composer_cursor,
+                self.completion(),
+            )
+        };
+        let view = composer_view(&display, cursor, completion.as_ref(), area);
         let widget = Paragraph::new(view.lines).scroll((0, view.horizontal_scroll));
         frame.render_widget(widget, area);
         if let Some(completion) = &completion {
@@ -2487,6 +2617,8 @@ impl App {
             "writing HANDOFF.md  Ctrl-C quit"
         } else if self.recovered_approval.is_some() {
             "approval pending: y allow, n reject, d details, empty line later"
+        } else if self.pending_login.is_some() {
+            "credential entry: Enter save, Esc cancel  (input is masked)"
         } else if self.pending_approval.is_some() {
             "approval: type y or n, then Enter. d shows details"
         } else if self.pending_skill.is_some() {
@@ -2700,6 +2832,10 @@ fn command_help_text(name: &str, args: &str, description: &str) -> String {
         "/mcp" => text.push_str(
             "\nexample: /mcp add ChromeDevTools/chrome-devtools-mcp\n         /mcp enable chrome-devtools\n         /mcp add fs npx -y @modelcontextprotocol/server-filesystem",
         ),
+        "/login" => text.push_str(
+            "\nwithout an argument this reports the credential and prompts when none is configured\nsaves to the workspace .env with mode 0600\nexample: /login key",
+        ),
+        "/logout" => text.push_str("\nremoves DEEPSEEK_API_KEY from the workspace .env"),
         "/plan" => text.push_str("\nexample: /plan add a line-count summary to notes.txt"),
         _ => {}
     }
@@ -3279,6 +3415,41 @@ struct ComposerView {
 
 fn composer_height(composer: &str) -> u16 {
     (composer.split('\n').count() as u16).clamp(1, 6)
+}
+
+/// Replace every character so a pasted key never reaches the screen.
+fn masked_input(composer: &str) -> String {
+    "*".repeat(composer.chars().count())
+}
+
+fn credential_report(status: &CredentialStatus) -> String {
+    match status.source {
+        CredentialSourceKind::WorkspaceEnv => format!(
+            "credential: DEEPSEEK_API_KEY from {}",
+            status.env_path.display()
+        ),
+        CredentialSourceKind::Environment => {
+            "credential: DEEPSEEK_API_KEY from the environment; a key in the workspace .env takes precedence".to_owned()
+        }
+        CredentialSourceKind::Missing => format!(
+            "credential: not configured; /login writes DEEPSEEK_API_KEY to {}",
+            status.env_path.display()
+        ),
+    }
+}
+
+/// Slash commands that cannot run without a provider credential.
+fn command_needs_credential(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Plan(_)
+            | Command::Answer(_)
+            | Command::Continue
+            | Command::Test
+            | Command::Fix
+            | Command::Execute
+            | Command::Distill(_)
+    )
 }
 
 fn composer_view(
@@ -5564,6 +5735,86 @@ mod tests {
             )),
             "{:?}",
             app.messages
+        );
+    }
+
+    #[test]
+    fn masked_input_hides_every_character() {
+        assert_eq!(masked_input("sk-abc"), "******");
+        assert_eq!(masked_input(""), "");
+    }
+
+    #[tokio::test]
+    async fn login_writes_the_key_without_echoing_it() {
+        let mut app = test_app().await;
+        let workspace = app.workspace();
+
+        app.handle_command(Command::Login(LoginCommand::Key)).await;
+        assert!(app.pending_login.is_some());
+
+        let secret = "sk-test-secret-123";
+        app.composer = secret.to_owned();
+        app.composer_cursor = secret.len();
+        app.submit().await;
+
+        assert!(app.pending_login.is_none());
+        assert!(app.composer.is_empty());
+        let contents = std::fs::read_to_string(workspace.join(".env")).expect(".env");
+        assert!(contents.contains("DEEPSEEK_API_KEY=sk-test-secret-123"));
+        assert!(
+            !app.messages.iter().any(|message| match message {
+                MessageBlock::System(text)
+                | MessageBlock::Prompt(text)
+                | MessageBlock::Error(text)
+                | MessageBlock::Assistant(text)
+                | MessageBlock::User(text) => text.contains(secret),
+                _ => false,
+            }),
+            "{:?}",
+            app.messages
+        );
+
+        app.handle_command(Command::Logout).await;
+        let contents = std::fs::read_to_string(workspace.join(".env")).expect(".env");
+        assert!(!contents.contains("DEEPSEEK_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn login_show_reports_the_workspace_env_source() {
+        let mut app = test_app().await;
+        let workspace = app.workspace();
+        std::fs::write(workspace.join(".env"), "DEEPSEEK_API_KEY=sk-existing\n").expect(".env");
+
+        app.handle_command(Command::Login(LoginCommand::Show)).await;
+
+        assert!(app.pending_login.is_none());
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                message,
+                MessageBlock::System(text)
+                    if text.contains("from") && text.contains(".env")
+            )),
+            "{:?}",
+            app.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_cancels_credential_entry() {
+        let mut app = test_app().await;
+        app.handle_command(Command::Login(LoginCommand::Key)).await;
+        app.composer = "sk-half-typed".to_owned();
+        app.composer_cursor = app.composer.len();
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).await;
+
+        assert!(app.pending_login.is_none());
+        assert!(app.composer.is_empty());
+        assert!(
+            !app.workspace().join(".env").exists()
+                || !std::fs::read_to_string(app.workspace().join(".env"))
+                    .expect(".env")
+                    .contains("sk-half-typed")
         );
     }
 }

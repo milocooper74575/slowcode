@@ -59,6 +59,30 @@ macOS 预编译包当前未做 Apple 签名与 notarization。通过 `curl` 安�
 Gatekeeper 的 quarantine 属性，所以终端里通常可以直接运行。如果系统仍拦截，
 可以在系统设置中允许，或改为从源码构建。签名会在拿到证书后补上。
 
+### 配置 DeepSeek API key
+
+安装后第一次运行不需要提前准备 `.env`。直接启动 TUI，按提示输入 `/login`，
+把 key 粘贴进去即可：
+
+```bash
+slowcode --workspace /path/to/project
+# 在输入框里输入 /login
+```
+
+`/login` 会把 key 写进 workspace 的 `.env`（权限 `0600`，临时文件加 rename），
+输入过程以 `*` 遮蔽，key 不会出现在对话、日志或 shell history 里。当前进程立即
+生效，无需重启。`/login key` 可以替换已有 key，`/logout` 会删除 `.env` 里的
+那一行。
+
+也可以继续用环境变量或手写 `.env`：
+
+```bash
+export DEEPSEEK_API_KEY=...
+```
+
+workspace `.env` 里的 key 优先于环境变量。headless 模式在没有 key 时不会调用
+模型，而是打印上面几种配置方式后退出。
+
 ### 卸载
 
 卸载只删除二进制，不会动 workspace 里的会话与工作流数据：

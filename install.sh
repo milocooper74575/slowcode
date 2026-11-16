@@ -96,3 +96,6 @@ if ! command -v slowcode >/dev/null 2>&1; then
 fi
 
 "${install_dir}/slowcode" --version
+echo
+echo "next: run slowcode and type /login to save your DeepSeek API key"
+echo "      (or export DEEPSEEK_API_KEY=<key>, or put it in <workspace>/.env)"
