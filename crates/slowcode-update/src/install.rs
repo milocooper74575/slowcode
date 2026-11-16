@@ -174,7 +174,10 @@ fn replace_executable(exe_path: &Path, binary: &[u8]) -> Result<(), UpdateError>
 }
 
 fn map_write_error(error: io::Error, directory: &Path) -> UpdateError {
-    if error.kind() == io::ErrorKind::PermissionDenied {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    ) {
         UpdateError::not_writable(directory)
     } else {
         UpdateError::Io(error)
@@ -208,7 +211,7 @@ fn set_executable(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
@@ -420,5 +423,23 @@ mod tests {
         );
         assert!(parse_checksum(b"not-a-digest").is_err());
         assert!(parse_checksum(&[b'a'; 63]).is_err());
+    }
+
+    #[test]
+    fn unwritable_directories_report_a_clear_error() {
+        let directory = Path::new("/opt/slowcode");
+        let denied =
+            super::map_write_error(io::Error::from(io::ErrorKind::PermissionDenied), directory);
+        assert!(matches!(denied, UpdateError::NotWritable { .. }));
+        assert!(
+            denied
+                .to_string()
+                .contains("installation directory is not writable")
+        );
+        let read_only = super::map_write_error(
+            io::Error::from(io::ErrorKind::ReadOnlyFilesystem),
+            directory,
+        );
+        assert!(matches!(read_only, UpdateError::NotWritable { .. }));
     }
 }

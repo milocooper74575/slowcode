@@ -118,11 +118,7 @@ impl UpdateTransport for HttpTransport {
                 return Err(UpdateError::Status(status));
             }
             let body = response.bytes().await?;
-            let parsed: LatestRelease = serde_json::from_slice(&body)?;
-            let tag = parsed.tag_name.ok_or(UpdateError::MissingTag)?;
-            let version =
-                Version::parse(&tag).ok_or_else(|| UpdateError::InvalidVersion(tag.clone()))?;
-            Ok(Release { tag, version })
+            parse_latest_release(&body)
         })
     }
 
@@ -142,6 +138,13 @@ impl UpdateTransport for HttpTransport {
     fn asset_url(&self, tag: &str, file: &str) -> Result<String, UpdateError> {
         self.locations.asset_url(tag, file)
     }
+}
+
+fn parse_latest_release(body: &[u8]) -> Result<Release, UpdateError> {
+    let parsed: LatestRelease = serde_json::from_slice(body)?;
+    let tag = parsed.tag_name.ok_or(UpdateError::MissingTag)?;
+    let version = Version::parse(&tag).ok_or_else(|| UpdateError::InvalidVersion(tag.clone()))?;
+    Ok(Release { tag, version })
 }
 
 /// Reject URLs that would send the updater over cleartext. Loopback HTTP is
@@ -204,7 +207,24 @@ fn is_safe_segment(value: &str) -> bool {
 mod tests {
     use crate::policy::Environment;
 
-    use super::{ReleaseLocations, validate_url};
+    use super::{ReleaseLocations, parse_latest_release, validate_url};
+
+    #[test]
+    fn latest_release_json_uses_tag_name() {
+        let release =
+            parse_latest_release(br#"{"tag_name":"v0.2.0","name":"release"}"#).expect("release");
+        assert_eq!(release.tag, "v0.2.0");
+        assert_eq!(release.version.to_string(), "0.2.0");
+
+        assert!(matches!(
+            parse_latest_release(br#"{"name":"no tag"}"#),
+            Err(crate::error::UpdateError::MissingTag)
+        ));
+        assert!(matches!(
+            parse_latest_release(br#"{"tag_name":"not a version"}"#),
+            Err(crate::error::UpdateError::InvalidVersion(_))
+        ));
+    }
 
     #[test]
     fn only_https_or_loopback_http_is_allowed() {
