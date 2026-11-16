@@ -4142,11 +4142,13 @@ async fn commit_tool_round(
                     ToolRun::Infrastructure { stop } => {
                         if reservation.session().is_durable() {
                             settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
-                            infrastructure_failure = Some(failure_reason(
-                                "AGENT_TOOL_EXECUTOR",
+                            classify_durable_infrastructure_stop(
+                                stop,
                                 "the prepared file mutation failed without a definite outcome",
-                            )?);
-                            latched_stop = latch_tool_stop(latched_stop, stop);
+                                &mut cancelled,
+                                &mut infrastructure_failure,
+                                &mut latched_stop,
+                            )?;
                             continue;
                         }
                         reservation.release(&mut plan.result_claim)?;
@@ -4155,10 +4157,10 @@ async fn commit_tool_round(
                             reservation.release(&mut later.result_claim)?;
                         }
                         return Ok(StepResolution::with_stop(
-                            StepOutcome::Error(failure_reason(
-                                "AGENT_TOOL_EXECUTOR",
+                            infrastructure_step_outcome(
+                                stop,
                                 "the prepared file mutation failed without a definite outcome",
-                            )?),
+                            )?,
                             latch_tool_stop(latched_stop, stop),
                         ));
                     }
@@ -4211,11 +4213,13 @@ async fn commit_tool_round(
                     ToolRun::ActionUnresolved { stop } => {
                         if reservation.session().is_durable() {
                             settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
-                            infrastructure_failure = Some(failure_reason(
-                                "AGENT_TOOL_EXECUTOR",
+                            classify_durable_infrastructure_stop(
+                                stop,
                                 "the foreground action lost a definite result",
-                            )?);
-                            latched_stop = latch_tool_stop(latched_stop, stop);
+                                &mut cancelled,
+                                &mut infrastructure_failure,
+                                &mut latched_stop,
+                            )?;
                             continue;
                         }
                         reservation.release(&mut plan.result_claim)?;
@@ -4224,10 +4228,10 @@ async fn commit_tool_round(
                             reservation.release(&mut later.result_claim)?;
                         }
                         return Ok(StepResolution::with_stop(
-                            StepOutcome::Error(failure_reason(
-                                "AGENT_TOOL_EXECUTOR",
+                            infrastructure_step_outcome(
+                                stop,
                                 "the foreground action lost a definite result",
-                            )?),
+                            )?,
                             latch_tool_stop(latched_stop, stop),
                         ));
                     }
@@ -4252,11 +4256,13 @@ async fn commit_tool_round(
             ToolRun::Infrastructure { stop } => {
                 if reservation.session().is_durable() {
                     settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
-                    infrastructure_failure = Some(failure_reason(
-                        "AGENT_TOOL_EXECUTOR",
+                    classify_durable_infrastructure_stop(
+                        stop,
                         "the tool executor failed before producing a result",
-                    )?);
-                    latched_stop = latch_tool_stop(latched_stop, stop);
+                        &mut cancelled,
+                        &mut infrastructure_failure,
+                        &mut latched_stop,
+                    )?;
                     continue;
                 }
                 reservation.release(&mut plan.result_claim)?;
@@ -4265,21 +4271,23 @@ async fn commit_tool_round(
                     reservation.release(&mut later.result_claim)?;
                 }
                 return Ok(StepResolution::with_stop(
-                    StepOutcome::Error(failure_reason(
-                        "AGENT_TOOL_EXECUTOR",
+                    infrastructure_step_outcome(
+                        stop,
                         "the tool executor failed before producing a result",
-                    )?),
+                    )?,
                     latch_tool_stop(latched_stop, stop),
                 ));
             }
             ToolRun::ActionUnresolved { stop } => {
                 if reservation.session().is_durable() {
                     settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
-                    infrastructure_failure = Some(failure_reason(
-                        "AGENT_TOOL_EXECUTOR",
+                    classify_durable_infrastructure_stop(
+                        stop,
                         "the foreground action lost a definite result",
-                    )?);
-                    latched_stop = latch_tool_stop(latched_stop, stop);
+                        &mut cancelled,
+                        &mut infrastructure_failure,
+                        &mut latched_stop,
+                    )?;
                     continue;
                 }
                 reservation.release(&mut plan.result_claim)?;
@@ -4288,10 +4296,10 @@ async fn commit_tool_round(
                     reservation.release(&mut later.result_claim)?;
                 }
                 return Ok(StepResolution::with_stop(
-                    StepOutcome::Error(failure_reason(
-                        "AGENT_TOOL_EXECUTOR",
+                    infrastructure_step_outcome(
+                        stop,
                         "the foreground action lost a definite result",
-                    )?),
+                    )?,
                     latch_tool_stop(latched_stop, stop),
                 ));
             }
@@ -4455,6 +4463,52 @@ fn latch_tool_stop(current: ToolStop, observed: ToolStop) -> ToolStop {
     } else {
         current
     }
+}
+
+/// Close a durable unknown outcome according to the stop that interrupted it.
+///
+/// A caller cancellation is an abort, not an executor fault. A turn deadline is
+/// a turn timeout. Only an executor that failed while the turn was still live
+/// is an infrastructure error.
+fn classify_durable_infrastructure_stop(
+    stop: ToolStop,
+    executor_message: &'static str,
+    cancelled: &mut bool,
+    infrastructure_failure: &mut Option<LlmFailure>,
+    latched_stop: &mut ToolStop,
+) -> Result<(), AgentLoopError> {
+    *latched_stop = latch_tool_stop(*latched_stop, stop);
+    match stop {
+        ToolStop::None => {
+            *infrastructure_failure =
+                Some(failure_reason("AGENT_TOOL_EXECUTOR", executor_message)?);
+        }
+        ToolStop::Cancelled => *cancelled = true,
+        ToolStop::TurnTimeout => {
+            *infrastructure_failure = Some(failure_reason(
+                "AGENT_TURN_TIMEOUT",
+                "the agent turn timed out",
+            )?);
+        }
+    }
+    Ok(())
+}
+
+/// Close a non-durable unknown outcome with the same stop classification.
+fn infrastructure_step_outcome(
+    stop: ToolStop,
+    executor_message: &'static str,
+) -> Result<StepOutcome, AgentLoopError> {
+    Ok(match stop {
+        ToolStop::None => {
+            StepOutcome::Error(failure_reason("AGENT_TOOL_EXECUTOR", executor_message)?)
+        }
+        ToolStop::Cancelled => StepOutcome::Cancelled,
+        ToolStop::TurnTimeout => StepOutcome::Error(failure_reason(
+            "AGENT_TURN_TIMEOUT",
+            "the agent turn timed out",
+        )?),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4820,10 +4874,17 @@ async fn settle_parallel_infrastructure(
     Ok(ParallelCommitOutcome {
         cancelled: stop == ToolStop::Cancelled,
         concludes_turn: false,
-        infrastructure_failure: Some(failure_reason(
-            "AGENT_TOOL_EXECUTOR",
-            "the parallel-safe tool executor failed before producing a result",
-        )?),
+        infrastructure_failure: match stop {
+            ToolStop::None => Some(failure_reason(
+                "AGENT_TOOL_EXECUTOR",
+                "the parallel-safe tool executor failed before producing a result",
+            )?),
+            ToolStop::Cancelled => None,
+            ToolStop::TurnTimeout => Some(failure_reason(
+                "AGENT_TURN_TIMEOUT",
+                "the agent turn timed out",
+            )?),
+        },
         stop,
         memory_unresolved,
     })

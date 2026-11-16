@@ -544,6 +544,7 @@ enum ActionScript {
     StartedOwnershipLost,
     OversizedStartedResult,
     StopThenCleanup(StopThenCleanup),
+    StartedInfrastructureOnCancel(StopThenCleanup),
 }
 
 struct StopThenCleanup {
@@ -993,6 +994,15 @@ fn run_action_script(
                 ToolActionOutcome::StartedAndQuiescent {
                     turn_stop,
                     result: started_abort_result(turn_stop),
+                }
+            }
+            ActionScript::StartedInfrastructureOnCancel(fixture) => {
+                fixture.running.add_permits(1);
+                control.cancellation().cancelled().await;
+                fixture.cleanup_entered.add_permits(1);
+                drop(fixture.cleanup_release.acquire().await.unwrap());
+                ToolActionOutcome::Infrastructure {
+                    turn_stop: ToolActionTurnStop::CallerCancelled,
                 }
             }
         }
@@ -4975,6 +4985,92 @@ async fn durable_executor_outcome_loss_closes_current_and_later_declared_tools()
             .is_some_and(|sources| sources.len() == 1)
     }));
 
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    std::fs::remove_dir(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn caller_cancellation_during_started_action_is_an_abort_not_an_executor_error() {
+    let running = Arc::new(Semaphore::new(0));
+    let cleanup_entered = Arc::new(Semaphore::new(0));
+    let cleanup_release = Arc::new(Semaphore::new(0));
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedInfrastructureOnCancel(
+        StopThenCleanup {
+            running: running.clone(),
+            cleanup_entered: cleanup_entered.clone(),
+            cleanup_release: cleanup_release.clone(),
+        },
+    ));
+    let (session, journal_path, root, workspace) =
+        durable_session_with_event_room("caller-cancel-started-action", 64).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![tool_response()]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+
+    let outcome = {
+        let turn = agent.run_turn(TurnProposal::Enter(vec![user()]), cancellation.clone());
+        tokio::pin!(turn);
+        tokio::select! {
+            biased;
+            permit = running.acquire() => drop(permit.unwrap()),
+            result = &mut turn => panic!("turn ended before Action started: {result:?}"),
+        }
+        cancellation.cancel();
+        tokio::select! {
+            biased;
+            permit = cleanup_entered.acquire() => drop(permit.unwrap()),
+            result = &mut turn => panic!("turn ended before cleanup was released: {result:?}"),
+        }
+        cleanup_release.add_permits(1);
+        turn.await.unwrap()
+    };
+
+    assert!(
+        matches!(outcome.reason(), TurnEndReason::Aborted { .. }),
+        "caller cancellation must abort the turn: {:?}",
+        outcome.reason()
+    );
+    assert!(!matches!(outcome.reason(), TurnEndReason::Error { .. }));
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    agent.shutdown().await.unwrap();
+
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.iter().filter(|row| row["type"] == "tool/call").count(),
+        1
+    );
+    let results = rows
+        .iter()
+        .filter(|row| row["type"] == "tool/result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["data"]["error"]["code"], "TOOL_OUTCOME_UNKNOWN");
+    let end = rows
+        .iter()
+        .rev()
+        .find(|row| row["type"] == "turn/end")
+        .expect("the durable turn must close with turn/end");
+    assert_eq!(end["data"]["reason"]["kind"], "aborted");
+
+    drop(agent);
     std::fs::remove_file(journal_path).unwrap();
     std::fs::remove_dir(root).unwrap();
     std::fs::remove_dir(workspace).unwrap();

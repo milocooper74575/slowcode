@@ -114,6 +114,16 @@ include those JSON fixtures by relative path.
   `--no-textconv`. `tools/mod.rs` exports it as `tools::readonly_shell`.
 - `Cargo.toml`: enabled the `process` feature on `tokio` so the read-only shell
   can spawn and reap bounded subprocesses with cancellation and a timeout.
+- `agent/mod.rs`: a tool result lost to an interrupted round is still recorded
+  as `TOOL_OUTCOME_UNKNOWN`, but the turn now closes by the stop that caused it
+  instead of always failing with `AGENT_TOOL_EXECUTOR`. A caller cancellation
+  closes the turn as `Aborted`; a turn deadline closes it with
+  `AGENT_TURN_TIMEOUT`; only an executor failure with no observed stop still
+  closes with `AGENT_TOOL_EXECUTOR`. The same classification applies to
+  mutation infrastructure, action unresolved, generic tool infrastructure, and
+  parallel infrastructure settlement. Test:
+  `phase6_tests::caller_cancellation_during_started_action_is_an_abort_not_an_executor_error`
+  covers a started action cancelled mid-flight.
 
 Keep local changes to upstream files minimal. Record every edit here before
 touching an upstream file. The goal is a short, auditable diff that can be
