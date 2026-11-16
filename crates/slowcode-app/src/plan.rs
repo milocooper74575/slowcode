@@ -5695,4 +5695,42 @@ validation: ok
         assert!(hint.output.contains("Do the next step"), "{}", hint.output);
         let _ = fs::remove_dir_all(&workspace);
     }
+
+    #[test]
+    fn plan_session_reuse_requires_returning_the_session() {
+        let mut sessions = PlanSession::new(Some(Session::new("session-guard").unwrap()));
+        let taken = sessions.take_or_create("slowcode-test-").unwrap();
+        assert!(
+            sessions.take_or_create("slowcode-test-").is_err(),
+            "a second take without a put is rejected"
+        );
+        sessions.put(taken);
+        assert!(sessions.into_session().is_some());
+    }
+
+    #[tokio::test]
+    async fn run_command_returns_the_session_after_a_model_stream_failure() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::with_attempts(vec![vec![
+            Ok(StreamChunk::block_start(0, ContentBlockType::Text).unwrap()),
+            Ok(StreamChunk::text_delta(0, "partial").unwrap()),
+        ]]));
+        let mut session = Some(Session::new("session-stream-failure").expect("session opens"));
+
+        let result = run_command_with_session(
+            PlanCommand::Plan("count lines".to_owned()),
+            &config,
+            provider,
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await;
+
+        assert!(result.is_err(), "an incomplete stream fails the turn");
+        let session = session.expect("the session is returned after the failure");
+        assert_eq!(session.id().as_str(), "session-stream-failure");
+        let _ = fs::remove_dir_all(&workspace);
+    }
 }
