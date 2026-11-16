@@ -1,9 +1,9 @@
 //! Plan command flow shared by the CLI and the TUI.
 //!
-//! The five Plan commands run their own read-only or workspace agent on an
-//! ephemeral session. They never persist into the user's durable session and
-//! never stream deltas: the caller receives one final report plus the artifact
-//! path.
+//! Each Plan command runs its own read-only or workspace agent. Callers that
+//! supply a Session reuse it for every command in the run, so Plan turns share
+//! the conversation transcript and UI event stream. One-shot callers may omit
+//! the Session and keep the historical ephemeral behaviour.
 
 use std::{
     error::Error,
@@ -36,7 +36,7 @@ use slowcode_kernel::{
     provider::{ModelProvider, deepseek::DEEPSEEK_PROVIDER},
     session::{ApprovalOutcome, Session, TurnEndReason},
 };
-use slowcode_roles::agent::{AgentSpec, RegistryMode, build as build_role_agent};
+use slowcode_roles::agent::{AgentSpec, RegistryMode};
 use slowcode_runtime::{
     ApprovalResolution, PendingTool, RunBudget, RunLink, RunModelCall, RunStatus, RunStore,
 };
@@ -59,6 +59,8 @@ use crate::workflow::{
 type BoxError = Box<dyn Error + Send + Sync>;
 type PlanOutcomeFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<PlanOutcome, BoxError>> + Send + 'a>>;
+type PlanBodyFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, BoxError>> + Send + 'a>>;
 type PlanAgentFuture<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<(AgentLoop, Arc<dyn ToolExecutor>), BoxError>>
@@ -263,6 +265,46 @@ pub struct PlanOutcome {
     pub workflow_id: Option<String>,
 }
 
+/// Session ownership for one Plan command.
+///
+/// When the caller supplies a Session, every model command in the run reuses
+/// it, so Plan turns share the user's conversation transcript. Without a
+/// Session, commands keep the historical ephemeral behaviour used by
+/// one-shot CLI runs.
+struct PlanSession {
+    session: Option<Session>,
+    reuse: bool,
+}
+
+impl PlanSession {
+    fn new(session: Option<Session>) -> Self {
+        Self {
+            reuse: session.is_some(),
+            session,
+        }
+    }
+
+    fn take_or_create(&mut self, prefix: &'static str) -> Result<Session, BoxError> {
+        if self.reuse {
+            self.session
+                .take()
+                .ok_or_else(|| invalid("plan session is already in use"))
+        } else {
+            Ok(Session::new(format!("{prefix}{}", now_unix_millis()?))?)
+        }
+    }
+
+    fn put(&mut self, session: Session) {
+        if self.reuse {
+            self.session = Some(session);
+        }
+    }
+
+    fn into_session(self) -> Option<Session> {
+        self.session
+    }
+}
+
 struct PlanAgentPolicy {
     system: &'static str,
     profile: CapabilityProfile,
@@ -286,6 +328,52 @@ pub async fn run_command(
     provider: Arc<dyn ModelProvider>,
     approval: Option<Arc<dyn ApprovalProvider>>,
     cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut session = None;
+    run_command_with_session(
+        command,
+        config,
+        provider,
+        approval,
+        cancellation,
+        &mut session,
+    )
+    .await
+}
+
+/// Run one Plan command, optionally reusing a caller-owned Session.
+///
+/// `session` is replaced with the same Session after the command, even when the
+/// command fails, so the caller can restore its conversation transcript.
+pub async fn run_command_with_session(
+    command: PlanCommand,
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    approval: Option<Arc<dyn ApprovalProvider>>,
+    cancellation: CancellationToken,
+    session: &mut Option<Session>,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(session.take());
+    let result = run_command_inner(
+        command,
+        config,
+        provider,
+        approval,
+        cancellation,
+        &mut sessions,
+    )
+    .await;
+    *session = sessions.into_session();
+    result
+}
+
+async fn run_command_inner(
+    command: PlanCommand,
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    approval: Option<Arc<dyn ApprovalProvider>>,
+    cancellation: CancellationToken,
+    sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
     let store = WorkflowStore::new(&config.workspace);
     let active = store.load_active().ok().flatten();
@@ -360,22 +448,41 @@ pub async fn run_command(
     let dispatch = Box::pin(async {
         match command {
             PlanCommand::Plan(task) => {
-                run_plan(config, provider, &task, cancellation.clone()).await
+                run_plan_with_session(config, provider, &task, cancellation.clone(), sessions).await
             }
             PlanCommand::Answer(answer) => {
-                run_answer(config, provider, &answer, cancellation.clone()).await
+                run_answer_with_session(config, provider, &answer, cancellation.clone(), sessions)
+                    .await
             }
             PlanCommand::Scaffold => {
-                run_scaffold(config, provider, approval, cancellation.clone()).await
+                run_scaffold_with_session(
+                    config,
+                    provider,
+                    approval,
+                    cancellation.clone(),
+                    sessions,
+                )
+                .await
             }
             PlanCommand::Continue => run_continue(config).await,
             PlanCommand::Test => run_test(config).await,
-            PlanCommand::Fix => run_fix(config, provider, approval, cancellation.clone()).await,
+            PlanCommand::Fix => {
+                run_fix_with_session(config, provider, approval, cancellation.clone(), sessions)
+                    .await
+            }
             PlanCommand::Execute => {
-                run_execute(config, provider, approval, cancellation.clone()).await
+                run_execute_with_session(config, provider, approval, cancellation.clone(), sessions)
+                    .await
             }
             PlanCommand::Distill(explanation) => {
-                run_distill(config, provider, &explanation, cancellation.clone()).await
+                run_distill_with_session(
+                    config,
+                    provider,
+                    &explanation,
+                    cancellation.clone(),
+                    sessions,
+                )
+                .await
             }
             PlanCommand::Approve => run_approve(config).await,
             PlanCommand::Status(workflow_id) => run_status(config, workflow_id).await,
@@ -383,7 +490,8 @@ pub async fn run_command(
             PlanCommand::Workflow(argument) => run_workflow(config, argument).await,
             PlanCommand::Reclassify(text) => run_reclassify(config, &text).await,
             PlanCommand::Hint(question) => {
-                run_hint(config, provider, &question, cancellation.clone()).await
+                run_hint_with_session(config, provider, &question, cancellation.clone(), sessions)
+                    .await
             }
         }
     });
@@ -491,13 +599,14 @@ fn record_backfilled_plan_run(config: &PlanConfig, workflow_id: &str) {
 }
 
 /// Run one `/plan` turn in a read-only agent and persist the result.
-pub async fn run_plan(
+async fn run_plan_with_session(
     config: &PlanConfig,
     provider: Arc<dyn ModelProvider>,
     task: &str,
     cancellation: CancellationToken,
+    sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
-    let task = task.trim();
+    let task = task.trim().to_owned();
     if task.is_empty() {
         return Err(invalid("usage: /plan <task>"));
     }
@@ -505,7 +614,10 @@ pub async fn run_plan(
     store.ensure_no_active()?;
 
     let audit_sink = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (mut agent, tools) = plan_agent(
+    let plan_config = config.clone();
+    let plan_task = task.clone();
+    with_plan_agent(
+        sessions,
         config,
         provider,
         PlanAgentPolicy {
@@ -519,73 +631,68 @@ pub async fn run_plan(
             audit_sink: Some(Arc::clone(&audit_sink)),
             max_steps_per_turn: Some(MAX_AGENT_STEPS_PER_TURN),
         },
-    )
-    .await?;
+        move |agent| {
+            Box::pin(async move {
+                let config = &plan_config;
+                let task = plan_task.as_str();
+                let (mut output, mut usage) =
+                    run_text_turn_usage(agent, &plan_user_prompt(task), 1, config, &cancellation)
+                        .await?;
+                let mut validation = validate_plan_output(&output);
+                if !validation.is_valid() {
+                    let repair = repair_prompt(&validation.reasons);
+                    let (repaired, repair_usage) =
+                        run_text_turn_usage(agent, &repair, 2, config, &cancellation).await?;
+                    usage.model_calls += repair_usage.model_calls;
+                    usage.output_tokens += repair_usage.output_tokens;
+                    output = repaired;
+                    validation = validate_plan_output(&output);
+                }
 
-    finish_plan(
-        async {
-            let (mut output, mut usage) = run_text_turn_usage(
-                &mut agent,
-                &plan_user_prompt(task),
-                1,
-                config,
-                &cancellation,
-            )
-            .await?;
-            let mut validation = validate_plan_output(&output);
-            if !validation.is_valid() {
-                let repair = repair_prompt(&validation.reasons);
-                let (repaired, repair_usage) =
-                    run_text_turn_usage(&mut agent, &repair, 2, config, &cancellation).await?;
-                usage.model_calls += repair_usage.model_calls;
-                usage.output_tokens += repair_usage.output_tokens;
-                output = repaired;
-                validation = validate_plan_output(&output);
-            }
-
-            let path = write_plan_artifact(config, task, &output, &validation)?;
-            if !validation.is_valid() {
-                return Err(invalid(format!(
-                    "/plan output did not satisfy the contract: {}\n\n{output}",
-                    validation.reasons.join("; "),
-                )));
-            }
-            let tasks = workflow_tasks(&parse_task_table(&output), &[]);
-            let questions = workflow_questions(&tasks, &parse_question_table(&output));
-            let state = store.create_with_questions(task, None, tasks, questions)?;
-            let state = store.record_model_usage(
-                &state.workflow_id,
-                usage.model_calls,
-                usage.output_tokens,
-            )?;
-            flush_shell_audit(&store, &state.workflow_id, &audit_sink)?;
-            record_manifest(
-                &config.workspace,
-                &state.workflow_id,
-                Phase::Classify,
-                CapabilityProfile::Navigator,
-            )?;
-            let output = format!(
-                "{output}\n\n[workflow: {} phase: {}]",
-                state.workflow_id, state.phase
-            );
-            Ok(PlanOutcome {
-                path,
-                output,
-                workflow_id: Some(state.workflow_id),
+                let path = write_plan_artifact(config, task, &output, &validation)?;
+                if !validation.is_valid() {
+                    return Err(invalid(format!(
+                        "/plan output did not satisfy the contract: {}\n\n{output}",
+                        validation.reasons.join("; "),
+                    )));
+                }
+                let tasks = workflow_tasks(&parse_task_table(&output), &[]);
+                let questions = workflow_questions(&tasks, &parse_question_table(&output));
+                let state = store.create_with_questions(task, None, tasks, questions)?;
+                let state = store.record_model_usage(
+                    &state.workflow_id,
+                    usage.model_calls,
+                    usage.output_tokens,
+                )?;
+                flush_shell_audit(&store, &state.workflow_id, &audit_sink)?;
+                record_manifest(
+                    &config.workspace,
+                    &state.workflow_id,
+                    Phase::Classify,
+                    CapabilityProfile::Navigator,
+                )?;
+                let output = format!(
+                    "{output}\n\n[workflow: {} phase: {}]",
+                    state.workflow_id, state.phase
+                );
+                Ok(PlanOutcome {
+                    path,
+                    output,
+                    workflow_id: Some(state.workflow_id),
+                })
             })
         },
-        tools,
     )
     .await
 }
 
 /// `/answer` records decisions and reclassifies the plan.
-pub fn run_answer<'a>(
+fn run_answer_with_session<'a>(
     config: &'a PlanConfig,
     provider: Arc<dyn ModelProvider>,
     answer: &'a str,
     cancellation: CancellationToken,
+    sessions: &'a mut PlanSession,
 ) -> PlanOutcomeFuture<'a> {
     Box::pin(async move {
         let argument = parse_answer_argument(answer)?;
@@ -703,7 +810,9 @@ pub fn run_answer<'a>(
             active.phase,
             profile,
         )?;
-        let (mut agent, tools) = plan_agent(
+        let plan_config = config.clone();
+        with_plan_agent(
+            sessions,
             config,
             provider,
             PlanAgentPolicy {
@@ -717,11 +826,8 @@ pub fn run_answer<'a>(
                 audit_sink: None,
                 max_steps_per_turn: None,
             },
-        )
-        .await?;
-
-        finish_plan(
-        async {
+        move |agent| Box::pin(async move {
+            let config = &plan_config;
             if let Some(question) = question {
                 if question.kind == QuestionKind::Unknown {
                     return answer_unknown_question(
@@ -736,7 +842,7 @@ pub fn run_answer<'a>(
                     );
                 }
                 return answer_model_question(
-                    &mut agent,
+                    agent,
                     config,
                     &store,
                     &active,
@@ -753,7 +859,7 @@ pub fn run_answer<'a>(
             }
 
             let mut output = run_text_turn(
-                &mut agent,
+                agent,
                 &answer_user_prompt(&artifact, &answer_text),
                 1,
                 config,
@@ -764,7 +870,7 @@ pub fn run_answer<'a>(
             let mut validation = validate_decisions(&decisions);
             if !validation.is_valid() {
                 let repair = decision_repair(&validation.reasons);
-                output = run_text_turn(&mut agent, &repair, 2, config, &cancellation).await?;
+                output = run_text_turn(agent, &repair, 2, config, &cancellation).await?;
                 decisions = parse_decision_tables(&output);
                 validation = validate_decisions(&decisions);
             }
@@ -816,8 +922,7 @@ pub fn run_answer<'a>(
                 output: body,
                 workflow_id: Some(state.workflow_id),
             })
-        },
-        tools,
+        }),
     )
     .await
     })
@@ -1063,11 +1168,12 @@ async fn answer_model_question(
 }
 
 /// `/scaffold` writes scaffolds for tasks still marked 待用户实现.
-pub async fn run_scaffold(
+async fn run_scaffold_with_session(
     config: &PlanConfig,
     provider: Arc<dyn ModelProvider>,
     approval: Option<Arc<dyn ApprovalProvider>>,
     cancellation: CancellationToken,
+    sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
     if config.read_only {
         return Err(invalid("/scaffold cannot run with --read-only"));
@@ -1120,7 +1226,9 @@ pub async fn run_scaffold(
         active.phase,
         CapabilityProfile::Driver,
     )?;
-    let (mut agent, tools) = plan_agent(
+    let plan_config = config.clone();
+    with_plan_agent(
+        sessions,
         config,
         provider,
         PlanAgentPolicy {
@@ -1134,13 +1242,10 @@ pub async fn run_scaffold(
             audit_sink: None,
             max_steps_per_turn: None,
         },
-    )
-    .await?;
-
-    finish_plan(
-        async {
+        move |agent| Box::pin(async move {
+            let config = &plan_config;
             let output = run_text_turn(
-                &mut agent,
+                agent,
                 &scaffold_user_prompt(&artifact, &targets),
                 1,
                 config,
@@ -1208,8 +1313,7 @@ pub async fn run_scaffold(
                 output: body,
                 workflow_id: Some(state.workflow_id),
             })
-        },
-        tools,
+        }),
     )
     .await
 }
@@ -1453,11 +1557,12 @@ pub async fn run_test(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
 
 /// `/fix` runs one driver turn over the last red test run and applies the
 /// classification table's transition.
-pub async fn run_fix(
+async fn run_fix_with_session(
     config: &PlanConfig,
     provider: Arc<dyn ModelProvider>,
     approval: Option<Arc<dyn ApprovalProvider>>,
     cancellation: CancellationToken,
+    sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
     if config.read_only {
         return Err(invalid("/fix cannot run with --read-only"));
@@ -1519,7 +1624,9 @@ pub async fn run_fix(
         active.phase,
         CapabilityProfile::Driver,
     )?;
-    let (mut agent, tools) = plan_agent(
+    let plan_config = config.clone();
+    with_plan_agent(
+        sessions,
         config,
         provider,
         PlanAgentPolicy {
@@ -1533,127 +1640,125 @@ pub async fn run_fix(
             audit_sink: None,
             max_steps_per_turn: None,
         },
-    )
-    .await?;
+        move |agent| {
+            Box::pin(async move {
+                let config = &plan_config;
+                let started = std::time::Instant::now();
+                let mut output = run_text_turn(
+                    agent,
+                    &fix_user_prompt(&artifact, &evidence),
+                    1,
+                    config,
+                    &cancellation,
+                )
+                .await?;
+                let mut validation = validate_failure_classifications(&output, &expected_failures);
+                if !validation.is_valid() {
+                    let repair = failure_classification_repair_prompt(&validation.reasons);
+                    let repaired = run_text_turn(agent, &repair, 2, config, &cancellation).await?;
+                    output = repaired;
+                    validation = validate_failure_classifications(&output, &expected_failures);
+                }
+                let active_seconds = started.elapsed().as_secs();
+                let state = store.record_fix_active_seconds(&active.workflow_id, active_seconds)?;
+                if let Err(error) = verify_test_contract_hashes(&config.workspace, &contract) {
+                    store.block(
+                        &state.workflow_id,
+                        "contract",
+                        Some(error.to_string()),
+                        "restore the framework and test files, then /workflow use <id>",
+                    )?;
+                    return Err(invalid(format!(
+                        "/fix modified locked framework or test files: {error}"
+                    )));
+                }
+                if !validation.is_valid() {
+                    return Err(invalid(format!(
+                        "/fix did not produce a valid `## 失败分类` table: {}\n\n{output}",
+                        validation.reasons.join("; ")
+                    )));
+                }
+                let rows = parse_failure_classifications(&output);
+                let classifications: Vec<ClassifiedFailure> = rows
+                    .iter()
+                    .map(|row| ClassifiedFailure {
+                        failure: row.failure.clone(),
+                        kind: row.kind.clone(),
+                        evidence: row.evidence.clone(),
+                    })
+                    .collect();
+                let state = store.record_fix_completed(&state.workflow_id, &classifications)?;
+                let body = format!("### 失败分类\n\n{output}");
+                let heading = format!("Fix {}", now_unix()?);
+                let updated = append_section(&artifact, &heading, &body);
+                let updated = set_artifact_status(&updated, "fixed");
+                fs::write(&path, updated)?;
 
-    finish_plan(
-        Box::pin(async {
-            let started = std::time::Instant::now();
-            let mut output = run_text_turn(
-                &mut agent,
-                &fix_user_prompt(&artifact, &evidence),
-                1,
-                config,
-                &cancellation,
-            )
-            .await?;
-            let mut validation = validate_failure_classifications(&output, &expected_failures);
-            if !validation.is_valid() {
-                let repair = failure_classification_repair_prompt(&validation.reasons);
-                let repaired = run_text_turn(&mut agent, &repair, 2, config, &cancellation).await?;
-                output = repaired;
-                validation = validate_failure_classifications(&output, &expected_failures);
-            }
-            let active_seconds = started.elapsed().as_secs();
-            let state = store.record_fix_active_seconds(&active.workflow_id, active_seconds)?;
-            if let Err(error) = verify_test_contract_hashes(&config.workspace, &contract) {
-                store.block(
-                    &state.workflow_id,
-                    "contract",
-                    Some(error.to_string()),
-                    "restore the framework and test files, then /workflow use <id>",
-                )?;
-                return Err(invalid(format!(
-                    "/fix modified locked framework or test files: {error}"
-                )));
-            }
-            if !validation.is_valid() {
-                return Err(invalid(format!(
-                    "/fix did not produce a valid `## 失败分类` table: {}\n\n{output}",
-                    validation.reasons.join("; ")
-                )));
-            }
-            let rows = parse_failure_classifications(&output);
-            let classifications: Vec<ClassifiedFailure> = rows
-                .iter()
-                .map(|row| ClassifiedFailure {
-                    failure: row.failure.clone(),
-                    kind: row.kind.clone(),
-                    evidence: row.evidence.clone(),
-                })
-                .collect();
-            let state = store.record_fix_completed(&state.workflow_id, &classifications)?;
-            let body = format!("### 失败分类\n\n{output}");
-            let heading = format!("Fix {}", now_unix()?);
-            let updated = append_section(&artifact, &heading, &body);
-            let updated = set_artifact_status(&updated, "fixed");
-            fs::write(&path, updated)?;
+                let unknown: Vec<UnknownGap> = rows
+                    .iter()
+                    .filter(|row| row.kind == "unknown_gap")
+                    .map(|row| UnknownGap {
+                        failure: row.failure.clone(),
+                        evidence: row.evidence.clone(),
+                    })
+                    .collect();
+                let contract_error = rows.iter().find(|row| row.kind == "test_contract_error");
+                let environment = rows.iter().find(|row| row.kind == "environment");
 
-            let unknown: Vec<UnknownGap> = rows
-                .iter()
-                .filter(|row| row.kind == "unknown_gap")
-                .map(|row| UnknownGap {
-                    failure: row.failure.clone(),
-                    evidence: row.evidence.clone(),
-                })
-                .collect();
-            let contract_error = rows.iter().find(|row| row.kind == "test_contract_error");
-            let environment = rows.iter().find(|row| row.kind == "environment");
-
-            if !unknown.is_empty() {
-                let state = store.ask_unknown_gaps(&state.workflow_id, &unknown)?;
-                let question = state
-                    .open_questions()
-                    .first()
-                    .map(|question| question.question_id.clone())
-                    .unwrap_or_default();
-                return Ok(PlanOutcome {
+                if !unknown.is_empty() {
+                    let state = store.ask_unknown_gaps(&state.workflow_id, &unknown)?;
+                    let question = state
+                        .open_questions()
+                        .first()
+                        .map(|question| question.question_id.clone())
+                        .unwrap_or_default();
+                    return Ok(PlanOutcome {
+                        path,
+                        output: format!(
+                            "{body}\n\nunknown gap: {}\nnext question: {question}",
+                            question
+                        ),
+                        workflow_id: Some(state.workflow_id),
+                    });
+                }
+                if let Some(row) = contract_error {
+                    let state = store.return_to_review(
+                        &state.workflow_id,
+                        &format!("{}: {}", row.failure, row.evidence),
+                    )?;
+                    return Ok(PlanOutcome {
+                        path,
+                        output: format!(
+                            "{body}\n\ncontract error: {}; back to Review, run /approve again",
+                            row.evidence
+                        ),
+                        workflow_id: Some(state.workflow_id),
+                    });
+                }
+                if let Some(row) = environment {
+                    let state = store.block(
+                        &state.workflow_id,
+                        "environment",
+                        Some(format!("{}: {}", row.failure, row.evidence)),
+                        "fix the environment, then /workflow use <id>",
+                    )?;
+                    return Ok(PlanOutcome {
+                        path,
+                        output: format!("{body}\n\nblocked: environment ({})", row.evidence),
+                        workflow_id: Some(state.workflow_id),
+                    });
+                }
+                let flaky = rows.iter().filter(|row| row.kind == "flaky").count();
+                Ok(PlanOutcome {
                     path,
                     output: format!(
-                        "{body}\n\nunknown gap: {}\nnext question: {question}",
-                        question
+                        "{body}\n\nclassified {} failure(s), flaky {flaky}\nnext: /test",
+                        rows.len()
                     ),
                     workflow_id: Some(state.workflow_id),
-                });
-            }
-            if let Some(row) = contract_error {
-                let state = store.return_to_review(
-                    &state.workflow_id,
-                    &format!("{}: {}", row.failure, row.evidence),
-                )?;
-                return Ok(PlanOutcome {
-                    path,
-                    output: format!(
-                        "{body}\n\ncontract error: {}; back to Review, run /approve again",
-                        row.evidence
-                    ),
-                    workflow_id: Some(state.workflow_id),
-                });
-            }
-            if let Some(row) = environment {
-                let state = store.block(
-                    &state.workflow_id,
-                    "environment",
-                    Some(format!("{}: {}", row.failure, row.evidence)),
-                    "fix the environment, then /workflow use <id>",
-                )?;
-                return Ok(PlanOutcome {
-                    path,
-                    output: format!("{body}\n\nblocked: environment ({})", row.evidence),
-                    workflow_id: Some(state.workflow_id),
-                });
-            }
-            let flaky = rows.iter().filter(|row| row.kind == "flaky").count();
-            Ok(PlanOutcome {
-                path,
-                output: format!(
-                    "{body}\n\nclassified {} failure(s), flaky {flaky}\nnext: /test",
-                    rows.len()
-                ),
-                workflow_id: Some(state.workflow_id),
+                })
             })
-        }),
-        tools,
+        },
     )
     .await
 }
@@ -1678,11 +1783,12 @@ fn render_fix_evidence(run: &TestRunRecord, expected_failures: &[String]) -> Str
 }
 
 /// `/execute` is a compatibility alias: ensure a red run, fix it, then test.
-pub async fn run_execute(
+async fn run_execute_with_session(
     config: &PlanConfig,
     provider: Arc<dyn ModelProvider>,
     approval: Option<Arc<dyn ApprovalProvider>>,
     cancellation: CancellationToken,
+    sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
     if config.read_only {
         return Err(invalid("/execute cannot run with --read-only"));
@@ -1707,7 +1813,14 @@ pub async fn run_execute(
             return Ok(outcome.clone());
         }
     }
-    let fix = Box::pin(run_fix(config, provider, approval, cancellation)).await?;
+    let fix = Box::pin(run_fix_with_session(
+        config,
+        provider,
+        approval,
+        cancellation,
+        sessions,
+    ))
+    .await?;
     let state = store.load(
         fix.workflow_id
             .as_deref()
@@ -1737,13 +1850,14 @@ pub async fn run_execute(
 }
 
 /// `/distill` records a Teach-back and returns an understanding-gap report.
-pub async fn run_distill(
+async fn run_distill_with_session(
     config: &PlanConfig,
     provider: Arc<dyn ModelProvider>,
     explanation: &str,
     cancellation: CancellationToken,
+    sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
-    let explanation = explanation.trim();
+    let explanation = explanation.trim().to_owned();
     if explanation.is_empty() {
         return Err(invalid("usage: /distill <your explanation>"));
     }
@@ -1759,7 +1873,10 @@ pub async fn run_distill(
         active.phase,
         CapabilityProfile::Auditor,
     )?;
-    let (mut agent, tools) = plan_agent(
+    let plan_config = config.clone();
+    let plan_explanation = explanation.clone();
+    with_plan_agent(
+        sessions,
         config,
         provider,
         PlanAgentPolicy {
@@ -1773,56 +1890,55 @@ pub async fn run_distill(
             audit_sink: None,
             max_steps_per_turn: None,
         },
-    )
-    .await?;
-
-    finish_plan(
-        async {
-            let mut output = run_text_turn(
-                &mut agent,
-                &distill_user_prompt(&artifact, explanation),
-                1,
-                config,
-                &cancellation,
-            )
-            .await?;
-            let mut validation = validate_distill_output(&output);
-            if !validation.is_valid() {
-                output = run_text_turn(
-                    &mut agent,
-                    &distill_repair_prompt(&validation.reasons),
-                    2,
+        move |agent| {
+            Box::pin(async move {
+                let config = &plan_config;
+                let explanation = plan_explanation.as_str();
+                let mut output = run_text_turn(
+                    agent,
+                    &distill_user_prompt(&artifact, explanation),
+                    1,
                     config,
                     &cancellation,
                 )
                 .await?;
-                validation = validate_distill_output(&output);
-            }
-            if !validation.is_valid() {
-                return Err(invalid(format!(
-                    "distill report does not satisfy the contract: {}\n\n{output}",
-                    validation.reasons.join("; "),
-                )));
-            }
+                let mut validation = validate_distill_output(&output);
+                if !validation.is_valid() {
+                    output = run_text_turn(
+                        agent,
+                        &distill_repair_prompt(&validation.reasons),
+                        2,
+                        config,
+                        &cancellation,
+                    )
+                    .await?;
+                    validation = validate_distill_output(&output);
+                }
+                if !validation.is_valid() {
+                    return Err(invalid(format!(
+                        "distill report does not satisfy the contract: {}\n\n{output}",
+                        validation.reasons.join("; "),
+                    )));
+                }
 
-            let follow_up = distill_follow_up(&output).unwrap_or_default();
-            let body = format!("### 用户解释\n\n{explanation}\n\n{}", output.trim());
-            let heading = format!("Distill {}", now_unix()?);
-            let updated = append_section(&artifact, &heading, &body);
-            let updated = set_artifact_status(&updated, "distilled");
-            fs::write(&path, updated)?;
-            let state = store.record_distill_report(
-                &active.workflow_id,
-                Some(distill_follow_up_question(follow_up)),
-            )?;
-            let body = format!("{body}\n\n### 下一步\n\n{}", answer_next_step(&state));
-            Ok(PlanOutcome {
-                path,
-                output: body,
-                workflow_id: Some(state.workflow_id),
+                let follow_up = distill_follow_up(&output).unwrap_or_default();
+                let body = format!("### 用户解释\n\n{explanation}\n\n{}", output.trim());
+                let heading = format!("Distill {}", now_unix()?);
+                let updated = append_section(&artifact, &heading, &body);
+                let updated = set_artifact_status(&updated, "distilled");
+                fs::write(&path, updated)?;
+                let state = store.record_distill_report(
+                    &active.workflow_id,
+                    Some(distill_follow_up_question(follow_up)),
+                )?;
+                let body = format!("{body}\n\n### 下一步\n\n{}", answer_next_step(&state));
+                Ok(PlanOutcome {
+                    path,
+                    output: body,
+                    workflow_id: Some(state.workflow_id),
+                })
             })
         },
-        tools,
     )
     .await
 }
@@ -1852,13 +1968,14 @@ fn distill_follow_up_question(question: String) -> Question {
 }
 
 /// `/hint` runs one read-only coach turn without changing phase or role.
-pub async fn run_hint(
+async fn run_hint_with_session(
     config: &PlanConfig,
     provider: Arc<dyn ModelProvider>,
     question: &str,
     cancellation: CancellationToken,
+    sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
-    let question = question.trim();
+    let question = question.trim().to_owned();
     if question.is_empty() {
         return Err(invalid("usage: /hint <question>"));
     }
@@ -1880,7 +1997,10 @@ pub async fn run_hint(
         active.phase,
         CapabilityProfile::Coach,
     )?;
-    let (mut agent, tools) = plan_agent(
+    let plan_config = config.clone();
+    let plan_question = question.clone();
+    with_plan_agent(
+        sessions,
         config,
         provider,
         PlanAgentPolicy {
@@ -1894,26 +2014,27 @@ pub async fn run_hint(
             audit_sink: None,
             max_steps_per_turn: None,
         },
-    )
-    .await?;
-    finish_plan(
-        async {
-            let output = run_text_turn(
-                &mut agent,
-                &hint_user_prompt(&artifact, question),
-                1,
-                config,
-                &cancellation,
-            )
-            .await?;
-            let state = store.record_capability_override(&active.workflow_id, question, "coach")?;
-            Ok(PlanOutcome {
-                path,
-                output,
-                workflow_id: Some(state.workflow_id),
+        move |agent| {
+            Box::pin(async move {
+                let config = &plan_config;
+                let question = plan_question.as_str();
+                let output = run_text_turn(
+                    agent,
+                    &hint_user_prompt(&artifact, question),
+                    1,
+                    config,
+                    &cancellation,
+                )
+                .await?;
+                let state =
+                    store.record_capability_override(&active.workflow_id, question, "coach")?;
+                Ok(PlanOutcome {
+                    path,
+                    output,
+                    workflow_id: Some(state.workflow_id),
+                })
             })
         },
-        tools,
     )
     .await
 }
@@ -2470,8 +2591,10 @@ fn plan_agent<'a>(
     config: &'a PlanConfig,
     provider: Arc<dyn ModelProvider>,
     policy: PlanAgentPolicy,
+    sessions: &'a mut PlanSession,
 ) -> PlanAgentFuture<'a> {
     Box::pin(async move {
+        let session_prefix = policy.session_prefix;
         let call = LlmCallConfig::new(DEEPSEEK_PROVIDER, &config.model)?;
         // Keep a single request from spending the whole workflow budget. The
         // caller still settles actual usage after the turn.
@@ -2532,12 +2655,46 @@ fn plan_agent<'a>(
                     vec![crate::workflow::readonly_shell_schema()?],
                 ));
         }
-        let session_id = format!("{}{}", policy.session_prefix, now_unix_millis()?);
-        let session = Session::new(session_id)?;
-        build_role_agent(spec, session, provider)
-            .await
-            .map_err(|error| invalid(error.to_string()))
+        let prepared =
+            slowcode_roles::agent::prepare(spec).map_err(|error| invalid(error.to_string()))?;
+        let session = sessions.take_or_create(session_prefix)?;
+        match slowcode_roles::agent::finish(prepared, session, provider).await {
+            Ok(agent) => Ok(agent),
+            Err(failure) => {
+                if let Some(session) = failure.session {
+                    sessions.put(*session);
+                }
+                Err(invalid(failure.error.to_string()))
+            }
+        }
     })
+}
+
+/// Run one Plan command body against an agent built around the shared Session.
+///
+/// The agent is always released afterwards so the Session returns to the
+/// caller even when the command body fails.
+async fn with_plan_agent<T, F>(
+    sessions: &mut PlanSession,
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    policy: PlanAgentPolicy,
+    run: F,
+) -> Result<T, BoxError>
+where
+    F: for<'a> FnOnce(&'a mut AgentLoop) -> PlanBodyFuture<'a, T>,
+{
+    let (mut agent, _tools) = plan_agent(config, provider, policy, sessions).await?;
+    let result = run(&mut agent).await;
+    let (session, shutdown) = match agent.shutdown_into_session().await {
+        Ok(session) => (session, Ok(())),
+        Err(error) => {
+            let (source, session) = error.into_parts();
+            (session, Err(source))
+        }
+    };
+    sessions.put(session);
+    merge_plan_result(result, shutdown)
 }
 
 fn skill_roots_for(profile: CapabilityProfile) -> Result<SkillRoots, BoxError> {
@@ -2572,6 +2729,7 @@ fn flush_shell_audit(
 
 /// Run the command body, then always settle the toolset before returning.
 /// A body error wins over a shutdown error so the user sees the real cause.
+#[cfg(test)]
 async fn finish_plan<T>(
     run: impl std::future::Future<Output = Result<T, BoxError>>,
     tools: Arc<dyn ToolExecutor>,
@@ -2771,7 +2929,7 @@ async fn run_text_turn_usage(
     let message = Message::user(
         format!("plan-user-{turn}"),
         vec![ContentBlock::text(text)?],
-        MessageSource::user()?,
+        MessageSource::plugin("slowcode-plan")?,
     )?;
     reserve_model_call()?;
     let outcome = agent
@@ -2887,6 +3045,85 @@ fn now_unix() -> Result<u64, BoxError> {
 
 fn now_unix_millis() -> Result<u128, BoxError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+}
+
+#[cfg(test)]
+async fn run_plan(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    task: &str,
+    cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(None);
+    run_plan_with_session(config, provider, task, cancellation, &mut sessions).await
+}
+
+#[cfg(test)]
+fn run_answer<'a>(
+    config: &'a PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    answer: &'a str,
+    cancellation: CancellationToken,
+) -> PlanOutcomeFuture<'a> {
+    Box::pin(async move {
+        let mut sessions = PlanSession::new(None);
+        run_answer_with_session(config, provider, answer, cancellation, &mut sessions).await
+    })
+}
+
+#[cfg(test)]
+async fn run_scaffold(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    approval: Option<Arc<dyn ApprovalProvider>>,
+    cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(None);
+    run_scaffold_with_session(config, provider, approval, cancellation, &mut sessions).await
+}
+
+#[cfg(test)]
+async fn run_fix(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    approval: Option<Arc<dyn ApprovalProvider>>,
+    cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(None);
+    run_fix_with_session(config, provider, approval, cancellation, &mut sessions).await
+}
+
+#[cfg(test)]
+async fn run_execute(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    approval: Option<Arc<dyn ApprovalProvider>>,
+    cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(None);
+    run_execute_with_session(config, provider, approval, cancellation, &mut sessions).await
+}
+
+#[cfg(test)]
+async fn run_distill(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    explanation: &str,
+    cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(None);
+    run_distill_with_session(config, provider, explanation, cancellation, &mut sessions).await
+}
+
+#[cfg(test)]
+async fn run_hint(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    question: &str,
+    cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(None);
+    run_hint_with_session(config, provider, question, cancellation, &mut sessions).await
 }
 
 #[cfg(test)]
@@ -5317,5 +5554,70 @@ validation: ok
             rendered.contains("plan-1  active  interview  count lines"),
             "{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_command_returns_a_reused_session_after_a_failure() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let mut session = Some(Session::new("session-reused").expect("session opens"));
+        let id = session.as_ref().expect("session").id().as_str().to_owned();
+
+        let result = run_command_with_session(
+            PlanCommand::Status(None),
+            &config,
+            Arc::new(PanicProvider),
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await;
+
+        let _ = result;
+        let session = session.expect("the session is returned");
+        assert_eq!(session.id().as_str(), id);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn run_command_reuses_the_supplied_session_for_model_turns() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(FakeProvider::with_attempts(vec![text_response(
+                "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+",
+            )]));
+        let mut session = Some(Session::new("session-plan-reuse").expect("session opens"));
+
+        let outcome = run_command_with_session(
+            PlanCommand::Plan("count lines".to_owned()),
+            &config,
+            provider,
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect("plan succeeds");
+
+        let session = session.expect("the session is returned");
+        assert_eq!(session.id().as_str(), "session-plan-reuse");
+        assert!(
+            session.messages().iter().any(|message| matches!(
+                message.role(),
+                slowcode_kernel::model::MessageRole::Assistant
+            )),
+            "the plan response is committed to the shared session"
+        );
+        assert!(outcome.output.contains("## 证据包"));
+        let _ = fs::remove_dir_all(&workspace);
     }
 }

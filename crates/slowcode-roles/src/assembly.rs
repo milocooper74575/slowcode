@@ -344,6 +344,22 @@ impl RoleSession {
         self.promote_role(new_fiber, target, new_agent).await
     }
 
+    /// Release the active agent and lend its Session to the caller.
+    ///
+    /// The caller must return the Session through [`Self::restore_session`]
+    /// before running another role turn. This seam exists for command-scoped
+    /// agents such as Plan commands that need a different system prompt and
+    /// tool registry but must keep the user's conversation transcript.
+    pub async fn take_session(&mut self) -> Result<Session, RoleSessionError> {
+        self.ensure_idle()?;
+        self.release_or_restore().await
+    }
+
+    /// Rebuild the active role around a Session returned by [`Self::take_session`].
+    pub async fn restore_session(&mut self, session: Session) -> Result<(), RoleSessionError> {
+        self.restore_agent(session).await
+    }
+
     /// Replace the model call configuration while keeping the same Session
     /// and rebuilding the agent around the active role.
     pub async fn set_call(&mut self, call: LlmCallConfig) -> Result<(), RoleSessionError> {

@@ -550,8 +550,8 @@ impl Runtime {
         Ok(session.run_turn(message, cancellation).await?)
     }
 
-    /// Run one Plan command in-process, sharing this runtime's provider and
-    /// approval policy. Plan turns keep their own ephemeral sessions.
+    /// Run one Plan command in-process, sharing this runtime's provider,
+    /// approval policy, and durable conversation session.
     pub async fn run_plan_command(
         &mut self,
         command: PlanCommand,
@@ -569,15 +569,25 @@ impl Runtime {
         } else {
             None
         };
-        plan::run_command(
+        let provider = Arc::clone(&self.provider);
+        let role_session = self
+            .role_session
+            .as_mut()
+            .ok_or(RuntimeError::Unavailable)?;
+        let mut session = Some(role_session.take_session().await?);
+        let result = plan::run_command_with_session(
             command,
             &config,
-            Arc::clone(&self.provider),
+            provider,
             approval,
             cancellation,
+            &mut session,
         )
-        .await
-        .map_err(|error| RuntimeError::Plan(error.to_string()))
+        .await;
+        if let Some(session) = session.take() {
+            role_session.restore_session(session).await?;
+        }
+        result.map_err(|error| RuntimeError::Plan(error.to_string()))
     }
 
     /// Switch roles at a turn boundary and report what actually happened.
@@ -1137,6 +1147,27 @@ mod tests {
 
         runtime.shutdown().await.expect("runtime shuts down");
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn plan_command_keeps_the_durable_session() {
+        let _guard = HOME_LOCK.lock().await;
+        let (mut runtime, home, workspace) = runtime_with_temp_home("plan-session").await;
+        let id = runtime.session_id().to_owned();
+
+        let _ = runtime
+            .run_plan_command(PlanCommand::Status(None), CancellationToken::new())
+            .await;
+
+        assert_eq!(runtime.session_id(), id);
+        let snapshot = runtime
+            .feedback_snapshot()
+            .await
+            .expect("feedback snapshot after a plan command");
+        assert!(!snapshot.journal.is_empty());
+        runtime.shutdown().await.expect("runtime shuts down");
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_dir_all(workspace);
     }

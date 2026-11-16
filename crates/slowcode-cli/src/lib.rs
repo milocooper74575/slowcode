@@ -677,20 +677,49 @@ async fn run_plan_command(
     pending: Option<&Path>,
     provider: Arc<dyn ModelProvider>,
 ) -> Result<PlanCommandOutcome, Box<dyn Error>> {
+    run_plan_command_with_optional_session(command, options, pending, provider, None).await
+}
+
+async fn run_plan_command_with_optional_session(
+    command: slowcode_app::plan::PlanCommand,
+    options: &CliOptions,
+    pending: Option<&Path>,
+    provider: Arc<dyn ModelProvider>,
+    session: Option<&mut RoleSession>,
+) -> Result<PlanCommandOutcome, Box<dyn Error>> {
     let approval = options.ask.then(|| {
         Arc::new(CliApprovalProvider {
             unavailable: ApprovalSignal::default(),
         }) as Arc<dyn ApprovalProvider>
     });
-    let outcome = slowcode_app::plan::run_command(
-        command,
-        &plan_config(options, pending),
-        provider,
-        approval,
-        CancellationToken::new(),
-    )
-    .await
-    .map_err(|error| io::Error::other(error.to_string()))?;
+    let config = plan_config(options, pending);
+    let outcome = match session {
+        Some(session) => {
+            let mut plan_session = Some(session.take_session().await?);
+            let result = slowcode_app::plan::run_command_with_session(
+                command,
+                &config,
+                provider,
+                approval,
+                CancellationToken::new(),
+                &mut plan_session,
+            )
+            .await;
+            if let Some(plan_session) = plan_session.take() {
+                session.restore_session(plan_session).await?;
+            }
+            result.map_err(|error| io::Error::other(error.to_string()))?
+        }
+        None => slowcode_app::plan::run_command(
+            command,
+            &config,
+            provider,
+            approval,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?,
+    };
     Ok(PlanCommandOutcome {
         path: outcome.path,
         output: outcome.output,
@@ -754,82 +783,103 @@ async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box
         if let Some(command) = split_command(line) {
             let result = match command {
                 SlashCommand::Plan(task) => {
-                    run_plan_with_provider(options, Arc::clone(&plan_provider), task).await
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Plan(task.to_owned()),
+                        options,
+                        pending_plan.as_deref(),
+                        Arc::clone(&plan_provider),
+                        Some(session),
+                    )
+                    .await
                 }
                 SlashCommand::Answer(answer) => {
-                    run_answer_with_provider(
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Answer(answer.to_owned()),
                         options,
-                        Arc::clone(&plan_provider),
                         pending_plan.as_deref(),
-                        answer,
+                        Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Scaffold => {
-                    run_scaffold_with_provider(
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Scaffold,
                         options,
-                        Arc::clone(&plan_provider),
                         pending_plan.as_deref(),
+                        Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Continue => {
-                    run_continue_with_provider(
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Continue,
                         options,
-                        Arc::clone(&plan_provider),
                         pending_plan.as_deref(),
+                        Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Test => {
-                    run_test_with_provider(
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Test,
                         options,
-                        Arc::clone(&plan_provider),
                         pending_plan.as_deref(),
+                        Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Fix => {
-                    run_fix_with_provider(
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Fix,
                         options,
-                        Arc::clone(&plan_provider),
                         pending_plan.as_deref(),
+                        Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Execute => {
-                    run_execute_with_provider(
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Execute,
                         options,
-                        Arc::clone(&plan_provider),
                         pending_plan.as_deref(),
+                        Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Distill(explanation) => {
-                    run_distill_with_provider(
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Distill(explanation.to_owned()),
                         options,
-                        Arc::clone(&plan_provider),
                         pending_plan.as_deref(),
-                        explanation,
+                        Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Status(argument) => {
                     let argument = (!argument.is_empty()).then(|| argument.to_owned());
-                    run_plan_command(
+                    run_plan_command_with_optional_session(
                         slowcode_app::plan::PlanCommand::Status(argument),
                         options,
                         None,
                         Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
                 SlashCommand::Next => {
-                    run_plan_command(
+                    run_plan_command_with_optional_session(
                         slowcode_app::plan::PlanCommand::Next,
                         options,
                         None,
                         Arc::clone(&plan_provider),
+                        Some(session),
                     )
                     .await
                 }
