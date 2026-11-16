@@ -103,6 +103,44 @@ SLOWCODE_INSTALL_DIR="$HOME/bin" sh install.sh --uninstall
 
 workspace 内的 `.slowcode/` 与 `.scratch/` 需要手动删除。
 
+### 更新
+
+slowcode 不会在后台静默替换自身。检查更新只是只读的网络请求，真正的替换必须
+由用户确认：
+
+```bash
+slowcode update --check   # 只报告当前版本与最新版本
+slowcode update           # 下载、校验 sha256、替换当前可执行文件
+```
+
+release 构建的 TUI 启动后会在后台查询最新 release（2 秒超时），结果缓存 24
+小时。发现新版本时只显示一行提示，不弹模态、不打断当前 turn：
+
+```text
+update available: 0.2.0 (current 0.1.0); type /update
+```
+
+输入 `/update` 会先确认 `y/n`，确认后在一个后台任务里下载并替换，完成时提示
+重启。当前进程仍然运行旧代码，必须重启才会生效。`slowcode update` 与 TUI
+共用同一条下载、校验与替换路径。模型不能触发更新，更新也不会写入
+`.slowcode/`、`.scratch/` 或 workspace。
+
+启动检查是默认开启的，但以下情况会跳过：
+
+- `SLOWCODE_UPDATE_CHECK=0`（也接受 `false`、`no`、`off`）
+- 设置了 `CI`
+- debug 构建（`cargo run` / `cargo build`）
+- `SLOWCODE_VERSION` 固定版本时抑制更新提示，且 `slowcode update` 会拒绝执行
+
+`slowcode update --check` 是显式命令，不受启动检查的开关影响，但仍复用 24 小时
+缓存。包管理器安装的路径（Homebrew 的 `/Cellar/` 或 `/opt/homebrew/`）不会
+自更新，会提示改用 `brew upgrade slowcode`。安装目录不可写时报明确错误，不会
+尝试提权。Windows 原生自替换暂不支持，会提示重新运行安装脚本。
+
+为什么不做自动更新：替换二进制是供应链敏感且不可回滚的动作。sha256 与发布包
+同源，只能防止传输损坏，不能防御发布渠道被攻破；签名验证尚未实现。自动检查
+更新是低风险、可缓存的只读动作，替换必须留给用户。
+
 ### 从源码构建
 
 从源码构建需要 Rust 1.88 或更高。
@@ -208,6 +246,7 @@ workflow 状态写在目标 workspace 的 `.scratch/workflows/<workflow_id>/`，
 | `crates/slowcode-context` | AGENTS.md、GLOSSARY.md 与 HANDOFF.md 指针 |
 | `crates/slowcode-mcp` | MCP 配置、连接与工具调用 |
 | `crates/slowcode-skills` | 本地 skill 安装、校验与锁文件 |
+| `crates/slowcode-update` | 版本比较、更新检查缓存、校验与自替换 |
 | `crates/slowcode-tests` | 跨 crate 集成测试 |
 
 ## 开发与测试
