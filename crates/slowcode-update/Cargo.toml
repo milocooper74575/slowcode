@@ -1,0 +1,22 @@
+[package]
+name = "slowcode-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Version checks and user-confirmed self-update for slowcode"
+license = "MIT"
+publish = false
+
+[lib]
+name = "slowcode_update"
+path = "src/lib.rs"
+
+[dependencies]
+flate2 = "1.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["macros", "rt", "time"] }
