@@ -11,6 +11,10 @@ use ratatui::{
     text::{Line, Span},
 };
 
+const MAX_TABLE_COLUMNS: usize = 4;
+const MAX_TABLE_ROWS: usize = 6;
+const MAX_TABLE_CELL_WIDTH: usize = 18;
+
 /// Render one Markdown document into terminal lines.
 #[must_use]
 pub fn render(text: &str, base: Color) -> Vec<Line<'static>> {
@@ -212,10 +216,6 @@ fn table_cells(line: &str) -> Vec<&str> {
 
 fn render_table(lines: &[&str], base: Color) -> (Vec<Line<'static>>, usize) {
     let header = table_cells(lines[0]);
-    let mut widths = header
-        .iter()
-        .map(|cell| display_width(cell).clamp(3, 40))
-        .collect::<Vec<_>>();
     let mut index = 2;
     let mut rows = Vec::new();
     while index < lines.len() && lines[index].contains('|') {
@@ -223,11 +223,35 @@ fn render_table(lines: &[&str], base: Color) -> (Vec<Line<'static>>, usize) {
         if cells.len() != header.len() {
             break;
         }
-        for (column, cell) in cells.iter().enumerate() {
-            widths[column] = widths[column].max(display_width(cell).min(40));
-        }
         rows.push(cells);
         index += 1;
+    }
+
+    let total_columns = header.len();
+    let columns = select_columns(&header);
+    let header = columns
+        .iter()
+        .map(|column| header[*column])
+        .collect::<Vec<_>>();
+    let mut widths = header
+        .iter()
+        .map(|cell| display_width(cell).clamp(3, MAX_TABLE_CELL_WIDTH))
+        .collect::<Vec<_>>();
+    let hidden_rows = rows.len().saturating_sub(MAX_TABLE_ROWS);
+    let rows = rows
+        .into_iter()
+        .take(MAX_TABLE_ROWS)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| row[*column])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for row in &rows {
+        for (column, cell) in row.iter().enumerate() {
+            widths[column] = widths[column].max(display_width(cell).min(MAX_TABLE_CELL_WIDTH));
+        }
     }
 
     let mut out = Vec::new();
@@ -251,7 +275,60 @@ fn render_table(lines: &[&str], base: Color) -> (Vec<Line<'static>>, usize) {
     for row in rows {
         out.push(table_row(&row, &widths, Style::default().fg(base)));
     }
+    let hidden_columns = total_columns.saturating_sub(columns.len());
+    if hidden_rows > 0 || hidden_columns > 0 {
+        let mut note = String::from("…");
+        if hidden_rows > 0 {
+            note.push_str(&format!(" {hidden_rows} more row(s)"));
+        }
+        if hidden_columns > 0 {
+            if hidden_rows > 0 {
+                note.push(',');
+            }
+            note.push_str(&format!(" {hidden_columns} more column(s)"));
+        }
+        note.push_str("; full table in the plan artifact");
+        out.push(Line::from(Span::styled(
+            note,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     (out, index)
+}
+
+fn select_columns(header: &[&str]) -> Vec<usize> {
+    if header.len() <= MAX_TABLE_COLUMNS {
+        return (0..header.len()).collect();
+    }
+    let priority = [
+        "任务",
+        "认知属性",
+        "执行状态",
+        "用户角色",
+        "用户动作",
+        "结果",
+        "状态",
+    ];
+    let mut selected = Vec::new();
+    for name in priority {
+        if selected.len() == MAX_TABLE_COLUMNS {
+            break;
+        }
+        if let Some(index) = header.iter().position(|cell| cell.contains(name))
+            && !selected.contains(&index)
+        {
+            selected.push(index);
+        }
+    }
+    for index in 0..header.len() {
+        if selected.len() == MAX_TABLE_COLUMNS {
+            break;
+        }
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    selected
 }
 
 fn table_row(cells: &[&str], widths: &[usize], style: Style) -> Line<'static> {
@@ -261,13 +338,33 @@ fn table_row(cells: &[&str], widths: &[usize], style: Style) -> Line<'static> {
             spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
         }
         let width = widths[column];
-        let cell_width = display_width(cell);
-        spans.push(Span::styled((*cell).to_owned(), style));
+        let fitted = fit_cell(cell, width);
+        let cell_width = display_width(&fitted);
+        spans.push(Span::styled(fitted, style));
         if cell_width < width {
             spans.push(Span::raw(" ".repeat(width - cell_width)));
         }
     }
     Line::from(spans)
+}
+
+fn fit_cell(cell: &str, width: usize) -> String {
+    if display_width(cell) <= width {
+        return (*cell).to_owned();
+    }
+    let limit = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for character in cell.chars() {
+        let character_width = display_width(&character.to_string());
+        if used + character_width > limit {
+            break;
+        }
+        out.push(character);
+        used += character_width;
+    }
+    out.push('…');
+    out
 }
 
 fn display_width(text: &str) -> usize {
@@ -446,6 +543,48 @@ mod tests {
         );
         assert!(rendered.len() >= 3);
         assert_eq!(rendered[0].width(), rendered[2].width());
+    }
+
+    #[test]
+    fn wide_tables_keep_key_columns_and_report_the_rest() {
+        let rendered = render(
+            "| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |\n\
+|---|---|---|---|---|---|---|---|\n\
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |",
+            Color::Reset,
+        );
+        let flat = text(&rendered);
+        assert!(flat.contains("任务"));
+        assert!(flat.contains("认知属性"));
+        assert!(flat.contains("执行状态"));
+        assert!(flat.contains("用户角色"));
+        assert!(!flat.contains("判定依据"));
+        assert!(flat.contains("4 more column(s)"));
+        assert!(flat.contains("plan artifact"));
+    }
+
+    #[test]
+    fn long_cells_are_truncated_without_breaking_alignment() {
+        let rendered = render(
+            "| 任务 | 状态 |\n|---|---|\n| 这是一个非常非常非常非常非常长的任务名称 | 可执行 |",
+            Color::Reset,
+        );
+        let flat = text(&rendered);
+        assert!(flat.contains('…'), "{flat}");
+        for line in &rendered {
+            assert!(line.width() <= 40, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn many_rows_are_summarized() {
+        let mut table = String::from("| 任务 | 状态 |\n|---|---|\n");
+        for index in 0..10 {
+            table.push_str(&format!("| task {index} | ok |\n"));
+        }
+        let rendered = render(&table, Color::Reset);
+        let flat = text(&rendered);
+        assert!(flat.contains("4 more row(s)"), "{flat}");
     }
 
     #[test]

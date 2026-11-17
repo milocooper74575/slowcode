@@ -341,6 +341,7 @@ pub struct App {
     plan_started: Option<Instant>,
     plan_expects_assistant: bool,
     plan_output_seen: bool,
+    auto_plan_step: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 }
 
@@ -396,6 +397,7 @@ impl App {
             plan_started: None,
             plan_expects_assistant: false,
             plan_output_seen: false,
+            auto_plan_step: false,
             app_tx,
         };
         for event in history {
@@ -515,6 +517,7 @@ impl App {
                 self.pending_approval = None;
                 self.state = RunState::Idle;
                 let output_seen = std::mem::take(&mut self.plan_output_seen);
+                let auto_step = std::mem::take(&mut self.auto_plan_step);
                 let expects_assistant = std::mem::take(&mut self.plan_expects_assistant);
                 self.plan_started = None;
                 self.assistant_live = None;
@@ -527,6 +530,8 @@ impl App {
                             } else {
                                 self.push(MessageBlock::System(outcome.output));
                             }
+                        } else if output_seen && let Some(hint) = plan_followup(&outcome.output) {
+                            self.push_system(hint);
                         }
                         if let Some(workflow_id) = &outcome.workflow_id {
                             self.plan_workflow = Some(workflow_id.clone());
@@ -534,6 +539,9 @@ impl App {
                         self.refresh_plan_phase();
                         if expects_assistant {
                             self.push_system(format!("[plan saved to {}]", outcome.path.display()));
+                        }
+                        if auto_step {
+                            self.start_approved_step();
                         }
                     }
                     Err(error) => {
@@ -1143,9 +1151,52 @@ impl App {
             ));
             return KeyAction::none();
         }
+        if let Some(question_id) = self.pending_plan_question() {
+            self.push(MessageBlock::System(format!(
+                "recording answer to {question_id}"
+            )));
+            return self.handle_plan_command(Command::Answer(input)).await;
+        }
+        if self.plan_review_ready() && is_approval_text(&input) {
+            self.push(MessageBlock::System(
+                "approving the classification and starting execution".to_owned(),
+            ));
+            return self.handle_plan_command(Command::Approve).await;
+        }
         self.ensure_await_user_coach().await;
         self.start_turn(input);
         KeyAction::none()
+    }
+
+    /// The open Plan question that a plain-text submission answers.
+    ///
+    /// While a workflow is in Interview or Reclassify, ordinary text is an
+    /// answer, not a new turn. `/ask` stays available for side questions.
+    fn pending_plan_question(&self) -> Option<String> {
+        let state = WorkflowStore::new(&self.workspace())
+            .load_active()
+            .ok()
+            .flatten()?;
+        if !matches!(
+            state.phase,
+            slowcode_app::workflow::Phase::Interview
+                | slowcode_app::workflow::Phase::Reclassify
+                | slowcode_app::workflow::Phase::Distill
+        ) {
+            return None;
+        }
+        state
+            .open_questions()
+            .first()
+            .map(|question| question.question_id.clone())
+    }
+
+    fn plan_review_ready(&self) -> bool {
+        WorkflowStore::new(&self.workspace())
+            .load_active()
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.phase == slowcode_app::workflow::Phase::Review)
     }
 
     /// AwaitUser is read-only. Ordinary prompts act as a coach, which is the
@@ -1428,6 +1479,11 @@ impl App {
         let label = command.label();
         let is_plan = matches!(command, slowcode_app::plan::PlanCommand::Plan(_));
         let expects_assistant = command.uses_model();
+        let desired_role = self
+            .active_phase()
+            .map(phase_role)
+            .or_else(|| is_plan.then_some(slowcode_roles::RoleName::Navigator));
+        let switch_to = desired_role.filter(|role| role.as_str() != self.role);
         self.plan_started = Some(Instant::now());
         self.plan_phase = self
             .active_phase()
@@ -1435,6 +1491,7 @@ impl App {
         self.plan_workflow = self.active_workflow_id();
         self.plan_expects_assistant = expects_assistant;
         self.plan_output_seen = false;
+        self.auto_plan_step = matches!(command, slowcode_app::plan::PlanCommand::Approve);
         self.assistant_live = None;
         self.reasoning_live = None;
         self.running = true;
@@ -1446,12 +1503,34 @@ impl App {
         self.push_system(format!("running /{label}"));
         tokio::spawn(async move {
             let mut runtime = runtime.lock().await;
+            if let Some(role) = switch_to
+                && let Err(error) = runtime.switch_role(role).await
+            {
+                let _ = tx.send(AppEvent::PlanFinished(Err(error.to_string())));
+                return;
+            }
             let result = runtime
                 .run_plan_command(command, cancel)
                 .await
                 .map_err(|error| error.to_string());
             let _ = tx.send(AppEvent::PlanFinished(result));
         });
+    }
+
+    /// Continue an approved workflow without asking for the next phase command.
+    ///
+    /// Approval decides the phase. Scaffold runs for user-owned core tasks,
+    /// and TestFix runs the fixed test contract. The phase after those steps
+    /// still stops where a human is required.
+    fn start_approved_step(&mut self) {
+        let Some(phase) = self.active_phase() else {
+            return;
+        };
+        let Some(command) = approved_step_command(phase) else {
+            return;
+        };
+        self.push_system(format!("starting /{}", command.label()));
+        self.start_plan(command);
     }
 
     async fn handle_command(&mut self, command: Command) -> KeyAction {
@@ -1484,6 +1563,17 @@ impl App {
             | Command::Workflow(_)
             | Command::Reclassify(_)
             | Command::Hint(_) => self.handle_plan_command(command).await,
+            Command::Ask(question) => {
+                let question = question.trim().to_owned();
+                if question.is_empty() {
+                    self.push(MessageBlock::Error("usage: /ask <question>".to_owned()));
+                    return KeyAction::none();
+                }
+                if self.ensure_plan_role(&Command::Ask(question.clone())).await {
+                    self.start_turn(question);
+                }
+                KeyAction::none()
+            }
             other => self.handle_info_command(other),
         }
     }
@@ -3034,11 +3124,15 @@ fn block_lines_with_live(block: &MessageBlock, live: bool) -> Vec<Line<'static>>
             }
         }
         MessageBlock::Reasoning(text) => {
+            let summary = first_meaningful_line(text, 160);
             lines.push(Line::from(Span::styled(
-                "thinking",
+                if summary.is_empty() {
+                    "thinking".to_owned()
+                } else {
+                    format!("thinking: {summary}")
+                },
                 Style::default().fg(Color::DarkGray),
             )));
-            push_text(&mut lines, text, Color::DarkGray);
         }
         MessageBlock::Prompt(text) => push_text(&mut lines, text, Color::Yellow),
         MessageBlock::Tool {
@@ -3082,15 +3176,49 @@ fn push_tool_lines(
         ),
     ]));
     if !arguments.is_empty() {
-        push_text(lines, arguments, Color::DarkGray);
+        push_text(lines, &clip_line(arguments, 200), Color::DarkGray);
     }
     if let Some(result) = result {
         push_text(
             lines,
-            result,
+            &summarize_block(result, 6, 200),
             if is_error { Color::Red } else { Color::Gray },
         );
     }
+}
+
+fn first_meaningful_line(text: &str, maximum: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    clip_line(line, maximum)
+}
+
+fn clip_line(text: &str, maximum: usize) -> String {
+    let mut out = String::new();
+    for (index, character) in text.chars().enumerate() {
+        if index >= maximum {
+            out.push('…');
+            break;
+        }
+        out.push(character);
+    }
+    out
+}
+
+fn summarize_block(text: &str, maximum_lines: usize, maximum_chars: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    for line in lines.iter().take(maximum_lines) {
+        out.push(clip_line(line, maximum_chars));
+    }
+    let hidden = lines.len().saturating_sub(maximum_lines);
+    if hidden > 0 {
+        out.push(format!("… {hidden} more line(s)"));
+    }
+    out.join("\n")
 }
 
 fn push_text(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
@@ -3229,6 +3357,29 @@ fn phase_role(phase: slowcode_app::workflow::Phase) -> slowcode_roles::RoleName 
         | Phase::Done
         | Phase::Blocked => slowcode_roles::RoleName::Navigator,
     }
+}
+
+fn approved_step_command(
+    phase: slowcode_app::workflow::Phase,
+) -> Option<slowcode_app::plan::PlanCommand> {
+    match phase {
+        slowcode_app::workflow::Phase::Scaffold => Some(slowcode_app::plan::PlanCommand::Scaffold),
+        slowcode_app::workflow::Phase::TestFix => Some(slowcode_app::plan::PlanCommand::Test),
+        _ => None,
+    }
+}
+
+/// The workflow marker line and the next-step lines that follow it.
+///
+/// Plan commands stream the assistant body. The marker and the next command
+/// are appended to `PlanOutcome::output`, so the TUI must surface them even
+/// when the streamed body was already rendered.
+fn plan_followup(output: &str) -> Option<String> {
+    let start = output.rfind("[workflow:")?;
+    let mut lines = output[start..].lines();
+    let _marker = lines.next()?;
+    let rest = lines.collect::<Vec<_>>().join("\n");
+    (!rest.trim().is_empty()).then(|| rest.trim().to_owned())
 }
 
 const PHASE_ORDER: [slowcode_app::workflow::Phase; 9] = [
@@ -3844,7 +3995,48 @@ fn command_needs_credential(command: &Command) -> bool {
             | Command::Fix
             | Command::Execute
             | Command::Distill(_)
+            | Command::Ask(_)
     )
+}
+
+/// Whether plain text is an explicit approval of the current Review table.
+///
+/// The match is deliberately narrow. A side question in Review must still
+/// reach the model, so only short, unambiguous approval phrases count.
+fn is_approval_text(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(
+                    character,
+                    '。' | '！' | '，' | ',' | '.' | '!' | '?' | '？' | ':' | '：'
+                )
+        })
+        .collect::<String>();
+    if normalized.is_empty() {
+        return false;
+    }
+    matches!(
+        normalized.as_str(),
+        "y" | "yes"
+            | "ok"
+            | "okay"
+            | "approve"
+            | "approved"
+            | "同意"
+            | "批准"
+            | "通过"
+            | "可以"
+            | "继续"
+            | "进入下一阶段"
+            | "开始执行"
+            | "执行"
+    ) || normalized.starts_with("同意")
+        || normalized.starts_with("批准")
+        || normalized.starts_with("通过")
 }
 
 fn is_plan_command(command: &Command) -> bool {
@@ -5910,8 +6102,7 @@ mod tests {
     #[test]
     fn block_lines_render_reasoning_tool_and_error_blocks() {
         let lines = block_lines(&MessageBlock::Reasoning("hmm".to_owned()));
-        assert_eq!(line_text(&lines[0]), "thinking");
-        assert_eq!(line_text(&lines[1]), "hmm");
+        assert_eq!(line_text(&lines[0]), "thinking: hmm");
 
         let lines = block_lines(&MessageBlock::Tool {
             call_id: "call-1".to_owned(),
@@ -5928,6 +6119,32 @@ mod tests {
         let lines = block_lines(&MessageBlock::Error("bad".to_owned()));
         assert_eq!(line_text(&lines[0]), "error");
         assert_eq!(line_text(&lines[1]), "bad");
+
+        let long_result = (0..10)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = block_lines(&MessageBlock::Tool {
+            call_id: "call-2".to_owned(),
+            name: "read".to_owned(),
+            arguments: "{}".to_owned(),
+            status: "done".to_owned(),
+            result: Some(long_result),
+            is_error: false,
+        });
+        let flat = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("line 0"), "{flat}");
+        assert!(!flat.contains("line 9"), "{flat}");
+        assert!(flat.contains("4 more line(s)"), "{flat}");
     }
 
     #[test]
@@ -5957,6 +6174,80 @@ mod tests {
         assert!(is_plan_command(&Command::Hint("why".to_owned())));
         assert!(!is_plan_command(&Command::Help(None)));
         assert!(!is_plan_command(&Command::Model(None)));
+    }
+
+    #[test]
+    fn plain_language_approval_is_recognized_narrowly() {
+        assert!(is_approval_text("同意"));
+        assert!(is_approval_text("同意，进入下一阶段"));
+        assert!(is_approval_text("Approve."));
+        assert!(is_approval_text("y"));
+        assert!(!is_approval_text("不同意"));
+        assert!(!is_approval_text("如何才能进入 review 阶段？"));
+        assert!(!is_approval_text(""));
+    }
+
+    #[test]
+    fn approval_automatically_starts_the_next_execution_step() {
+        use slowcode_app::workflow::Phase;
+
+        assert_eq!(
+            approved_step_command(Phase::Scaffold),
+            Some(slowcode_app::plan::PlanCommand::Scaffold)
+        );
+        assert_eq!(
+            approved_step_command(Phase::TestFix),
+            Some(slowcode_app::plan::PlanCommand::Test)
+        );
+        assert_eq!(approved_step_command(Phase::Review), None);
+        assert_eq!(approved_step_command(Phase::AwaitUser), None);
+    }
+
+    #[test]
+    fn the_next_plan_step_survives_streamed_output() {
+        let output = "## 证据包\n\nbody\n\n[workflow: plan-1 phase: interview]\nnext: /answer #q-1 <answer>\nquestion q-1: pick one";
+        let hint = plan_followup(output).expect("hint");
+        assert!(hint.starts_with("next: /answer #q-1"), "{hint}");
+        assert!(hint.contains("question q-1"), "{hint}");
+        assert_eq!(plan_followup("no marker"), None);
+    }
+
+    #[tokio::test]
+    async fn plain_text_targets_the_open_interview_question() {
+        use slowcode_app::workflow::{Question, QuestionKind, QuestionStatus};
+
+        let root = unique_temp_dir("answer-routing");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = WorkflowStore::new(&workspace);
+        store
+            .create_with_questions(
+                "first",
+                None,
+                Vec::new(),
+                vec![Question {
+                    question_id: String::new(),
+                    task_id: None,
+                    kind: QuestionKind::SemiKnown,
+                    prompt: "选 A 还是 B？".to_owned(),
+                    options: vec!["A".to_owned(), "B".to_owned()],
+                    recommendation: Some("A".to_owned()),
+                    reason: "兼容".to_owned(),
+                    status: QuestionStatus::Open,
+                    criteria: "必须选一个".to_owned(),
+                    created_at: 0,
+                    answer: None,
+                    answer_source: None,
+                    answer_snapshot: None,
+                    attempts: 0,
+                    last_gap: None,
+                }],
+            )
+            .expect("workflow");
+
+        let (app, _, _) = app_in(workspace.clone()).await;
+        assert_eq!(app.pending_plan_question().as_deref(), Some("q-1"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     async fn app_in(
