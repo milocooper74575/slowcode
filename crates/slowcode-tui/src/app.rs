@@ -3173,7 +3173,8 @@ impl App {
     }
 
     fn draw_messages(&mut self, frame: &mut Frame, area: Rect) {
-        let lines = message_lines_with_live(&self.messages, self.assistant_live);
+        let lines =
+            message_lines_with_live(&self.messages, self.assistant_live, area.width as usize);
         let width = area.width.max(1);
         let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
         let content_height = widget.line_count(width).min(u16::MAX as usize) as u16;
@@ -3371,30 +3372,38 @@ impl App {
 }
 
 #[cfg(test)]
+const TEST_MESSAGE_WIDTH: usize = 100;
+
+#[cfg(test)]
 fn message_lines(messages: &[MessageBlock]) -> Vec<Line<'static>> {
-    message_lines_with_live(messages, None)
+    message_lines_with_live(messages, None, TEST_MESSAGE_WIDTH)
 }
 
 fn message_lines_with_live(
     messages: &[MessageBlock],
     live_assistant: Option<usize>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, block) in messages.iter().enumerate() {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.extend(block_lines_with_live(block, live_assistant == Some(index)));
+        lines.extend(block_lines_with_live(
+            block,
+            live_assistant == Some(index),
+            width,
+        ));
     }
     lines
 }
 
 #[cfg(test)]
 fn block_lines(block: &MessageBlock) -> Vec<Line<'static>> {
-    block_lines_with_live(block, false)
+    block_lines_with_live(block, false, TEST_MESSAGE_WIDTH)
 }
 
-fn block_lines_with_live(block: &MessageBlock, live: bool) -> Vec<Line<'static>> {
+fn block_lines_with_live(block: &MessageBlock, live: bool, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match block {
         MessageBlock::User(text) => push_user_text(&mut lines, text, Color::Cyan),
@@ -3402,7 +3411,7 @@ fn block_lines_with_live(block: &MessageBlock, live: bool) -> Vec<Line<'static>>
             if live {
                 push_text_aligned(&mut lines, text, Color::Reset, Alignment::Left);
             } else {
-                lines.extend(crate::markdown::render(text, Color::Reset));
+                lines.extend(crate::markdown::render(text, Color::Reset, width));
             }
         }
         MessageBlock::Reasoning(text) => {
