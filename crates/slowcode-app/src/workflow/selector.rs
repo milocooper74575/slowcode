@@ -713,7 +713,7 @@ mod tests {
         write_package(&workspace, ".", "fixture");
         let docs = task("task-1", "AGENTS.md");
 
-        match derive_selector(&workspace, &[docs.clone()], &cargo(), None) {
+        match derive_selector(&workspace, std::slice::from_ref(&docs), &cargo(), None) {
             SelectorChoice::NeedsUser { options, .. } => {
                 assert_eq!(
                     options,
