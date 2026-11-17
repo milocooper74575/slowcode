@@ -2937,7 +2937,7 @@ impl App {
 
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let composer_height = composer_height(&self.composer);
+        let composer_height = composer_height(&self.composer, area.width);
         let footer_height = if self.plan_phase.is_some() { 2 } else { 1 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -3024,7 +3024,7 @@ impl App {
             )
         };
         let view = composer_view(&display, cursor, completion.as_ref(), area);
-        let widget = Paragraph::new(view.lines).scroll((0, view.horizontal_scroll));
+        let widget = Paragraph::new(view.lines).scroll((view.vertical_scroll, 0));
         frame.render_widget(widget, area);
         if let Some(completion) = &completion {
             let text = match completion.description.as_deref() {
@@ -3075,7 +3075,7 @@ impl App {
         } else if self.running {
             "Esc interrupt  PgUp/PgDn scroll  Ctrl-C quit"
         } else {
-            "Shift+Enter/Ctrl-J newline  PgUp/PgDn scroll  Ctrl-C quit"
+            "Enter sends  Ctrl-J/Alt+Enter newline  PgUp/PgDn scroll  Ctrl-C quit"
         };
         let progress = self.context_progress(hint.chars().count(), footer_area.width);
         let width = footer_area.width as usize;
@@ -4055,13 +4055,49 @@ fn recovered_approval_details(record: &ApprovalRecord) -> String {
 
 struct ComposerView {
     lines: Vec<Line<'static>>,
-    horizontal_scroll: u16,
+    vertical_scroll: u16,
     cursor_x: u16,
     cursor_y: u16,
 }
 
-fn composer_height(composer: &str) -> u16 {
-    (composer.split('\n').count() as u16).clamp(1, 6)
+struct VisualLine {
+    text: String,
+    logical_index: usize,
+    chunk_start: usize,
+    chunk_end: usize,
+}
+
+fn composer_widths(area_width: u16) -> (usize, usize) {
+    let max_width = area_width.max(1) as usize;
+    let prefix_width = 2.min(max_width.saturating_sub(1));
+    (prefix_width, max_width.saturating_sub(prefix_width).max(1))
+}
+
+fn composer_height(composer: &str, area_width: u16) -> u16 {
+    let (_, content_width) = composer_widths(area_width);
+    let lines = composer
+        .split('\n')
+        .map(|line| wrap_ranges(line, content_width).len())
+        .sum::<usize>();
+    u16::try_from(lines).unwrap_or(u16::MAX).clamp(1, 10)
+}
+
+fn wrap_ranges(line: &str, content_width: usize) -> Vec<(usize, usize)> {
+    let content_width = content_width.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut width = 0;
+    for (index, character) in line.char_indices() {
+        let character_width = Line::from(character.to_string()).width();
+        if width > 0 && width + character_width > content_width {
+            ranges.push((start, index));
+            start = index;
+            width = 0;
+        }
+        width += character_width;
+    }
+    ranges.push((start, line.len()));
+    ranges
 }
 
 /// Replace every character so a pasted key never reaches the screen.
@@ -4226,21 +4262,57 @@ fn composer_view(
     completion: Option<&CommandCompletion>,
     area: Rect,
 ) -> ComposerView {
-    let raw_lines = composer.split('\n').collect::<Vec<_>>();
-    let total = raw_lines.len();
-    let height = composer_height(composer) as usize;
     let cursor = cursor.min(composer.len());
+    let (prefix_width, content_width) = composer_widths(area.width);
+    let mut visual = Vec::new();
+    let mut logical_start = 0;
+    for (logical_index, line) in composer.split('\n').enumerate() {
+        for (start, end) in wrap_ranges(line, content_width) {
+            visual.push(VisualLine {
+                text: format!(
+                    "{}{}",
+                    if logical_index == 0 && start == 0 {
+                        "> "
+                    } else {
+                        "  "
+                    },
+                    &line[start..end]
+                ),
+                logical_index,
+                chunk_start: logical_start + start,
+                chunk_end: logical_start + end,
+            });
+        }
+        logical_start += line.len() + 1;
+    }
+    let height = composer_height(composer, area.width) as usize;
     let cursor_line = composer[..cursor].matches('\n').count();
-    let line_start = composer[..cursor].rfind('\n').map_or(0, |index| index + 1);
-    let cursor_column = 2 + Line::from(&composer[line_start..cursor]).width();
-    let offset = cursor_line
+    let cursor_chunks = visual
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.logical_index == cursor_line)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut cursor_visual = cursor_chunks.last().copied().unwrap_or(0);
+    for (position, index) in cursor_chunks.iter().enumerate() {
+        let line = &visual[*index];
+        if cursor < line.chunk_end
+            || (cursor == line.chunk_end && position + 1 == cursor_chunks.len())
+        {
+            cursor_visual = *index;
+            break;
+        }
+    }
+    let cursor_chunk_start = visual.get(cursor_visual).map_or(0, |line| line.chunk_start);
+    let cursor_column =
+        prefix_width + Line::from(&composer[cursor_chunk_start.min(cursor)..cursor]).width();
+    let offset = cursor_visual
         .saturating_sub(height.saturating_sub(1))
-        .min(total.saturating_sub(height));
+        .min(visual.len().saturating_sub(height));
     let mut lines = Vec::new();
-    for (index, line) in raw_lines.iter().enumerate().skip(offset).take(height) {
-        let prefix = if index == 0 { "> " } else { "  " };
-        let mut spans = vec![Span::raw(format!("{prefix}{line}"))];
-        if index == total - 1
+    for (index, line) in visual.iter().enumerate().skip(offset).take(height) {
+        let mut spans = vec![Span::raw(line.text.clone())];
+        if index == visual.len() - 1
             && let Some(completion) = completion
         {
             spans.push(Span::styled(
@@ -4250,17 +4322,10 @@ fn composer_view(
         }
         lines.push(Line::from(spans));
     }
-
-    let max_width = area.width.max(1) as usize;
-    let horizontal_scroll = cursor_column
-        .saturating_sub(max_width.saturating_sub(1))
-        .min(u16::MAX as usize) as u16;
-    let cursor_x = area.x.saturating_add(
-        cursor_column
-            .saturating_sub(horizontal_scroll as usize)
-            .min(max_width.saturating_sub(1)) as u16,
-    );
-    let cursor_row = cursor_line.saturating_sub(offset).min(height - 1);
+    let cursor_x = area
+        .x
+        .saturating_add(cursor_column.min(area.width.max(1).saturating_sub(1) as usize) as u16);
+    let cursor_row = cursor_visual.saturating_sub(offset).min(height - 1);
     let cursor_y = area
         .y
         .saturating_add(cursor_row as u16)
@@ -4268,7 +4333,7 @@ fn composer_view(
 
     ComposerView {
         lines,
-        horizontal_scroll,
+        vertical_scroll: offset.min(u16::MAX as usize) as u16,
         cursor_x,
         cursor_y,
     }
@@ -4470,7 +4535,8 @@ fn parse_approval_reply(input: &str) -> ApprovalReply {
 fn is_newline_key(key: &KeyEvent) -> bool {
     (key.code == KeyCode::Enter
         && (key.modifiers.contains(KeyModifiers::SHIFT)
-            || key.modifiers.contains(KeyModifiers::CONTROL)))
+            || key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)))
         || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
@@ -4718,7 +4784,7 @@ mod tests {
         let view = composer_view("hello", 5, None, area);
         assert_eq!(view.cursor_x, 10);
         assert_eq!(view.cursor_y, 10);
-        assert_eq!(view.horizontal_scroll, 0);
+        assert_eq!(view.vertical_scroll, 0);
 
         let area = Rect {
             x: 3,
@@ -4732,16 +4798,44 @@ mod tests {
     }
 
     #[test]
-    fn composer_scrolls_long_lines_to_keep_the_cursor_visible() {
+    fn composer_soft_wraps_long_lines() {
         let area = Rect {
             x: 0,
             y: 0,
             width: 10,
-            height: 1,
+            height: 10,
         };
         let view = composer_view("012345678901234567890123456789", 30, None, area);
-        assert_eq!(view.cursor_x, 9);
-        assert!(view.horizontal_scroll > 0);
+        assert_eq!(view.lines.len(), 4);
+        assert_eq!(line_text(&view.lines[0]), "> 01234567");
+        assert_eq!(line_text(&view.lines[1]), "  89012345");
+        assert_eq!(line_text(&view.lines[2]), "  67890123");
+        assert_eq!(line_text(&view.lines[3]), "  456789");
+        assert_eq!(view.cursor_x, 8);
+        assert_eq!(view.cursor_y, 3);
+        assert_eq!(view.vertical_scroll, 0);
+    }
+
+    #[test]
+    fn composer_wraps_wide_characters_by_display_width() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 10,
+        };
+        let view = composer_view("中文中文中文", 18, None, area);
+        assert_eq!(view.lines.len(), 2);
+        assert_eq!(line_text(&view.lines[0]), "> 中文中文中");
+        assert_eq!(line_text(&view.lines[1]), "  文");
+        assert_eq!(view.cursor_x, 4);
+        assert_eq!(view.cursor_y, 1);
+    }
+
+    #[test]
+    fn composer_height_stops_at_ten_lines() {
+        let composer = (0..20).map(|_| "x").collect::<Vec<_>>().join("\n");
+        assert_eq!(composer_height(&composer, 40), 10);
     }
 
     #[test]
@@ -5020,7 +5114,7 @@ mod tests {
                 let area = Rect::new(0, 5, 20, 1);
                 let view = composer_view("hello", 5, None, area);
                 frame.render_widget(
-                    Paragraph::new(view.lines).scroll((0, view.horizontal_scroll)),
+                    Paragraph::new(view.lines).scroll((view.vertical_scroll, 0)),
                     area,
                 );
                 frame.set_cursor_position(Position::new(view.cursor_x, view.cursor_y));
@@ -6705,7 +6799,8 @@ mod tests {
             .await;
         app.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL))
             .await;
-        assert_eq!(app.composer, "\n\n\n");
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT)).await;
+        assert_eq!(app.composer, "\n\n\n\n");
 
         let action = app
             .handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -6719,7 +6814,18 @@ mod tests {
         );
         let action = app.handle_key(release).await;
         assert!(!action.quit);
-        assert_eq!(app.composer, "\n\n\n");
+        assert_eq!(app.composer, "\n\n\n\n");
+    }
+
+    #[test]
+    fn newline_keys_include_iterm_fallbacks() {
+        assert!(is_newline_key(&key(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_newline_key(&key(KeyCode::Enter, KeyModifiers::ALT)));
+        assert!(is_newline_key(&key(KeyCode::Enter, KeyModifiers::SHIFT)));
+        assert!(!is_newline_key(&key(KeyCode::Enter, KeyModifiers::NONE)));
     }
 
     #[tokio::test]
