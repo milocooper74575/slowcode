@@ -63,6 +63,15 @@ Kernel changes:
 cargo test -p slowcode-kernel --lib
 ```
 
+Fast local loop, using `cargo-nextest` when installed so test binaries run in
+parallel and falling back to `cargo test`:
+
+```bash
+scripts/test-fast.sh                 # workspace without the vendored kernel
+scripts/test-fast.sh slowcode-tui    # one crate
+scripts/test-fast.sh --full          # workspace including the kernel
+```
+
 Real provider tests are `#[ignore]` and need `DEEPSEEK_API_KEY`:
 
 ```bash
