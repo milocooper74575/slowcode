@@ -20,7 +20,9 @@ use slowcode_app::{
     command_specs, complete, complete_answer, credential_status, escape_terminal, parse_command,
     remove_api_key, save_api_key,
 };
-use slowcode_feedback::{BundlePreview, BundleRequest, clip, preview, write_bundle};
+use slowcode_feedback::{
+    BundlePreview, BundleRequest, EvidenceScope, clip, parse_feedback_text, preview, write_bundle,
+};
 use slowcode_kernel::ui::{
     UiEvent, UiEventKind, UiMessageSource, UiTodo, UiToolFailure, UiTurnEnd, UiUsage,
 };
@@ -246,7 +248,11 @@ struct PendingFeedback {
     model: String,
     title: Option<String>,
     note: Option<String>,
+    expected: Option<String>,
+    reproduction: Option<String>,
+    scope: EvidenceScope,
     plan: Option<std::path::PathBuf>,
+    candidates: Vec<std::path::PathBuf>,
     console_errors: Vec<String>,
     prompt: String,
 }
@@ -276,16 +282,23 @@ struct SkillRemoveRequest {
     scope: SkillScope,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct FeedbackRequest {
     title: Option<String>,
     note: Option<String>,
+    expected: Option<String>,
+    reproduction: Option<String>,
+    scope: EvidenceScope,
     plan: Option<std::path::PathBuf>,
 }
 
 impl FeedbackRequest {
     fn is_empty(&self) -> bool {
-        self.title.is_none() && self.note.is_none() && self.plan.is_none()
+        self.title.is_none()
+            && self.note.is_none()
+            && self.expected.is_none()
+            && self.reproduction.is_none()
+            && self.plan.is_none()
     }
 }
 
@@ -325,6 +338,8 @@ pub struct App {
     pending_mcp: Option<PendingMcpInstall>,
     pending_update: Option<PendingUpdate>,
     pending_plan_new: Option<String>,
+    feedback_draft: bool,
+    feedback_draft_context: Option<FeedbackRequest>,
     available_update: Option<UpdateInfo>,
     update_check_requested: bool,
     mcp_busy: bool,
@@ -383,6 +398,8 @@ impl App {
             pending_mcp: None,
             pending_update: None,
             pending_plan_new: None,
+            feedback_draft: false,
+            feedback_draft_context: None,
             available_update: None,
             update_check_requested: false,
             mcp_busy: false,
@@ -925,6 +942,14 @@ impl App {
                 self.cancel_login();
                 return Some(KeyAction::none());
             }
+            if self.feedback_draft {
+                self.feedback_draft = false;
+                self.feedback_draft_context = None;
+                self.composer.clear();
+                self.composer_cursor = 0;
+                self.push_system("feedback draft cancelled".to_owned());
+                return Some(KeyAction::none());
+            }
             self.cancel_current_turn();
             return Some(KeyAction::none());
         }
@@ -1097,6 +1122,16 @@ impl App {
         if input.is_empty() {
             return KeyAction::none();
         }
+        if self.feedback_draft {
+            self.feedback_draft = false;
+            let context = self.feedback_draft_context.take();
+            self.composer.clear();
+            self.composer_cursor = 0;
+            self.history.push(input.clone());
+            self.history_cursor = None;
+            self.scroll_to_bottom();
+            return self.submit_feedback_draft(input, context).await;
+        }
         if self.pending_login.is_some() {
             self.composer.clear();
             self.composer_cursor = 0;
@@ -1161,6 +1196,27 @@ impl App {
             return KeyAction::none();
         }
         self.submit_text(input).await
+    }
+
+    async fn submit_feedback_draft(
+        &mut self,
+        text: String,
+        context: Option<FeedbackRequest>,
+    ) -> KeyAction {
+        let parsed = parse_feedback_text(&text);
+        let mut request = context.unwrap_or_default();
+        request.note = (!parsed.actual.trim().is_empty()).then_some(parsed.actual);
+        request.expected = parsed.expected.or(request.expected);
+        request.reproduction = parsed.reproduction.or(request.reproduction);
+        if request.is_empty() {
+            self.feedback_draft = true;
+            self.feedback_draft_context = Some(request);
+            self.push(MessageBlock::Error(
+                "feedback draft is empty; write what happened and press Enter".to_owned(),
+            ));
+            return KeyAction::none();
+        }
+        self.preview_feedback(request).await
     }
 
     async fn submit_text(&mut self, input: String) -> KeyAction {
@@ -1394,12 +1450,14 @@ impl App {
         }
 
         if let Some(pending) = self.pending_feedback.take() {
-            match parse_yes_no(input) {
-                YesNoReply::Yes => self.finish_feedback(pending),
-                YesNoReply::No => {
+            match parse_feedback_reply(input) {
+                FeedbackReply::Write => self.finish_feedback(pending),
+                FeedbackReply::Cancel => {
                     self.push(MessageBlock::System("feedback cancelled".to_owned()));
                 }
-                YesNoReply::Invalid => {
+                FeedbackReply::Edit => self.edit_feedback(pending),
+                FeedbackReply::Plan => self.pick_feedback_plan(pending),
+                FeedbackReply::Invalid => {
                     self.messages
                         .push(MessageBlock::Prompt(pending.prompt.clone()));
                     self.scroll_to_bottom();
@@ -1430,6 +1488,91 @@ impl App {
                 }
             }
         }
+    }
+
+    fn edit_feedback(&mut self, pending: PendingFeedback) {
+        let context = FeedbackRequest {
+            title: pending.title,
+            note: None,
+            expected: None,
+            reproduction: None,
+            scope: pending.scope,
+            plan: pending.plan,
+        };
+        self.start_feedback_draft(Some(context));
+        self.composer = feedback_text_from_parts(
+            pending.note.as_deref(),
+            pending.expected.as_deref(),
+            pending.reproduction.as_deref(),
+        );
+        self.composer_cursor = self.composer.len();
+        self.push_system("editing feedback draft; Enter previews again".to_owned());
+    }
+
+    fn pick_feedback_plan(&mut self, mut pending: PendingFeedback) {
+        if pending.candidates.is_empty() {
+            self.push_system("feedback: no plan artifacts found".to_owned());
+            self.pending_feedback = Some(pending);
+            return;
+        }
+        if pending.candidates.len() == 1 {
+            self.push_system(format!(
+                "feedback: only one plan artifact: {}",
+                pending.candidates[0].display()
+            ));
+            self.pending_feedback = Some(pending);
+            return;
+        }
+        let next = pending
+            .plan
+            .as_ref()
+            .and_then(|plan| pending.candidates.iter().position(|path| path == plan))
+            .map_or(0, |index| (index + 1) % pending.candidates.len());
+        let candidate = pending.candidates[next].clone();
+        match Self::preview_pending(&pending, candidate.clone()) {
+            Ok(preview) => {
+                pending.plan = Some(candidate);
+                pending.prompt = feedback_preview_text(
+                    &preview,
+                    pending.candidates.len(),
+                    pending.console_errors.len(),
+                );
+                self.messages
+                    .push(MessageBlock::Prompt(pending.prompt.clone()));
+                self.scroll_to_bottom();
+                self.pending_feedback = Some(pending);
+            }
+            Err(error) => {
+                self.push(MessageBlock::Error(format!("feedback: {error}")));
+                self.pending_feedback = Some(pending);
+            }
+        }
+    }
+
+    fn preview_pending(
+        pending: &PendingFeedback,
+        plan: std::path::PathBuf,
+    ) -> Result<BundlePreview, String> {
+        let os = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+        let workspace = pending.workspace.to_string_lossy();
+        preview(&BundleRequest {
+            session_id: &pending.session_id,
+            journal: &pending.journal,
+            workspace: Some(workspace.as_ref()),
+            version: env!("CARGO_PKG_VERSION"),
+            model: Some(&pending.model),
+            provider: None,
+            os: &os,
+            out_dir: pending.workspace.join("feedback").join(&pending.session_id),
+            title: pending.title.clone(),
+            note: pending.note.clone(),
+            expected: pending.expected.clone(),
+            reproduction: pending.reproduction.clone(),
+            scope: pending.scope,
+            plan: Some(plan),
+            console_errors: &pending.console_errors,
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn handle_recovered_approval(&mut self, input: &str, record: ApprovalRecord) {
@@ -2282,6 +2425,13 @@ impl App {
             ));
             return KeyAction::none();
         }
+        if self.pending_feedback.is_some() {
+            self.push(MessageBlock::System(
+                "feedback preview is waiting: reply y/w to write, e to edit, n/c to cancel"
+                    .to_owned(),
+            ));
+            return KeyAction::none();
+        }
         let request = match parse_feedback_request(argument) {
             Ok(request) => request,
             Err(error) => {
@@ -2290,9 +2440,24 @@ impl App {
             }
         };
         if request.is_empty() {
-            self.push(MessageBlock::System(feedback_hint()));
+            self.start_feedback_draft(Some(request));
             return KeyAction::none();
         }
+        self.preview_feedback(request).await
+    }
+
+    fn start_feedback_draft(&mut self, context: Option<FeedbackRequest>) {
+        self.feedback_draft = true;
+        self.feedback_draft_context = context;
+        self.composer.clear();
+        self.composer_cursor = 0;
+        self.push(MessageBlock::Prompt(feedback_draft_prompt()));
+        self.scroll_to_bottom();
+    }
+
+    async fn preview_feedback(&mut self, request: FeedbackRequest) -> KeyAction {
+        self.feedback_draft = false;
+        self.feedback_draft_context = None;
         let console_errors = feedback_console_errors(&self.messages);
         let snapshot = {
             let mut runtime = self.runtime.lock().await;
@@ -2327,8 +2492,9 @@ impl App {
             out_dir: out_dir.clone(),
             title: request.title.clone(),
             note: request.note.clone(),
-            expected: None,
-            reproduction: None,
+            expected: request.expected.clone(),
+            reproduction: request.reproduction.clone(),
+            scope: request.scope,
             plan: plan.clone(),
             console_errors: &console_errors,
         };
@@ -2349,7 +2515,11 @@ impl App {
             model: snapshot.model,
             title: request.title,
             note: request.note,
+            expected: request.expected,
+            reproduction: request.reproduction,
+            scope: request.scope,
             plan,
+            candidates,
             console_errors,
             prompt,
         });
@@ -2370,8 +2540,9 @@ impl App {
             out_dir: pending.workspace.join("feedback").join(&pending.session_id),
             title: pending.title,
             note: pending.note,
-            expected: None,
-            reproduction: None,
+            expected: pending.expected,
+            reproduction: pending.reproduction,
+            scope: pending.scope,
             plan: pending.plan,
             console_errors: &pending.console_errors,
         });
@@ -3754,10 +3925,38 @@ fn named_flag_value<'a>(
     Ok(Some((prefix, value.to_owned())))
 }
 
-const FEEDBACK_USAGE: &str = "usage: /feedback [--title TEXT] [--note TEXT] [--plan PATH] [text]";
+const FEEDBACK_USAGE: &str = "usage: /feedback [--title TEXT] [--note TEXT] [--expected TEXT] [--steps TEXT] [--plan PATH] [--turn N|--full] [text]";
 
-fn feedback_hint() -> String {
-    "feedback: type what actually happened in plain words, or add --plan <path>\nerror events from the session journal and the current screen are included automatically\nexample: /feedback the turn failed while running the tests\n         /feedback --plan .scratch/plans/<artifact>.md".to_owned()
+fn feedback_draft_prompt() -> String {
+    "feedback draft: write what happened, what you expected, and how to reproduce.\n\
+     labels are optional: 实际：... 期望：... 复现：...\n\
+     example: 实际：/approve 卡住 期望：重新问 selector 复现：1. 运行 /approve\n\
+     Enter previews, Esc cancels."
+        .to_owned()
+}
+
+fn feedback_text_from_parts(
+    note: Option<&str>,
+    expected: Option<&str>,
+    reproduction: Option<&str>,
+) -> String {
+    let mut text = String::new();
+    if let Some(note) = note {
+        text.push_str("实际：");
+        text.push_str(note);
+        text.push('\n');
+    }
+    if let Some(expected) = expected {
+        text.push_str("期望：");
+        text.push_str(expected);
+        text.push('\n');
+    }
+    if let Some(reproduction) = reproduction {
+        text.push_str("复现：\n");
+        text.push_str(reproduction);
+        text.push('\n');
+    }
+    text.trim_end().to_owned()
 }
 
 fn feedback_console_errors(messages: &[MessageBlock]) -> Vec<String> {
@@ -3782,6 +3981,14 @@ fn feedback_preview_text(
     let mut lines = vec![
         format!("feedback bundle: {}", preview.title),
         format!(
+            "expected: {}",
+            preview
+                .expected
+                .as_deref()
+                .map(|expected| clip(expected, 200))
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
             "actual: {}",
             preview
                 .note
@@ -3789,7 +3996,26 @@ fn feedback_preview_text(
                 .map(|note| clip(note, 200))
                 .unwrap_or_else(|| "none".to_owned())
         ),
+        format!(
+            "steps: {}",
+            preview
+                .reproduction
+                .as_deref()
+                .map(|steps| clip(steps, 200))
+                .unwrap_or_else(|| "none".to_owned())
+        ),
     ];
+    let evidence = match (preview.scope, preview.focus_turn) {
+        (EvidenceScope::Full, _) | (EvidenceScope::Auto, None) => "all turns".to_owned(),
+        (EvidenceScope::Turn(turn), _) | (EvidenceScope::Auto, Some(turn)) => {
+            format!("turn {turn} (±2)")
+        }
+    };
+    lines.push(format!("evidence: {evidence}"));
+    lines.push(format!(
+        "redaction: {} workspace path(s)",
+        preview.redactions
+    ));
     match &preview.plan {
         Some(plan) => lines.push(format!("plan: {}", plan.display())),
         None if candidates > 1 => lines.push(format!(
@@ -3812,7 +4038,14 @@ fn feedback_preview_text(
     if console_errors > 0 {
         lines.push(format!("console errors: {console_errors}"));
     }
-    lines.push("reply y to write, n to cancel".to_owned());
+    lines.push(
+        if candidates > 1 {
+            "reply y/w to write, e to edit, p to pick a plan, n/c to cancel"
+        } else {
+            "reply y/w to write, e to edit, n/c to cancel"
+        }
+        .to_owned(),
+    );
     lines.join("\n")
 }
 
@@ -3831,74 +4064,162 @@ fn plan_artifacts(workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 fn parse_feedback_request(argument: &str) -> Result<FeedbackRequest, &'static str> {
-    let words = split_feedback_words(argument)?;
+    let tokens = feedback_tokens(argument)?;
     let mut title = None;
     let mut note = None;
+    let mut expected = None;
+    let mut steps = None;
     let mut plan = None;
-    let mut free = Vec::new();
-    let mut iter = words.into_iter();
-    while let Some(word) = iter.next() {
-        let mut take_value = || iter.next().ok_or(FEEDBACK_USAGE);
-        match word.as_str() {
-            "--title" => title = Some(take_value()?),
-            "--note" => note = Some(take_value()?),
-            "--plan" => plan = Some(std::path::PathBuf::from(take_value()?)),
-            other if other.starts_with("--title=") => {
-                title = Some(other.trim_start_matches("--title=").to_owned())
+    let mut turn = None;
+    let mut full = false;
+    let mut free = String::new();
+    let mut last_end = 0;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if !token.text.starts_with("--") {
+            if token.start > last_end {
+                free.push_str(&argument[last_end..token.start]);
+            } else if !free.is_empty() {
+                free.push(' ');
             }
-            other if other.starts_with("--note=") => {
-                note = Some(other.trim_start_matches("--note=").to_owned())
-            }
-            other if other.starts_with("--plan=") => {
-                plan = Some(std::path::PathBuf::from(
-                    other.trim_start_matches("--plan="),
-                ))
-            }
-            other if other.starts_with("--") => return Err(FEEDBACK_USAGE),
-            other => free.push(other.to_owned()),
+            free.push_str(&token.text);
+            last_end = token.end;
+            index += 1;
+            continue;
         }
+        let (flag, inline) = match token.text.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (token.text.as_str(), None),
+        };
+        let take_value = |index: usize| {
+            inline
+                .map(str::to_owned)
+                .or_else(|| tokens.get(index + 1).map(|token| token.text.clone()))
+                .ok_or(FEEDBACK_USAGE)
+        };
+        match flag {
+            "--title" => title = Some(take_value(index)?),
+            "--note" => note = Some(take_value(index)?),
+            "--expected" => expected = Some(take_value(index)?),
+            "--steps" => steps = Some(take_value(index)?),
+            "--plan" => plan = Some(std::path::PathBuf::from(take_value(index)?)),
+            "--turn" => {
+                if full {
+                    return Err("use either --turn or --full");
+                }
+                turn = Some(
+                    take_value(index)?
+                        .parse::<u64>()
+                        .map_err(|_| FEEDBACK_USAGE)?,
+                );
+            }
+            "--full" => {
+                if turn.is_some() {
+                    return Err("use either --turn or --full");
+                }
+                if inline.is_some() {
+                    return Err(FEEDBACK_USAGE);
+                }
+                full = true;
+            }
+            _ => return Err(FEEDBACK_USAGE),
+        }
+        let consumed_next = inline.is_none() && flag != "--full";
+        if consumed_next {
+            last_end = tokens[index + 1].end;
+            index += 2;
+        } else {
+            last_end = token.end;
+            index += 1;
+        }
+    }
+    let free = normalize_feedback_text(&free);
+    if note.is_some() && !free.is_empty() {
+        return Err("use either free text or --note, not both");
     }
     if !free.is_empty() {
-        if note.is_some() {
-            return Err("use either free text or --note, not both");
-        }
-        note = Some(free.join(" "));
+        let parsed = parse_feedback_text(&free);
+        note = note.or_else(|| (!parsed.actual.trim().is_empty()).then_some(parsed.actual));
+        expected = expected.or(parsed.expected);
+        steps = steps.or(parsed.reproduction);
     }
-    Ok(FeedbackRequest { title, note, plan })
+    let scope = if full {
+        EvidenceScope::Full
+    } else if let Some(turn) = turn {
+        EvidenceScope::Turn(turn)
+    } else {
+        EvidenceScope::Auto
+    };
+    Ok(FeedbackRequest {
+        title,
+        note,
+        expected,
+        reproduction: steps,
+        scope,
+        plan,
+    })
 }
 
-fn split_feedback_words(input: &str) -> Result<Vec<String>, &'static str> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut started = false;
-    for character in input.chars() {
-        match quote {
-            Some(active) if character == active => quote = None,
-            Some(_) => current.push(character),
-            None if character == '"' || character == '\'' => {
-                quote = Some(character);
-                started = true;
-            }
-            None if character.is_whitespace() => {
-                if started {
-                    words.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            None => {
-                current.push(character);
-                started = true;
-            }
+struct FeedbackToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn feedback_tokens(input: &str) -> Result<Vec<FeedbackToken>, &'static str> {
+    let characters = input.char_indices().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let (start, character) = characters[index];
+        if character.is_whitespace() {
+            index += 1;
+            continue;
         }
+        let mut text = String::new();
+        let mut end = start;
+        let mut quote = None;
+        while index < characters.len() {
+            let (at, character) = characters[index];
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                } else {
+                    text.push(character);
+                }
+                end = at + character.len_utf8();
+                index += 1;
+                continue;
+            }
+            if character == '"' || character == '\'' {
+                quote = Some(character);
+                end = at + character.len_utf8();
+                index += 1;
+                continue;
+            }
+            if character.is_whitespace() {
+                break;
+            }
+            text.push(character);
+            end = at + character.len_utf8();
+            index += 1;
+        }
+        if quote.is_some() {
+            return Err(FEEDBACK_USAGE);
+        }
+        tokens.push(FeedbackToken { text, start, end });
     }
-    if quote.is_some() {
-        return Err(FEEDBACK_USAGE);
-    }
-    if started {
-        words.push(current);
-    }
-    Ok(words)
+    Ok(tokens)
+}
+
+fn normalize_feedback_text(text: &str) -> String {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 fn mcp_transport_label(transport: &McpTransport) -> String {
@@ -4549,6 +4870,25 @@ enum YesNoReply {
     Yes,
     No,
     Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FeedbackReply {
+    Write,
+    Edit,
+    Plan,
+    Cancel,
+    Invalid,
+}
+
+fn parse_feedback_reply(input: &str) -> FeedbackReply {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "w" | "write" => FeedbackReply::Write,
+        "e" | "edit" => FeedbackReply::Edit,
+        "p" | "plan" => FeedbackReply::Plan,
+        "n" | "no" | "c" | "cancel" => FeedbackReply::Cancel,
+        _ => FeedbackReply::Invalid,
+    }
 }
 
 fn parse_yes_no(input: &str) -> YesNoReply {
@@ -5921,7 +6261,7 @@ mod tests {
         );
         assert!(prompt.contains("actual: the plan never paused"), "{prompt}");
         assert!(!prompt.contains("note:"), "{prompt}");
-        assert!(prompt.contains("reply y to write"), "{prompt}");
+        assert!(prompt.contains("reply y/w to write"), "{prompt}");
         assert!(!out_dir.exists(), "nothing is written before confirmation");
 
         app.respond_to_prompt("y").await;
@@ -5980,16 +6320,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_feedback_shows_a_hint_and_cancel_writes_nothing() {
+    async fn bare_feedback_starts_a_draft_and_cancel_writes_nothing() {
         let mut app = test_app().await;
         let session_id = app.session_id.clone();
 
         app.handle_command(Command::Feedback(String::new())).await;
-        let hint = match app.messages.last() {
-            Some(MessageBlock::System(text)) => text.clone(),
-            other => panic!("expected a system hint, got {other:?}"),
+        let prompt = match app.messages.last() {
+            Some(MessageBlock::Prompt(text)) => text.clone(),
+            other => panic!("expected a feedback draft, got {other:?}"),
         };
-        assert!(hint.contains("type what actually happened"), "{hint}");
+        assert!(prompt.contains("feedback draft"), "{prompt}");
+        assert!(app.feedback_draft);
 
         app.handle_command(Command::Feedback("a failure".to_owned()))
             .await;
@@ -6209,9 +6550,15 @@ mod tests {
         let request = parse_feedback_request("").expect("empty request");
         assert!(request.title.is_none());
         assert!(request.note.is_none());
+        assert!(request.expected.is_none());
+        assert!(request.reproduction.is_none());
         assert!(request.plan.is_none());
+        assert_eq!(request.scope, EvidenceScope::Auto);
 
         let request = parse_feedback_request("the plan never paused").expect("free text");
+        assert_eq!(request.note.as_deref(), Some("the plan never paused"));
+
+        let request = parse_feedback_request("\"the plan never paused\"").expect("quoted text");
         assert_eq!(request.note.as_deref(), Some("the plan never paused"));
 
         let request = parse_feedback_request(
@@ -6229,6 +6576,31 @@ mod tests {
         assert_eq!(request.title.as_deref(), Some("quick"));
         assert_eq!(request.note.as_deref(), Some("fast"));
 
+        let request = parse_feedback_request(
+            "实际：/approve 卡住\n期望：重新问 selector\n复现：\n1. 打开计划\n2. 运行 /approve",
+        )
+        .expect("labeled text");
+        assert_eq!(request.note.as_deref(), Some("/approve 卡住"));
+        assert_eq!(request.expected.as_deref(), Some("重新问 selector"));
+        assert_eq!(
+            request.reproduction.as_deref(),
+            Some("1. 打开计划\n2. 运行 /approve")
+        );
+
+        let request = parse_feedback_request("--expected \"a retry\" --steps \"1. run\" --turn 5")
+            .expect("scope flags");
+        assert_eq!(request.expected.as_deref(), Some("a retry"));
+        assert_eq!(request.reproduction.as_deref(), Some("1. run"));
+        assert_eq!(request.scope, EvidenceScope::Turn(5));
+
+        let request = parse_feedback_request("--full").expect("full scope");
+        assert_eq!(request.scope, EvidenceScope::Full);
+        assert_eq!(
+            parse_feedback_request("--turn 1 --full"),
+            Err("use either --turn or --full")
+        );
+        assert_eq!(parse_feedback_request("--turn nope"), Err(FEEDBACK_USAGE));
+
         assert_eq!(parse_feedback_request("--title"), Err(FEEDBACK_USAGE));
         assert_eq!(parse_feedback_request("--bogus"), Err(FEEDBACK_USAGE));
         assert_eq!(
@@ -6236,6 +6608,160 @@ mod tests {
             Err("use either free text or --note, not both")
         );
         assert_eq!(parse_feedback_request("\"unbalanced"), Err(FEEDBACK_USAGE));
+    }
+
+    #[tokio::test]
+    async fn bare_feedback_starts_a_draft() {
+        let mut app = test_app().await;
+
+        app.handle_feedback("").await;
+
+        assert!(app.feedback_draft);
+        assert!(app.messages.iter().any(|message| {
+            message_text(message).is_some_and(|text| text.contains("feedback draft"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn scope_flags_survive_the_feedback_draft() {
+        let mut app = test_app().await;
+
+        app.handle_feedback("--turn 7").await;
+
+        assert!(app.feedback_draft);
+        assert_eq!(
+            app.feedback_draft_context
+                .as_ref()
+                .map(|request| request.scope),
+            Some(EvidenceScope::Turn(7))
+        );
+
+        app.composer = "实际：卡住".to_owned();
+        app.composer_cursor = app.composer.len();
+        app.submit().await;
+
+        let pending = app.pending_feedback.as_ref().expect("preview");
+        assert_eq!(pending.scope, EvidenceScope::Turn(7));
+        assert_eq!(pending.note.as_deref(), Some("卡住"));
+    }
+
+    #[tokio::test]
+    async fn escape_cancels_a_feedback_draft() {
+        let mut app = test_app().await;
+        app.start_feedback_draft(None);
+        app.composer = "half-written".to_owned();
+        app.composer_cursor = app.composer.len();
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)).await;
+
+        assert!(!app.feedback_draft);
+        assert!(app.composer.is_empty());
+        assert!(app.messages.iter().any(|message| {
+            message_text(message).is_some_and(|text| text.contains("feedback draft cancelled"))
+        }));
+    }
+
+    #[test]
+    fn feedback_reply_accepts_write_edit_and_cancel() {
+        assert_eq!(parse_feedback_reply("w"), FeedbackReply::Write);
+        assert_eq!(parse_feedback_reply("yes"), FeedbackReply::Write);
+        assert_eq!(parse_feedback_reply("e"), FeedbackReply::Edit);
+        assert_eq!(parse_feedback_reply("p"), FeedbackReply::Plan);
+        assert_eq!(parse_feedback_reply("c"), FeedbackReply::Cancel);
+        assert_eq!(parse_feedback_reply("maybe"), FeedbackReply::Invalid);
+    }
+
+    #[test]
+    fn feedback_draft_text_round_trips_labels() {
+        let text = feedback_text_from_parts(
+            Some("actual behavior"),
+            Some("expected behavior"),
+            Some("1. run /plan\n2. wait"),
+        );
+
+        assert_eq!(
+            text,
+            "实际：actual behavior\n期望：expected behavior\n复现：\n1. run /plan\n2. wait"
+        );
+        let parsed = parse_feedback_text(&text);
+        assert_eq!(parsed.actual, "actual behavior");
+        assert_eq!(parsed.expected.as_deref(), Some("expected behavior"));
+        assert_eq!(
+            parsed.reproduction.as_deref(),
+            Some("1. run /plan\n2. wait")
+        );
+    }
+
+    #[test]
+    fn feedback_preview_shows_expected_steps_and_evidence() {
+        let preview = BundlePreview {
+            title: "a failure".to_owned(),
+            note: Some("actual".to_owned()),
+            expected: Some("expected".to_owned()),
+            reproduction: Some("1. run".to_owned()),
+            scope: EvidenceScope::Turn(5),
+            focus_turn: Some(5),
+            redactions: 2,
+            plan: None,
+            out_dir: std::path::PathBuf::from("out"),
+            complete: true,
+            hard_failures: Vec::new(),
+            warnings: Vec::new(),
+            events: 1,
+            first_seq: Some(0),
+            last_seq: Some(0),
+        };
+
+        let text = feedback_preview_text(&preview, 0, 0);
+
+        assert!(text.contains("expected: expected"), "{text}");
+        assert!(text.contains("steps: 1. run"), "{text}");
+        assert!(text.contains("evidence: turn 5 (±2)"), "{text}");
+        assert!(text.contains("redaction: 2 workspace path(s)"), "{text}");
+        assert!(
+            text.contains("reply y/w to write, e to edit, n/c to cancel"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn p_cycles_feedback_plan_artifacts() {
+        let mut app = test_app().await;
+        let plans = app.workspace().join(".scratch/plans");
+        std::fs::create_dir_all(&plans).expect("plans dir");
+        std::fs::write(plans.join("a.md"), "# plan a").expect("plan a");
+        std::fs::write(plans.join("b.md"), "# plan b").expect("plan b");
+
+        app.handle_command(Command::Feedback("the plan never paused".to_owned()))
+            .await;
+        let pending = app.pending_feedback.as_ref().expect("preview");
+        assert!(pending.plan.is_none());
+        assert_eq!(pending.candidates.len(), 2);
+        let prompt = match app.messages.last() {
+            Some(MessageBlock::Prompt(text)) => text.clone(),
+            other => panic!("expected a feedback prompt, got {other:?}"),
+        };
+        assert!(prompt.contains("p to pick a plan"), "{prompt}");
+
+        app.respond_to_prompt("p").await;
+        let first = app
+            .pending_feedback
+            .as_ref()
+            .expect("preview")
+            .plan
+            .clone()
+            .expect("first plan");
+        assert!(first.ends_with("a.md"), "{}", first.display());
+
+        app.respond_to_prompt("p").await;
+        let second = app
+            .pending_feedback
+            .as_ref()
+            .expect("preview")
+            .plan
+            .clone()
+            .expect("second plan");
+        assert!(second.ends_with("b.md"), "{}", second.display());
     }
 
     #[test]
