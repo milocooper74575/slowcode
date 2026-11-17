@@ -426,32 +426,63 @@ fn push_table_row(
 /// Break styled text into chunks no wider than `width` display cells.
 fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
-    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut used = 0;
-    for span in spans {
-        let mut chunk = String::new();
-        for character in span.content.chars() {
-            let character_width = display_width(&character.to_string());
-            if used > 0 && used + character_width > width {
-                push_chunk(&mut lines, &mut chunk, span.style);
-                lines.push(Vec::new());
-                used = 0;
+    let characters = spans
+        .iter()
+        .flat_map(|span| {
+            span.content
+                .chars()
+                .map(move |character| (character, span.style))
+        })
+        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < characters.len() {
+        let mut used = 0;
+        let mut end = start;
+        while end < characters.len() {
+            let character_width = display_width(&characters[end].0.to_string());
+            if end > start && used + character_width > width {
+                break;
             }
-            chunk.push(character);
             used += character_width;
+            end += 1;
         }
-        push_chunk(&mut lines, &mut chunk, span.style);
+        if end < characters.len()
+            && let Some(space) = (start + 1..end)
+                .rev()
+                .find(|index| characters[*index].0 == ' ')
+        {
+            end = space + 1;
+        }
+        lines.push(span_run(&characters[start..end]));
+        start = end;
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
     }
     lines
 }
 
-fn push_chunk(lines: &mut [Vec<Span<'static>>], chunk: &mut String, style: Style) {
-    if chunk.is_empty() {
-        return;
+fn span_run(characters: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_style = None;
+    for (character, style) in characters {
+        if chunk_style != Some(*style) {
+            if !chunk.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut chunk),
+                    chunk_style.unwrap_or_default(),
+                ));
+            }
+            chunk_style = Some(*style);
+        }
+        chunk.push(*character);
     }
-    if let Some(line) = lines.last_mut() {
-        line.push(Span::styled(std::mem::take(chunk), style));
+    if !chunk.is_empty() {
+        spans.push(Span::styled(chunk, chunk_style.unwrap_or_default()));
     }
+    spans
 }
 
 fn display_width(text: &str) -> usize {
@@ -714,6 +745,32 @@ mod tests {
         assert!(flat.contains("bold"), "{flat}");
         assert!(!flat.contains('`'), "{flat}");
         assert!(!flat.contains("**"), "{flat}");
+    }
+
+    #[test]
+    fn table_wraps_latin_words_at_spaces_when_it_can() {
+        let rendered = render(
+            "| col |\n|---|\n| alpha beta gamma delta epsilon |",
+            Color::Reset,
+            12,
+        );
+        let visible = rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible[2], "alpha beta", "{visible:?}");
+        assert_eq!(visible[3], "gamma delta", "{visible:?}");
+        assert_eq!(visible[4], "epsilon", "{visible:?}");
+        for line in &rendered {
+            assert!(line.width() <= 12, "{} {line:?}", line.width());
+        }
     }
 
     #[test]
