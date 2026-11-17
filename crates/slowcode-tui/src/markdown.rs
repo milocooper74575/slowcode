@@ -287,7 +287,6 @@ fn render_table(lines: &[&str], base: Color) -> (Vec<Line<'static>>, usize) {
             }
             note.push_str(&format!(" {hidden_columns} more column(s)"));
         }
-        note.push_str("; full table in the plan artifact");
         out.push(Line::from(Span::styled(
             note,
             Style::default().fg(Color::DarkGray),
@@ -560,7 +559,7 @@ mod tests {
         assert!(flat.contains("用户角色"));
         assert!(!flat.contains("判定依据"));
         assert!(flat.contains("4 more column(s)"));
-        assert!(flat.contains("plan artifact"));
+        assert!(!flat.contains("plan artifact"));
     }
 
     #[test]
