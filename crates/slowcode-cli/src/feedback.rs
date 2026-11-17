@@ -2,10 +2,10 @@
 
 use std::path::PathBuf;
 
-use slowcode_feedback::{BundleRequest, write_bundle};
+use slowcode_feedback::{BundleRequest, EvidenceScope, parse_feedback_text, write_bundle};
 use slowcode_kernel::session::{SessionStore, validate_session_id};
 
-const USAGE: &str = "usage: slowcode feedback <session-id> [--out DIR] [--plan PATH] [--title TEXT] [--note TEXT] [--expected TEXT] [--steps TEXT]";
+const USAGE: &str = "usage: slowcode feedback <session-id> [--out DIR] [--plan PATH] [--title TEXT] [--note TEXT] [--expected TEXT] [--steps TEXT] [--turn N|--full]";
 
 #[derive(Debug, Default)]
 struct Options {
@@ -16,6 +16,7 @@ struct Options {
     note: Option<String>,
     expected: Option<String>,
     steps: Option<String>,
+    scope: EvidenceScope,
     free: Vec<String>,
 }
 
@@ -45,6 +46,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         note: options.note,
         expected: options.expected,
         reproduction: options.steps,
+        scope: options.scope,
         plan: options.plan,
         console_errors: &[],
     })
@@ -76,6 +78,21 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
             "--note" => options.note = Some(value("--note")?),
             "--expected" => options.expected = Some(value("--expected")?),
             "--steps" => options.steps = Some(value("--steps")?),
+            "--turn" => {
+                if options.scope == EvidenceScope::Full {
+                    return Err(format!("use either --turn or --full\n{USAGE}"));
+                }
+                let turn = value("--turn")?
+                    .parse::<u64>()
+                    .map_err(|_| format!("--turn needs a number\n{USAGE}"))?;
+                options.scope = EvidenceScope::Turn(turn);
+            }
+            "--full" => {
+                if matches!(options.scope, EvidenceScope::Turn(_)) {
+                    return Err(format!("use either --turn or --full\n{USAGE}"));
+                }
+                options.scope = EvidenceScope::Full;
+            }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other if other.starts_with("--") => {
                 return Err(format!("unknown argument: {other}\n{USAGE}"));
@@ -87,9 +104,34 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
         if options.note.is_some() {
             return Err(format!("use either free text or --note, not both\n{USAGE}"));
         }
-        options.note = Some(options.free.join(" "));
+        let parsed = parse_feedback_text(&join_feedback_words(&options.free));
+        options.note = (!parsed.actual.trim().is_empty()).then_some(parsed.actual);
+        options.expected = options.expected.or(parsed.expected);
+        options.steps = options.steps.or(parsed.reproduction);
     }
     Ok(options)
+}
+
+fn join_feedback_words(words: &[String]) -> String {
+    let mut text = String::new();
+    for (index, word) in words.iter().enumerate() {
+        if index > 0 {
+            if is_numbered_step(word) {
+                text.push('\n');
+            } else {
+                text.push(' ');
+            }
+        }
+        text.push_str(word);
+    }
+    text
+}
+
+fn is_numbered_step(word: &str) -> bool {
+    word.chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+        && (word.contains('.') || word.contains(')') || word.contains('、'))
 }
 
 fn set_session(options: &mut Options, value: &str) -> Result<(), String> {
@@ -146,5 +188,47 @@ mod tests {
         .expect("options");
         assert_eq!(options.expected.as_deref(), Some("the plan should pause"));
         assert_eq!(options.steps.as_deref(), Some("1. run /plan"));
+    }
+
+    #[test]
+    fn turn_and_full_set_the_evidence_scope() {
+        let options = parse_args(words(&[
+            "session-33333333-3333-4333-8333-333333333333",
+            "--turn",
+            "5",
+        ]))
+        .expect("turn scope");
+        assert_eq!(options.scope, EvidenceScope::Turn(5));
+
+        let options = parse_args(words(&[
+            "session-33333333-3333-4333-8333-333333333333",
+            "--full",
+        ]))
+        .expect("full scope");
+        assert_eq!(options.scope, EvidenceScope::Full);
+
+        let error = parse_args(words(&[
+            "session-33333333-3333-4333-8333-333333333333",
+            "--turn",
+            "5",
+            "--full",
+        ]))
+        .expect_err("conflict");
+        assert!(error.contains("use either --turn or --full"), "{error}");
+    }
+
+    #[test]
+    fn labeled_free_text_fills_expected_and_steps() {
+        let options = parse_args(words(&[
+            "session-33333333-3333-4333-8333-333333333333",
+            "实际：卡住",
+            "期望：继续",
+            "复现：1.",
+        ]))
+        .expect("labeled text");
+
+        assert_eq!(options.note.as_deref(), Some("卡住"));
+        assert_eq!(options.expected.as_deref(), Some("继续"));
+        assert_eq!(options.steps.as_deref(), Some("1."));
     }
 }
