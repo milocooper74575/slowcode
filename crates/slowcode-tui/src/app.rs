@@ -2327,6 +2327,8 @@ impl App {
             out_dir: out_dir.clone(),
             title: request.title.clone(),
             note: request.note.clone(),
+            expected: None,
+            reproduction: None,
             plan: plan.clone(),
             console_errors: &console_errors,
         };
@@ -2368,6 +2370,8 @@ impl App {
             out_dir: pending.workspace.join("feedback").join(&pending.session_id),
             title: pending.title,
             note: pending.note,
+            expected: None,
+            reproduction: None,
             plan: pending.plan,
             console_errors: &pending.console_errors,
         });

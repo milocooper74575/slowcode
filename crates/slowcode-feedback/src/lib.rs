@@ -33,6 +33,10 @@ pub struct BundleRequest<'a> {
     pub out_dir: PathBuf,
     pub title: Option<String>,
     pub note: Option<String>,
+    /// What the user expected to happen. Rendered under `## 期望`.
+    pub expected: Option<String>,
+    /// How to reproduce it. Rendered under `## 复现步骤`.
+    pub reproduction: Option<String>,
     pub plan: Option<PathBuf>,
     /// Errors the UI showed on screen that the durable journal does not
     /// contain. Plan commands run on ephemeral sessions, so their failures only
@@ -128,6 +132,8 @@ pub fn write_bundle(request: BundleRequest<'_>) -> Result<BundleOutcome, Feedbac
         workspace,
         title,
         note,
+        expected,
+        reproduction,
         plan,
         sha256,
     } = prepared;
@@ -156,6 +162,8 @@ pub fn write_bundle(request: BundleRequest<'_>) -> Result<BundleOutcome, Feedbac
         RenderContext {
             title: &title,
             note: note.as_deref(),
+            expected: expected.as_deref(),
+            reproduction: reproduction.as_deref(),
             workspace_name,
             version: request.version,
             model: request.model.or(analysis.model.as_deref()),
@@ -224,6 +232,8 @@ struct Prepared {
     workspace: Option<String>,
     title: String,
     note: Option<String>,
+    expected: Option<String>,
+    reproduction: Option<String>,
     plan: Option<PathBuf>,
     sha256: String,
 }
@@ -275,6 +285,18 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         .note
         .clone()
         .map(|note| redact(&note, &redact_paths));
+    let expected = request
+        .expected
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| redact(text, &redact_paths));
+    let reproduction = request
+        .reproduction
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| redact(text, &redact_paths));
     let plan = match &request.plan {
         Some(plan) if !plan.is_file() => return Err(FeedbackError::PlanMissing(plan.clone())),
         plan => plan.clone(),
@@ -285,6 +307,8 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         workspace,
         title,
         note,
+        expected,
+        reproduction,
         plan,
         sha256,
     })
@@ -644,6 +668,8 @@ fn blocks_text(content: Option<&Value>, tool_names: &mut BTreeMap<String, usize>
 struct RenderContext<'a> {
     title: &'a str,
     note: Option<&'a str>,
+    expected: Option<&'a str>,
+    reproduction: Option<&'a str>,
     workspace_name: &'a str,
     version: &'a str,
     model: Option<&'a str>,
@@ -710,12 +736,16 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
     issue.push_str("\n## 关键错误\n\n");
     issue.push_str(&render_errors(&analysis.errors));
     issue.push_str(&format!(
-        "\n## 期望\n\n请补充你期望的行为。\n\n## 实际\n\n{}\n",
+        "\n## 期望\n\n{}\n\n## 实际\n\n{}\n",
+        context.expected.unwrap_or("请补充你期望的行为。"),
         context
             .note
             .unwrap_or("请补充实际行为，例如报错、耗时、输出差异。")
     ));
-    issue.push_str("\n## 复现步骤\n\n1. \n2. \n3. \n");
+    issue.push_str(&format!(
+        "\n## 复现步骤\n\n{}\n",
+        context.reproduction.unwrap_or("1. \n2. \n3. ").trim_end()
+    ));
 
     let turns: usize = analysis.turn_reasons.values().sum();
     let reason_text = if analysis.turn_reasons.is_empty() {
@@ -1176,6 +1206,33 @@ mod tests {
     }
 
     #[test]
+    fn issue_keeps_expected_and_reproduction_text() {
+        let base = temp_dir("expected-and-steps");
+        let out = base.join("out");
+        let journal = journal();
+        let mut request = request(&out, journal.as_bytes());
+        request.expected = Some("the plan should pause after review".to_owned());
+        request.reproduction =
+            Some("1. run /plan\n2. wait for the question\n3. approve".to_owned());
+
+        let outcome = write_bundle(request).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        assert!(
+            issue.contains("the plan should pause after review"),
+            "{issue}"
+        );
+        assert!(
+            issue.contains("1. run /plan\n2. wait for the question\n3. approve"),
+            "{issue}"
+        );
+        assert!(!issue.contains("请补充你期望的行为"), "{issue}");
+        assert!(!issue.contains("1. \n2. \n3."), "{issue}");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn multiple_steps_in_one_turn_do_not_warn() {
         let mut analysis = Analysis::start(&Value::Null, 0, Vec::new());
         analysis.model = Some("model".to_owned());
@@ -1256,6 +1313,8 @@ mod tests {
             out_dir: out_dir.to_path_buf(),
             title: Some("a real failure".to_owned()),
             note: Some("expected success".to_owned()),
+            expected: None,
+            reproduction: None,
             plan: None,
             console_errors: &[],
         }

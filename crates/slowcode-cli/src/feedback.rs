@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use slowcode_feedback::{BundleRequest, write_bundle};
 use slowcode_kernel::session::{SessionStore, validate_session_id};
 
-const USAGE: &str =
-    "usage: slowcode feedback <session-id> [--out DIR] [--plan PATH] [--title TEXT] [--note TEXT]";
+const USAGE: &str = "usage: slowcode feedback <session-id> [--out DIR] [--plan PATH] [--title TEXT] [--note TEXT] [--expected TEXT] [--steps TEXT]";
 
 #[derive(Debug, Default)]
 struct Options {
@@ -15,6 +14,8 @@ struct Options {
     plan: Option<PathBuf>,
     title: Option<String>,
     note: Option<String>,
+    expected: Option<String>,
+    steps: Option<String>,
     free: Vec<String>,
 }
 
@@ -42,6 +43,8 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         out_dir,
         title: options.title,
         note: options.note,
+        expected: options.expected,
+        reproduction: options.steps,
         plan: options.plan,
         console_errors: &[],
     })
@@ -71,6 +74,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String>
             "--plan" => options.plan = Some(PathBuf::from(value("--plan")?)),
             "--title" => options.title = Some(value("--title")?),
             "--note" => options.note = Some(value("--note")?),
+            "--expected" => options.expected = Some(value("--expected")?),
+            "--steps" => options.steps = Some(value("--steps")?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other if other.starts_with("--") => {
                 return Err(format!("unknown argument: {other}\n{USAGE}"));
@@ -127,5 +132,19 @@ mod tests {
         ]))
         .expect_err("conflict");
         assert!(error.contains("use either free text or --note"), "{error}");
+    }
+
+    #[test]
+    fn expected_and_steps_flags_are_kept() {
+        let options = parse_args(words(&[
+            "session-33333333-3333-4333-8333-333333333333",
+            "--expected",
+            "the plan should pause",
+            "--steps",
+            "1. run /plan",
+        ]))
+        .expect("options");
+        assert_eq!(options.expected.as_deref(), Some("the plan should pause"));
+        assert_eq!(options.steps.as_deref(), Some("1. run /plan"));
     }
 }
