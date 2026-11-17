@@ -369,14 +369,19 @@ pub fn changed_files(
 /// Capture size and mtime for workspace files, skipping build and tool output.
 pub fn snapshot_workspace(workspace: &Path) -> Result<BTreeMap<String, FileStamp>, ContractError> {
     let root = workspace.canonicalize()?;
+    let excluded = super::selector::workspace_excluded_dirs(&root)
+        .into_iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<BTreeSet<_>>();
     let mut snapshot = BTreeMap::new();
-    walk(&root, &root, &mut snapshot)?;
+    walk(&root, &root, &excluded, &mut snapshot)?;
     Ok(snapshot)
 }
 
 fn walk(
     root: &Path,
     directory: &Path,
+    excluded: &BTreeSet<PathBuf>,
     snapshot: &mut BTreeMap<String, FileStamp>,
 ) -> Result<(), ContractError> {
     for entry in fs::read_dir(directory)? {
@@ -384,10 +389,10 @@ fn walk(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if is_excluded_dir(&path) {
+            if is_excluded_dir(&path) || excluded.contains(&path) {
                 continue;
             }
-            walk(root, &path, snapshot)?;
+            walk(root, &path, excluded, snapshot)?;
             continue;
         }
         if !file_type.is_file() {
@@ -625,6 +630,34 @@ mod tests {
         fs::write(workspace.join("src/new.rs"), "new").expect("new file");
         let after = snapshot_workspace(&workspace).expect("snapshot");
         assert_eq!(changed_files(&before, &after), ["src/new.rs"]);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn snapshots_skip_cargo_workspace_excludes() {
+        let workspace = temp_workspace();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\".\"]\nexclude = [\"excerise\"]\n",
+        )
+        .expect("root manifest");
+        fs::create_dir_all(workspace.join("excerise/l1-service/src")).expect("private crate");
+        fs::write(
+            workspace.join("excerise/l1-service/Cargo.toml"),
+            "[package]\nname = \"l1-service\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("private manifest");
+        fs::write(workspace.join("excerise/l1-service/src/lib.rs"), "one").expect("private source");
+        let before = snapshot_workspace(&workspace).expect("snapshot");
+
+        fs::write(workspace.join("excerise/l1-service/src/lib.rs"), "two").expect("private change");
+        let after = snapshot_workspace(&workspace).expect("snapshot");
+
+        assert!(
+            changed_files(&before, &after).is_empty(),
+            "{:?}",
+            changed_files(&before, &after)
+        );
         let _ = fs::remove_dir_all(&workspace);
     }
 }

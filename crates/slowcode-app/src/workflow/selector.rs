@@ -391,6 +391,32 @@ fn workspace_packages(workspace: &Path) -> BTreeSet<String> {
     })
 }
 
+/// Directories excluded by the root Cargo manifest's `workspace.exclude`.
+pub(crate) fn workspace_excluded_dirs(workspace: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(workspace.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(table) = value.get("workspace") else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for pattern in string_array(table.get("exclude")) {
+        for path in expand_member_pattern(workspace, &pattern) {
+            dirs.push(path);
+        }
+        let plain = workspace.join(&pattern);
+        if plain.is_dir() {
+            dirs.push(plain);
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 fn string_array(value: Option<&toml::Value>) -> Vec<String> {
     value
         .and_then(toml::Value::as_array)

@@ -603,9 +603,9 @@ fn finish_checks(analysis: &mut Analysis, scan: &ScanState) {
         analysis.warnings.push("provider is unknown".to_owned());
     }
     let turns: usize = analysis.turn_reasons.values().sum();
-    if turns != analysis.assistant_messages.len() {
+    if turns == 0 && !analysis.assistant_messages.is_empty() {
         analysis.warnings.push(format!(
-            "turn/end count {turns} differs from assistant message count {}",
+            "{} assistant message(s) without any turn/end event",
             analysis.assistant_messages.len()
         ));
     }
@@ -1173,6 +1173,55 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
         assert_eq!(metadata["workspace"], ".");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn multiple_steps_in_one_turn_do_not_warn() {
+        let mut analysis = Analysis::start(&Value::Null, 0, Vec::new());
+        analysis.model = Some("model".to_owned());
+        analysis.provider = Some("provider".to_owned());
+        analysis.turn_reasons.insert("completed".to_owned(), 5);
+        analysis.assistant_messages = vec!["step".to_owned(); 6];
+        let scan = ScanState {
+            expected_seq: 0,
+            saw_request_header: true,
+            saw_turn_end: true,
+        };
+
+        finish_checks(&mut analysis, &scan);
+
+        assert!(
+            !analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("turn/end count")),
+            "{:?}",
+            analysis.warnings
+        );
+    }
+
+    #[test]
+    fn assistant_messages_without_a_turn_end_warn() {
+        let mut analysis = Analysis::start(&Value::Null, 0, Vec::new());
+        analysis.model = Some("model".to_owned());
+        analysis.provider = Some("provider".to_owned());
+        analysis.assistant_messages = vec!["step".to_owned()];
+        let scan = ScanState {
+            expected_seq: 0,
+            saw_request_header: true,
+            saw_turn_end: false,
+        };
+
+        finish_checks(&mut analysis, &scan);
+
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("without any turn/end")),
+            "{:?}",
+            analysis.warnings
+        );
     }
 
     fn journal() -> String {
