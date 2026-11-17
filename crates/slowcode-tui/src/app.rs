@@ -2425,6 +2425,12 @@ impl App {
             ));
             return KeyAction::none();
         }
+        if self.feedback_draft {
+            self.push(MessageBlock::System(
+                "feedback draft is open: Enter previews, Esc cancels".to_owned(),
+            ));
+            return KeyAction::none();
+        }
         if self.pending_feedback.is_some() {
             self.push(MessageBlock::System(
                 "feedback preview is waiting: reply y/w to write, e to edit, n/c to cancel"
@@ -6332,8 +6338,9 @@ mod tests {
         assert!(prompt.contains("feedback draft"), "{prompt}");
         assert!(app.feedback_draft);
 
-        app.handle_command(Command::Feedback("a failure".to_owned()))
-            .await;
+        app.composer = "a failure".to_owned();
+        app.composer_cursor = app.composer.len();
+        app.submit().await;
         app.respond_to_prompt("n").await;
         assert!(matches!(
             app.messages.last(),
@@ -6643,6 +6650,22 @@ mod tests {
         let pending = app.pending_feedback.as_ref().expect("preview");
         assert_eq!(pending.scope, EvidenceScope::Turn(7));
         assert_eq!(pending.note.as_deref(), Some("卡住"));
+    }
+
+    #[tokio::test]
+    async fn a_second_feedback_command_keeps_the_draft() {
+        let mut app = test_app().await;
+        app.handle_feedback("").await;
+        app.composer = "half-written".to_owned();
+        app.composer_cursor = app.composer.len();
+
+        app.handle_feedback("--full").await;
+
+        assert!(app.feedback_draft);
+        assert_eq!(app.composer, "half-written");
+        assert!(app.messages.iter().any(|message| {
+            message_text(message).is_some_and(|text| text.contains("feedback draft is open"))
+        }));
     }
 
     #[tokio::test]
