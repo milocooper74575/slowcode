@@ -329,6 +329,14 @@ pub enum AnswerSource {
     Mixed,
 }
 
+/// Explicit decision that a docs-only plan needs no test contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestSkip {
+    pub reason: String,
+    pub source: AnswerSource,
+    pub decided_at: u64,
+}
+
 /// One question asked during Interview, Reclassify or Distill.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Question {
@@ -630,6 +638,9 @@ pub struct WorkflowState {
     /// Selector resolved at `/approve` or answered by the user.
     #[serde(default)]
     pub test_selector: Option<String>,
+    /// Set only when the user explicitly records that no test is required.
+    #[serde(default)]
+    pub test_skip: Option<TestSkip>,
     #[serde(default)]
     pub test: TestState,
     #[serde(default)]
@@ -689,6 +700,7 @@ impl WorkflowState {
             scaffold: None,
             test_contract: None,
             test_selector: None,
+            test_skip: None,
             test: TestState::default(),
             execution: None,
             distill: None,
@@ -856,7 +868,7 @@ impl WorkflowState {
         if !self.review_is_current() {
             return Err(GateError::NotApproved);
         }
-        if self.test_contract.is_none() {
+        if self.test_contract.is_none() && self.test_skip.is_none() {
             return Err(GateError::MissingTestContract);
         }
         Ok(())

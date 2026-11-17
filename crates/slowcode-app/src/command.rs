@@ -175,8 +175,8 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/workflow",
-        args: "[list|use <id>|end]",
-        description: "list, switch or end workflows",
+        args: "[list|use <id>|end|selector [selector]]",
+        description: "list, switch, end or reset the test selector",
     },
     CommandSpec {
         name: "/reclassify",
@@ -321,7 +321,7 @@ fn argument_candidates(command: &str) -> &'static [&'static str] {
         "/skills" => &["install", "remove", "reload"],
         "/mcp" => &["add", "test", "tools", "remove", "reload"],
         "/feedback" => &["--plan", "--title", "--note"],
-        "/workflow" => &["list", "use", "end"],
+        "/workflow" => &["list", "use", "end", "selector"],
         "/help" => &[
             "help",
             "model",

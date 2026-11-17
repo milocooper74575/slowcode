@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use super::state::{
     AnswerSnapshot, AnswerSource, ExecutionState, PendingApproval, Phase, Question, QuestionKind,
-    QuestionStatus, Task, TestRunRecord, TestStatus, WorkflowState, WorkflowStatus,
+    QuestionStatus, Task, TestRunRecord, TestSkip, TestStatus, WorkflowState, WorkflowStatus,
     changed_task_ids,
 };
 use super::{
@@ -35,6 +35,7 @@ use super::{
         ModelCall,
     },
     input::redact_secrets,
+    selector::NO_TEST_OPTION,
 };
 
 const INDEX_SCHEMA_VERSION: u32 = 1;
@@ -562,9 +563,11 @@ impl WorkflowStore {
         let mut state = self.load(workflow_id)?;
         state.approve()?;
         state.test_selector = test_selector;
-        if state.phase == Phase::TestFix {
+        if state.phase == Phase::TestFix && state.test_skip.is_none() {
             let contract = test_contract.ok_or(super::state::GateError::MissingTestContract)?;
             state.test_contract = Some(contract);
+        } else if state.test_skip.is_some() {
+            state.test_contract = None;
         }
         let payload = json!({
             "approved_version": state.version,
@@ -1074,15 +1077,38 @@ impl WorkflowStore {
             }
             .into());
         }
+        let prompt = format!(
+            "无法唯一推导测试选择器：{reason}\n请选择 selector。直接回复选项，或用 /answer #<id> <selector>。"
+        );
+        if let Some(existing) = state.questions.iter_mut().find(|question| {
+            question.kind == QuestionKind::TestSelector && question.status == QuestionStatus::Open
+        }) {
+            existing.prompt = prompt;
+            existing.options = options.to_vec();
+            existing.recommendation = None;
+            existing.reason = reason.to_owned();
+            let question_id = existing.question_id.clone();
+            self.commit(
+                &mut state,
+                vec![(
+                    "selector.required",
+                    json!({
+                        "reason": reason,
+                        "options": options,
+                        "question_id": question_id,
+                        "updated": true,
+                    }),
+                )],
+            )?;
+            return Ok(state);
+        }
         let question = Question {
             question_id: String::new(),
             task_id: None,
             kind: QuestionKind::TestSelector,
-            prompt: format!(
-                "无法唯一推导测试选择器：{reason}\n请选择 selector。直接回复选项，或用 /answer #<id> <selector>。"
-            ),
+            prompt,
             options: options.to_vec(),
-            recommendation: options.first().cloned(),
+            recommendation: None,
             reason: reason.to_owned(),
             status: QuestionStatus::Open,
             criteria: "必须是项目测试命令接受的 package、目录或测试路径。".to_owned(),
@@ -1153,6 +1179,7 @@ impl WorkflowStore {
             )));
         }
         state.test_selector = Some(selector.to_owned());
+        state.test_skip = None;
         if state.open_questions().is_empty() {
             state.phase = Phase::Review;
         }
@@ -1165,6 +1192,171 @@ impl WorkflowStore {
                 ),
                 ("selector.resolved", json!({ "selector": selector })),
             ],
+        )?;
+        Ok(state)
+    }
+
+    /// Record an explicit "no tests" decision for a docs-only plan.
+    pub fn skip_test(
+        &self,
+        workflow_id: &str,
+        question_id: Option<&str>,
+        reason: &str,
+        source: AnswerSource,
+    ) -> Result<WorkflowState, WorkflowError> {
+        let _lock = self.lock()?;
+        let mut state = self.load(workflow_id)?;
+        if state.status != WorkflowStatus::Active {
+            return Err(super::state::GateError::NotActive(state.status).into());
+        }
+        if state.phase != Phase::Review {
+            return Err(super::state::GateError::WrongPhase {
+                phase: state.phase,
+                action: "/answer",
+            }
+            .into());
+        }
+        if !super::selector::plan_can_skip_test(&state.tasks) {
+            return Err(WorkflowError::Corrupt(
+                "test skip is only allowed for docs-only plans".to_owned(),
+            ));
+        }
+        let question_id = question_id.map(str::to_owned).or_else(|| {
+            state
+                .questions
+                .iter()
+                .find(|question| {
+                    question.kind == QuestionKind::TestSelector
+                        && question.status == QuestionStatus::Open
+                })
+                .map(|question| question.question_id.clone())
+        });
+        let mut events: Vec<(&str, Value)> = Vec::new();
+        if let Some(question_id) = &question_id {
+            if state
+                .answer_question(question_id, NO_TEST_OPTION.to_owned(), source)
+                .is_none()
+            {
+                return Err(WorkflowError::NotFound(format!(
+                    "open question {question_id}"
+                )));
+            }
+            events.push((
+                "question.answered",
+                json!({ "question_id": question_id, "source": source }),
+            ));
+        }
+        state.test_selector = None;
+        state.test_contract = None;
+        state.test_skip = Some(TestSkip {
+            reason: reason.to_owned(),
+            source,
+            decided_at: now_ms(),
+        });
+        if state.open_questions().is_empty() {
+            state.phase = Phase::Review;
+        }
+        events.push((
+            "test.skipped",
+            json!({ "reason": reason, "source": source }),
+        ));
+        self.commit(&mut state, events)?;
+        Ok(state)
+    }
+
+    /// Set a validated selector without asking a new question.
+    pub fn set_test_selector(
+        &self,
+        workflow_id: &str,
+        selector: &str,
+    ) -> Result<WorkflowState, WorkflowError> {
+        let _lock = self.lock()?;
+        let mut state = self.load(workflow_id)?;
+        if state.status != WorkflowStatus::Active {
+            return Err(super::state::GateError::NotActive(state.status).into());
+        }
+        if !matches!(state.phase, Phase::Review | Phase::Scaffold) {
+            return Err(super::state::GateError::WrongPhase {
+                phase: state.phase,
+                action: "/workflow selector",
+            }
+            .into());
+        }
+        let open = state
+            .questions
+            .iter()
+            .find(|question| {
+                question.kind == QuestionKind::TestSelector
+                    && question.status == QuestionStatus::Open
+            })
+            .map(|question| question.question_id.clone());
+        let mut events: Vec<(&str, Value)> = Vec::new();
+        if let Some(question_id) = open {
+            let _ = state.answer_question(&question_id, selector.to_owned(), AnswerSource::Text);
+            events.push((
+                "question.answered",
+                json!({ "question_id": question_id, "source": "text" }),
+            ));
+        }
+        state.test_selector = Some(selector.to_owned());
+        state.test_skip = None;
+        state.test_contract = None;
+        events.push(("selector.resolved", json!({ "selector": selector })));
+        self.commit(&mut state, events)?;
+        Ok(state)
+    }
+
+    /// Complete `/test` when the user explicitly recorded that no test is
+    /// required. The workflow still records the skip event and the completion.
+    pub fn complete_skipped_test(&self, workflow_id: &str) -> Result<WorkflowState, WorkflowError> {
+        let _lock = self.lock()?;
+        let mut state = self.load(workflow_id)?;
+        state.can_enter_test()?;
+        let reason = state
+            .test_skip
+            .as_ref()
+            .map(|skip| skip.reason.clone())
+            .unwrap_or_default();
+        state.workspace_dirty = false;
+        state.workspace_fingerprint = Some(self.workspace_fingerprint(&state));
+        let mut events: Vec<(&str, Value)> = vec![("test.skipped", json!({ "reason": reason }))];
+        if state.requires_distill() {
+            state.phase = Phase::Distill;
+        } else {
+            state.phase = Phase::Done;
+            state.status = WorkflowStatus::Completed;
+            events.push((
+                "workflow.completed",
+                json!({ "reason": "docs-only plan skipped tests" }),
+            ));
+        }
+        self.commit(&mut state, events)?;
+        Ok(state)
+    }
+
+    /// Record a failed `/approve` review baseline without changing the phase.
+    pub fn record_review_baseline_failure(
+        &self,
+        workflow_id: &str,
+        command: &str,
+        exit_code: Option<i32>,
+        output_tail: &str,
+    ) -> Result<WorkflowState, WorkflowError> {
+        let _lock = self.lock()?;
+        let mut state = self.load(workflow_id)?;
+        if state.status != WorkflowStatus::Active {
+            return Err(super::state::GateError::NotActive(state.status).into());
+        }
+        self.commit(
+            &mut state,
+            vec![(
+                "review.baseline_failed",
+                json!({
+                    "command": command,
+                    "exit_code": exit_code,
+                    "output_tail": output_tail,
+                }),
+            )],
         )?;
         Ok(state)
     }
@@ -2230,6 +2422,21 @@ mod tests {
         )
     }
 
+    fn docs_task() -> Task {
+        Task::new(
+            "task-1".to_owned(),
+            "update docs".to_owned(),
+            Domain::Known,
+            "AGENTS.md".to_owned(),
+            ExecState::Executable,
+            "edit AGENTS.md".to_owned(),
+            "reviewer".to_owned(),
+            "AGENTS.md".to_owned(),
+            "git diff shows only AGENTS.md".to_owned(),
+            Strategy::AiImplements,
+        )
+    }
+
     #[test]
     fn creates_state_events_and_index() {
         let workspace = temp_workspace();
@@ -3051,6 +3258,118 @@ mod tests {
         assert_eq!(state.phase, Phase::Review);
         assert_eq!(state.test_selector.as_deref(), Some("-p beta"));
         assert_eq!(state.questions[0].status, QuestionStatus::Answered);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn asking_for_a_selector_twice_reuses_the_open_question() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        let state = store
+            .create_with_tasks("first", None, vec![known_task()])
+            .expect("workflow");
+        store
+            .ask_test_selector(
+                &state.workflow_id,
+                &["-p l1-service".to_owned()],
+                "stale options",
+            )
+            .expect("first selector question");
+        let state = store
+            .ask_test_selector(
+                &state.workflow_id,
+                &["-p alpha".to_owned(), "-p beta".to_owned()],
+                "workspace members",
+            )
+            .expect("second selector question");
+
+        assert_eq!(state.questions.len(), 1);
+        assert_eq!(
+            state.questions[0].options,
+            vec!["-p alpha".to_owned(), "-p beta".to_owned()]
+        );
+        let events = fs::read_to_string(store.events_path(&state.workflow_id)).expect("events");
+        assert!(events.contains("\"updated\":true"), "{events}");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn skipping_tests_records_the_decision_and_clears_the_selector() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        let state = store
+            .create_with_tasks("docs", None, vec![docs_task()])
+            .expect("workflow");
+        let state = store
+            .ask_test_selector(
+                &state.workflow_id,
+                &[
+                    "-p fixture".to_owned(),
+                    crate::workflow::selector::NO_TEST_OPTION.to_owned(),
+                ],
+                "docs only",
+            )
+            .expect("selector question");
+        let state = store
+            .skip_test(
+                &state.workflow_id,
+                None,
+                "plan only changes docs",
+                AnswerSource::Text,
+            )
+            .expect("skip");
+
+        assert_eq!(state.phase, Phase::Review);
+        assert!(state.test_selector.is_none());
+        let skip = state.test_skip.as_ref().expect("skip decision");
+        assert_eq!(skip.reason, "plan only changes docs");
+        let events = fs::read_to_string(store.events_path(&state.workflow_id)).expect("events");
+        assert!(events.contains("test.skipped"), "{events}");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn setting_a_selector_clears_a_previous_skip() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        let state = store
+            .create_with_tasks("docs", None, vec![docs_task()])
+            .expect("workflow");
+        store
+            .skip_test(
+                &state.workflow_id,
+                None,
+                "plan only changes docs",
+                AnswerSource::Text,
+            )
+            .expect("skip");
+        let state = store
+            .set_test_selector(&state.workflow_id, "-p fixture")
+            .expect("selector");
+        assert!(state.test_skip.is_none());
+        assert_eq!(state.test_selector.as_deref(), Some("-p fixture"));
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn a_red_review_baseline_is_recorded_as_an_event() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        let state = store
+            .create_with_tasks("first", None, vec![known_task()])
+            .expect("workflow");
+        store
+            .record_review_baseline_failure(
+                &state.workflow_id,
+                "cargo test -p l1-service",
+                Some(101),
+                "error: package ID specification `l1-service` did not match any packages",
+            )
+            .expect("baseline failure");
+        let events = fs::read_to_string(store.events_path(&state.workflow_id)).expect("events");
+        assert!(events.contains("review.baseline_failed"), "{events}");
+        assert!(events.contains("cargo test -p l1-service"), "{events}");
+        assert!(events.contains("l1-service"), "{events}");
         let _ = fs::remove_dir_all(&workspace);
     }
 

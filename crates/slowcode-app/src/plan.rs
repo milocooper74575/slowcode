@@ -49,14 +49,15 @@ use tokio_util::sync::CancellationToken;
 use crate::workflow::{
     AnswerSnapshot, AnswerSource, AnswerUpdate, CapabilityProfile, ClassifiedFailure,
     DEFAULT_MAX_OUTPUT_TOKENS, DistillAnswerUpdate, DistillDecision, Domain, ExecState,
-    MAX_CONSECUTIVE_SAME_FAILURE, MAX_OUTPUT_TOKENS_PER_TURN, ManifestFile, ModelCall, Phase,
-    ProjectTestConfig, Question, QuestionKind, QuestionStatus, ScaffoldContract, SecretPolicy,
-    SelectorChoice, Strategy, Task as WorkflowTask, TestContract, TestRun, TestRunRecord,
-    TestRunUpdate, TestStatus, UnknownGap, WorkflowBudget, WorkflowError, WorkflowState,
-    WorkflowStatus, WorkflowStore, build_contract, build_review_contract, build_skill_manifest,
-    changed_files, derive_selector, detect_project, hash_arguments, input::redact_secrets,
-    read_answer_file, sha256_hex, snapshot_workspace, test_exec, validate_selector,
-    verify_core_implemented, verify_hashes, verify_test_contract_hashes, verify_test_flip,
+    MAX_CONSECUTIVE_SAME_FAILURE, MAX_OUTPUT_TOKENS_PER_TURN, ManifestFile, ModelCall,
+    NO_TEST_OPTION, Phase, ProjectTestConfig, Question, QuestionKind, QuestionStatus,
+    ScaffoldContract, SecretPolicy, SelectorChoice, Strategy, Task as WorkflowTask, TestContract,
+    TestRun, TestRunRecord, TestRunUpdate, TestStatus, UnknownGap, WorkflowBudget, WorkflowError,
+    WorkflowState, WorkflowStatus, WorkflowStore, build_contract, build_review_contract,
+    build_skill_manifest, changed_files, derive_selector, detect_project, hash_arguments,
+    input::redact_secrets, plan_can_skip_test, read_answer_file, sha256_hex, snapshot_workspace,
+    test_exec, validate_selector_against_packages, verify_core_implemented, verify_hashes,
+    verify_test_contract_hashes, verify_test_flip, workspace_package_names,
 };
 
 /// Errors from a Plan command. The message is user-facing.
@@ -911,9 +912,6 @@ fn run_answer_body<'a>(
         if let Some(question) = &question
             && question.kind == QuestionKind::TestSelector
         {
-            let project = detect_project(&config.workspace).ok_or_else(|| {
-                invalid("test selector needs a Cargo package or pytest configuration")
-            })?;
             let selector = resolve_selector_answer(&question.options, &answer_text);
             if !question.options.is_empty()
                 && !question.options.iter().any(|option| option == &selector)
@@ -923,7 +921,36 @@ fn run_answer_body<'a>(
                     question.options.join(" / ")
                 )));
             }
-            validate_selector(&project, &selector)
+            if selector == NO_TEST_OPTION {
+                if !plan_can_skip_test(&active.tasks) {
+                    return Err(invalid(
+                        "无需测试只适用于只改文档的计划；当前计划引用了代码文件或用户实现任务",
+                    ));
+                }
+                let reason = "计划只改文档，用户显式选择无需测试";
+                let state = store.skip_test(
+                    &active.workflow_id,
+                    Some(&question.question_id),
+                    reason,
+                    source,
+                )?;
+                let body = format!("### 测试策略\n\n无需测试：{reason}");
+                let heading = format!("决策记录 {}", now_unix()?);
+                let updated = append_section(&artifact, &heading, &body);
+                let updated = set_artifact_status(&updated, "answered");
+                fs::write(&path, updated)?;
+                let output = outcome_with_next(&state, body);
+                return Ok(PlanOutcome {
+                    path,
+                    output,
+                    workflow_id: Some(state.workflow_id),
+                });
+            }
+            let project = detect_project(&config.workspace).ok_or_else(|| {
+                invalid("test selector needs a Cargo package or pytest configuration")
+            })?;
+            let packages = workspace_package_names(&config.workspace).unwrap_or_default();
+            validate_selector_against_packages(&project, &selector, &packages)
                 .map_err(|error| invalid(format!("invalid test selector: {error}")))?;
             let state = store.answer_test_selector(
                 &active.workflow_id,
@@ -1343,9 +1370,14 @@ async fn run_scaffold_with_session(
         active.test_selector.as_deref(),
     ) {
         SelectorChoice::Resolved(selector) => selector,
-        SelectorChoice::NeedsUser { reason, .. } => {
+        SelectorChoice::NeedsUser { reason, options } => {
+            let choices = if options.is_empty() {
+                "(none)".to_owned()
+            } else {
+                options.join(", ")
+            };
             return Err(invalid(format!(
-                "/scaffold needs a resolved test selector: {reason}; run /approve first"
+                "/scaffold needs a resolved test selector: {reason}; choose one of: {choices}; run /workflow selector <selector>"
             )));
         }
     };
@@ -1642,10 +1674,35 @@ pub async fn run_test(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
             "/test is blocked until /execute implements the known executable tasks",
         ));
     }
+    if let Some(skip) = &active.test_skip {
+        let state = store.complete_skipped_test(&active.workflow_id)?;
+        let path = resolve_plan_path(config)?;
+        let artifact = fs::read_to_string(&path)?;
+        let heading = format!("Test {}", now_unix()?);
+        let body = format!("### Result\n\nstatus: skipped\nreason: {}", skip.reason);
+        let updated = append_section(&artifact, &heading, &body);
+        let updated = set_artifact_status(&updated, "test-skipped");
+        fs::write(&path, updated)?;
+        let output = format!("{body}\n\nnext: {}", next_action(&state));
+        return Ok(PlanOutcome {
+            path,
+            output,
+            workflow_id: Some(state.workflow_id),
+        });
+    }
     let contract = active
         .test_contract
         .clone()
         .ok_or_else(|| invalid("no test contract; run /approve or /scaffold first"))?;
+    if let Some(project_config) = ProjectTestConfig::from_command(&contract.project_test_command) {
+        let packages = workspace_package_names(&config.workspace).unwrap_or_default();
+        validate_selector_against_packages(&project_config, &contract.test_selector, &packages)
+            .map_err(|error| {
+                invalid(format!(
+                    "stored test selector is invalid: {error}; run /workflow selector"
+                ))
+            })?;
+    }
     if let Err(error) = verify_test_contract_hashes(&config.workspace, &contract) {
         store.block(
             &active.workflow_id,
@@ -2278,13 +2335,29 @@ pub async fn run_approve(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
     let user_owns_core = active.tasks.iter().any(|task| {
         task.exec_state == ExecState::PendingUser || task.strategy == Strategy::UserImplementsCore
     });
+    let can_skip = plan_can_skip_test(&active.tasks);
+    if active.test_skip.is_some() && !can_skip {
+        return Err(invalid(
+            "无需测试的决定已不适用于当前任务表；请用 /workflow selector 重新选择",
+        ));
+    }
     let project = detect_project(&config.workspace);
-    if project.is_none() && !user_owns_core {
+    if project.is_none() && !user_owns_core && active.test_skip.is_none() {
+        if can_skip {
+            return ask_selector(
+                &store,
+                &active,
+                vec![NO_TEST_OPTION.to_owned()],
+                "workspace has no test command; the plan only changes docs".to_owned(),
+            );
+        }
         return Err(invalid(
             "/approve needs a project test command; add a Cargo package or pytest configuration",
         ));
     }
-    let selector = if let Some(project) = &project {
+    let selector = if active.test_skip.is_some() {
+        None
+    } else if let Some(project) = &project {
         match derive_selector(
             &config.workspace,
             &active.tasks,
@@ -2293,30 +2366,13 @@ pub async fn run_approve(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
         ) {
             SelectorChoice::Resolved(selector) => Some(selector),
             SelectorChoice::NeedsUser { options, reason } => {
-                let state = store.ask_test_selector(&active.workflow_id, &options, &reason)?;
-                let question = state.open_questions().first().cloned();
-                let output = match &question {
-                    Some(question) => format!(
-                        "selector required: {reason}\n\n{}\n\nnext: /answer #{} <selector>",
-                        question.render(),
-                        question.question_id
-                    ),
-                    None => format!(
-                        "selector required: {reason}\noptions: {}",
-                        options.join(", ")
-                    ),
-                };
-                return Ok(PlanOutcome {
-                    path: store.root().join(&state.workflow_id).join("state.json"),
-                    output,
-                    workflow_id: Some(state.workflow_id),
-                });
+                return ask_selector(&store, &active, options, reason);
             }
         }
     } else {
         None
     };
-    let contract = if user_owns_core {
+    let contract = if user_owns_core || active.test_skip.is_some() {
         None
     } else {
         let project = project
@@ -2327,6 +2383,12 @@ pub async fn run_approve(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
             .await
             .map_err(|error| invalid(format!("review baseline could not run: {error}")))?;
         if !baseline.succeeded() {
+            let _ = store.record_review_baseline_failure(
+                &active.workflow_id,
+                &baseline.command,
+                baseline.exit_code,
+                &baseline.record(0).output_tail,
+            );
             let failures = if baseline.failures.is_empty() {
                 baseline
                     .output
@@ -2338,18 +2400,51 @@ pub async fn run_approve(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
                 baseline.failures.join(", ")
             };
             return Err(invalid(format!(
-                "review baseline is red; fix these pre-existing failures or exclude them before /approve:\n{failures}"
+                "review baseline is red: `{}` failed; fix these failures before /approve, or choose a different selector with /workflow selector:\n{failures}",
+                baseline.command
             )));
         }
         if baseline.passed.is_empty() && baseline.failures.is_empty() {
+            let _ = store.record_review_baseline_failure(
+                &active.workflow_id,
+                &baseline.command,
+                baseline.exit_code,
+                &baseline.record(0).output_tail,
+            );
             return Err(invalid(
-                "review baseline matched no tests; choose a selector that runs at least one test",
+                "review baseline matched no tests; choose a selector that runs at least one test with /workflow selector",
             ));
         }
         Some(build_review_contract(project, selector, &baseline)?.test_contract())
     };
     let state = store.approve(&active.workflow_id, contract, selector)?;
     Ok(workflow_outcome(&store, &state))
+}
+
+fn ask_selector(
+    store: &WorkflowStore,
+    active: &WorkflowState,
+    options: Vec<String>,
+    reason: String,
+) -> Result<PlanOutcome, BoxError> {
+    let state = store.ask_test_selector(&active.workflow_id, &options, &reason)?;
+    let question = state.open_questions().first().cloned();
+    let output = match &question {
+        Some(question) => format!(
+            "selector required: {reason}\n\n{}\n\nnext: /answer #{} <selector>\n也可以直接用 /workflow selector <selector> 覆盖",
+            question.render(),
+            question.question_id
+        ),
+        None => format!(
+            "selector required: {reason}\noptions: {}",
+            options.join(", ")
+        ),
+    };
+    Ok(PlanOutcome {
+        path: store.root().join(&state.workflow_id).join("state.json"),
+        output,
+        workflow_id: Some(state.workflow_id),
+    })
 }
 
 /// `/status [--workflow <id>]` shows one workflow or the workspace list.
@@ -2432,6 +2527,16 @@ pub async fn run_workflow(
             workflow_id: listing.active,
         });
     }
+    if argument == "selector" {
+        return run_workflow_selector(config, None).await;
+    }
+    if let Some(selector) = argument.strip_prefix("selector ") {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(invalid("usage: /workflow selector <selector>"));
+        }
+        return run_workflow_selector(config, Some(selector)).await;
+    }
     if let Some(id) = argument.strip_prefix("use ") {
         let id = id.trim();
         if id.is_empty() {
@@ -2445,7 +2550,68 @@ pub async fn run_workflow(
         let state = store.end(&active.workflow_id)?;
         return Ok(workflow_outcome(&store, &state));
     }
-    Err(invalid("usage: /workflow [list|use <id>|end]"))
+    Err(invalid(
+        "usage: /workflow [list|use <id>|end|selector [selector]]",
+    ))
+}
+
+async fn run_workflow_selector(
+    config: &PlanConfig,
+    selector: Option<&str>,
+) -> Result<PlanOutcome, BoxError> {
+    let store = WorkflowStore::new(&config.workspace);
+    let active = store.require_active()?;
+    if !matches!(active.phase, Phase::Review | Phase::Scaffold) {
+        return Err(invalid(format!(
+            "/workflow selector is available in review or scaffold (current phase {})",
+            active.phase
+        )));
+    }
+    if let Some(selector) = selector {
+        if selector == NO_TEST_OPTION {
+            if !plan_can_skip_test(&active.tasks) {
+                return Err(invalid(
+                    "无需测试只适用于只改文档的计划；当前计划引用了代码文件或用户实现任务",
+                ));
+            }
+            let state = store.skip_test(
+                &active.workflow_id,
+                None,
+                "用户通过 /workflow selector 显式选择无需测试",
+                AnswerSource::Text,
+            )?;
+            return Ok(workflow_outcome(&store, &state));
+        }
+        let project = detect_project(&config.workspace)
+            .ok_or_else(|| invalid("/workflow selector needs a project test command"))?;
+        let packages = workspace_package_names(&config.workspace).unwrap_or_default();
+        validate_selector_against_packages(&project, selector, &packages)
+            .map_err(|error| invalid(format!("invalid test selector: {error}")))?;
+        let state = store.set_test_selector(&active.workflow_id, selector)?;
+        return Ok(workflow_outcome(&store, &state));
+    }
+    if let Some(project) = detect_project(&config.workspace) {
+        return match derive_selector(&config.workspace, &active.tasks, &project, None) {
+            SelectorChoice::Resolved(selector) => {
+                let state = store.set_test_selector(&active.workflow_id, &selector)?;
+                Ok(workflow_outcome(&store, &state))
+            }
+            SelectorChoice::NeedsUser { options, reason } => {
+                ask_selector(&store, &active, options, reason)
+            }
+        };
+    }
+    if plan_can_skip_test(&active.tasks) {
+        return ask_selector(
+            &store,
+            &active,
+            vec![NO_TEST_OPTION.to_owned()],
+            "workspace has no test command; the plan only changes docs".to_owned(),
+        );
+    }
+    Err(invalid(
+        "/workflow selector needs a project test command; add a Cargo package or pytest configuration",
+    ))
 }
 
 fn workflow_outcome(store: &WorkflowStore, state: &WorkflowState) -> PlanOutcome {
@@ -2499,7 +2665,12 @@ fn render_workflow_status(state: &WorkflowState) -> String {
         answer_next_step(state),
     ) + &format!(
         "\nselector: {}\ntest: {} rounds, {} attempts, last {}{}",
-        state.test_selector.as_deref().unwrap_or("(unresolved)"),
+        state
+            .test_skip
+            .as_ref()
+            .map(|skip| format!("无需测试 ({})", skip.reason))
+            .or_else(|| state.test_selector.clone())
+            .unwrap_or_else(|| "(unresolved)".to_owned()),
         state.test.rounds,
         state.test.attempts,
         match state.test.last_status {
@@ -4097,6 +4268,171 @@ validation: ok
         let state = store.load(&state.workflow_id).expect("state is readable");
         assert_eq!(state.phase, Phase::Review);
         assert!(state.review.approved_table_hash.is_none());
+        let events = fs::read_to_string(store.root().join(&state.workflow_id).join("events.jsonl"))
+            .expect("events");
+        assert!(events.contains("review.baseline_failed"), "{events}");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn approval_reasks_when_the_stored_selector_is_not_a_workspace_package() {
+        let workspace = temp_workspace();
+        seed_cargo_baseline(&workspace);
+        fs::create_dir_all(workspace.join("excerise/l1-service/src")).expect("private crate");
+        fs::write(
+            workspace.join("excerise/l1-service/Cargo.toml"),
+            "[package]\nname = \"l1-service\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("private manifest");
+        fs::write(
+            workspace.join("excerise/l1-service/src/lib.rs"),
+            "pub fn x() {}\n",
+        )
+        .expect("private source");
+        write_plan(&workspace, docs_plan_text());
+        let store = WorkflowStore::new(&workspace);
+        let tasks = workflow_tasks(&parse_task_table(docs_plan_text()), &[]);
+        let state = store
+            .create_with_tasks("docs", None, tasks)
+            .expect("workflow");
+        store
+            .set_test_selector(&state.workflow_id, "-p l1-service")
+            .expect("stale selector");
+
+        let outcome = run_approve(&PlanConfig::new(workspace.clone()))
+            .await
+            .expect("approve re-asks instead of running the bad selector");
+        assert!(
+            outcome.output.contains("selector required"),
+            "{}",
+            outcome.output
+        );
+        let state = store.load(&state.workflow_id).expect("state");
+        assert_eq!(state.phase, Phase::Review);
+        let questions = state.open_questions();
+        let question = questions.first().expect("selector question");
+        assert!(
+            question.options.contains(&"-p fixture".to_owned()),
+            "{question:?}"
+        );
+        assert!(
+            !question.options.contains(&"-p l1-service".to_owned()),
+            "{question:?}"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn docs_only_plan_can_skip_tests_and_complete() {
+        let workspace = temp_workspace();
+        seed_cargo_baseline(&workspace);
+        write_plan(&workspace, docs_plan_text());
+        let store = WorkflowStore::new(&workspace);
+        let tasks = workflow_tasks(&parse_task_table(docs_plan_text()), &[]);
+        let state = store
+            .create_with_tasks("docs", None, tasks)
+            .expect("workflow");
+        store
+            .ask_test_selector(
+                &state.workflow_id,
+                &["-p fixture".to_owned(), NO_TEST_OPTION.to_owned()],
+                "docs only",
+            )
+            .expect("selector question");
+        let config = PlanConfig::new(workspace.clone());
+        run_answer(
+            &config,
+            Arc::new(PanicProvider),
+            NO_TEST_OPTION,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("no-test answer");
+        let state = store.load(&state.workflow_id).expect("state");
+        assert!(state.test_skip.is_some());
+        assert!(state.test_selector.is_none());
+
+        let approved = run_approve(&config).await.expect("approve without a test");
+        assert!(approved.output.contains("test_fix") || approved.output.contains("TestFix"));
+        store
+            .record_execution(&state.workflow_id, Some("docs updated".to_owned()))
+            .expect("execution is recorded");
+        let tested = run_test(&config).await.expect("test skips and completes");
+        assert!(
+            tested.output.contains("status: skipped"),
+            "{}",
+            tested.output
+        );
+        let state = store.load(&state.workflow_id).expect("state");
+        assert_eq!(state.phase, Phase::Done);
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        let events = fs::read_to_string(store.root().join(&state.workflow_id).join("events.jsonl"))
+            .expect("events");
+        assert!(events.contains("test.skipped"), "{events}");
+        assert!(!events.contains("\"status\":\"passed\""), "{events}");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn workflow_selector_reopens_a_stale_selector() {
+        let workspace = temp_workspace();
+        seed_cargo_baseline(&workspace);
+        write_plan(&workspace, docs_plan_text());
+        let store = WorkflowStore::new(&workspace);
+        let tasks = workflow_tasks(&parse_task_table(docs_plan_text()), &[]);
+        let state = store
+            .create_with_tasks("docs", None, tasks)
+            .expect("workflow");
+        store
+            .set_test_selector(&state.workflow_id, "-p l1-service")
+            .expect("stale selector");
+
+        let outcome = run_workflow(
+            &PlanConfig::new(workspace.clone()),
+            Some("selector".to_owned()),
+        )
+        .await
+        .expect("selector question");
+        assert!(
+            outcome.output.contains("selector required"),
+            "{}",
+            outcome.output
+        );
+        let state = store.load(&state.workflow_id).expect("state");
+        let questions = state.open_questions();
+        let question = questions.first().expect("selector question");
+        assert!(
+            question.options.contains(&"-p fixture".to_owned()),
+            "{question:?}"
+        );
+        assert!(
+            !question.options.contains(&"-p l1-service".to_owned()),
+            "{question:?}"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn workflow_selector_rejects_a_package_outside_the_workspace() {
+        let workspace = temp_workspace();
+        seed_cargo_baseline(&workspace);
+        write_plan(&workspace, docs_plan_text());
+        let store = WorkflowStore::new(&workspace);
+        let tasks = workflow_tasks(&parse_task_table(docs_plan_text()), &[]);
+        let _state = store
+            .create_with_tasks("docs", None, tasks)
+            .expect("workflow");
+
+        let error = run_workflow(
+            &PlanConfig::new(workspace.clone()),
+            Some("selector -p l1-service".to_owned()),
+        )
+        .await
+        .expect_err("a package outside the workspace is rejected");
+        assert!(
+            error.to_string().contains("not in this workspace"),
+            "{error}"
+        );
         let _ = fs::remove_dir_all(&workspace);
     }
 
@@ -5145,6 +5481,18 @@ validation: ok
 | 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
 |---|---|---|---|---|---|---|---|
 | 修复取值 | 已知域 | src/lib.rs 的实现 | 可执行 | 自主执行 | 审查者 | src/lib.rs | tests/value_test.rs |
+"
+    }
+
+    fn docs_plan_text() -> &'static str {
+        "\
+## 证据包
+- read AGENTS.md
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 更新规则 | 已知域 | AGENTS.md 的既有小节 | 可执行 | 编辑 AGENTS.md | 审查者 | AGENTS.md | git diff 只含 AGENTS.md |
 "
     }
 

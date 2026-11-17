@@ -17,8 +17,8 @@ use serde_json::json;
 use slowcode_app::{
     plan::{PlanConfig, run_approve},
     workflow::{
-        Domain, ExecState, Phase, ScaffoldContract, Strategy, Task, TestContract, WorkflowStatus,
-        WorkflowStore,
+        Domain, ExecState, NO_TEST_OPTION, Phase, ScaffoldContract, Strategy, Task, TestContract,
+        WorkflowStatus, WorkflowStore,
     },
 };
 use slowcode_cli::{
@@ -622,9 +622,26 @@ async fn plan_answer_approve_execute_completes_with_file_change() {
         answered.output
     );
 
+    let selector = run_approve(&PlanConfig::new(workspace.clone()))
+        .await
+        .expect("approval asks for a selector");
+    assert!(
+        selector.output.contains("selector required") && selector.output.contains(NO_TEST_OPTION),
+        "docs-only plans must offer the no-test option: {}",
+        selector.output
+    );
+    let selector_answer =
+        run_answer_with_provider(&options, Arc::clone(&provider), None, NO_TEST_OPTION)
+            .await
+            .expect("no-test answer is recorded");
+    assert!(
+        selector_answer.output.contains("next: /approve"),
+        "selector answer must print the next step: {}",
+        selector_answer.output
+    );
     run_approve(&PlanConfig::new(workspace.clone()))
         .await
-        .expect("approval succeeds");
+        .expect("approval succeeds after the no-test decision");
     let workflow_id = WorkflowStore::new(&workspace)
         .require_active()
         .expect("active workflow")

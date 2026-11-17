@@ -183,15 +183,44 @@ pub fn validate_selector(config: &ProjectTestConfig, selector: &str) -> Result<(
         if token.contains("..") {
             return Err(invalid_selector(selector, "parent paths are not allowed"));
         }
-        match config.runner {
-            Runner::Cargo => validate_cargo_token(selector, token)?,
-            Runner::Pytest => validate_pytest_token(selector, token)?,
+    }
+    match config.runner {
+        Runner::Cargo => validate_cargo_selector(selector),
+        Runner::Pytest => {
+            for token in selector.split_whitespace() {
+                validate_pytest_token(selector, token)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Validate a selector and require every `-p`/`--package` name to be a member
+/// of the workspace package set.
+///
+/// The set is empty when the caller cannot enumerate packages; in that case
+/// only the syntax check runs and the caller decides whether that is enough.
+pub fn validate_selector_against_packages(
+    config: &ProjectTestConfig,
+    selector: &str,
+    packages: &std::collections::BTreeSet<String>,
+) -> Result<(), TestExecError> {
+    validate_selector(config, selector)?;
+    if config.runner != Runner::Cargo || packages.is_empty() {
+        return Ok(());
+    }
+    for package in cargo_package_values(selector) {
+        if !packages.contains(package) {
+            return Err(invalid_selector(
+                selector,
+                &format!("package `{package}` is not in this workspace"),
+            ));
         }
     }
     Ok(())
 }
 
-fn validate_cargo_token(selector: &str, token: &str) -> Result<(), TestExecError> {
+fn validate_cargo_selector(selector: &str) -> Result<(), TestExecError> {
     const FLAGS: &[&str] = &[
         "--lib",
         "--bins",
@@ -203,16 +232,57 @@ fn validate_cargo_token(selector: &str, token: &str) -> Result<(), TestExecError
         "--all",
     ];
     const VALUE_FLAGS: &[&str] = &["-p", "--package", "--test", "--bin", "--example"];
-    if FLAGS.contains(&token) || VALUE_FLAGS.contains(&token) {
-        return Ok(());
-    }
-    if token.starts_with('-') {
+    let tokens: Vec<&str> = selector.split_whitespace().collect();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if FLAGS.contains(&token) {
+            index += 1;
+            continue;
+        }
+        if VALUE_FLAGS.contains(&token) {
+            let value = tokens.get(index + 1).ok_or_else(|| {
+                invalid_selector(selector, &format!("{token} needs a package or target name"))
+            })?;
+            if value.starts_with('-') || value.is_empty() {
+                return Err(invalid_selector(
+                    selector,
+                    &format!("{token} needs a package or target name"),
+                ));
+            }
+            index += 2;
+            continue;
+        }
+        if token.starts_with('-') {
+            return Err(invalid_selector(
+                selector,
+                "only package or target scoping flags are allowed",
+            ));
+        }
         return Err(invalid_selector(
             selector,
-            "only package or target scoping flags are allowed",
+            "bare test filters are not allowed; use -p <package> or --test <target>",
         ));
     }
     Ok(())
+}
+
+fn cargo_package_values(selector: &str) -> Vec<&str> {
+    let tokens: Vec<&str> = selector.split_whitespace().collect();
+    let mut packages = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if matches!(token, "-p" | "--package") {
+            if let Some(value) = tokens.get(index + 1) {
+                packages.push(*value);
+            }
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    packages
 }
 
 fn validate_pytest_token(selector: &str, token: &str) -> Result<(), TestExecError> {
@@ -470,15 +540,50 @@ mod tests {
 
     #[test]
     fn cargo_selectors_accept_package_and_test_scoping() {
-        for selector in ["", "-p parser", "--test parser", "-p parser --test parser"] {
+        for selector in [
+            "",
+            "-p parser",
+            "--package parser",
+            "--test parser",
+            "-p parser --test parser",
+            "--workspace",
+            "--lib",
+        ] {
             validate_selector(&cargo(), selector).expect("selector is legal");
         }
-        for selector in ["; rm -rf .", "--release", "tests/../../etc", "$(whoami)"] {
+        for selector in [
+            "; rm -rf .",
+            "--release",
+            "tests/../../etc",
+            "$(whoami)",
+            "parser",
+            "parser::tests::parses",
+            "-p",
+            "-p ;",
+            "-p parser parser",
+        ] {
             assert!(
                 validate_selector(&cargo(), selector).is_err(),
                 "selector {selector} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn cargo_selectors_must_name_a_workspace_package() {
+        let packages = ["alpha".to_owned(), "beta".to_owned()]
+            .into_iter()
+            .collect();
+        validate_selector_against_packages(&cargo(), "-p alpha", &packages)
+            .expect("workspace member");
+        validate_selector_against_packages(&cargo(), "-p alpha --test alpha", &packages)
+            .expect("workspace member with a target");
+        let error = validate_selector_against_packages(&cargo(), "-p l1-service", &packages)
+            .expect_err("a private nested package is not a member");
+        assert!(
+            error.to_string().contains("is not in this workspace"),
+            "{error}"
+        );
     }
 
     #[test]

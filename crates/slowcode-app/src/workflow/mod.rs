@@ -51,12 +51,15 @@ pub use contract::{
 pub use input::{InputError, InputSnapshot, MAX_INPUT_BYTES, SecretPolicy, read_answer_file};
 pub use manifest::{ContextManifest, SkillManifestEntry, build_skill_manifest};
 pub use readonly_shell::{AuditedReadonlyShell, ReadonlyShellHandle, readonly_shell_schema};
-pub use selector::{SelectorChoice, derive_selector};
+pub use selector::{
+    NO_TEST_OPTION, SelectorChoice, derive_selector, plan_can_skip_test, plan_is_docs_only,
+    workspace_package_names,
+};
 pub use state::{
     AnswerSnapshot, AnswerSource, BlockedState, BudgetState, CapabilityProfile, CoreRegion,
     DistillState, Domain, ExecState, GateError, PendingApproval, Phase, Question, QuestionKind,
     QuestionStatus, ReviewState, SCHEMA_VERSION, ScaffoldContract, Strategy, Task, TestContract,
-    TestRunRecord, TestState, TestStatus, WorkflowLane, WorkflowState, WorkflowStatus,
+    TestRunRecord, TestSkip, TestState, TestStatus, WorkflowLane, WorkflowState, WorkflowStatus,
     changed_task_ids,
 };
 pub use store::{
@@ -66,5 +69,5 @@ pub use store::{
 };
 pub use test_exec::{
     DEFAULT_TEST_TIMEOUT_SECONDS, ProjectTestConfig, Runner, TestExecError, TestRun,
-    detect_project, validate_selector,
+    detect_project, validate_selector, validate_selector_against_packages,
 };
