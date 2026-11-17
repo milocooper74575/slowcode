@@ -99,12 +99,41 @@ async fn role_command_switches_without_calling_the_provider() {
 }
 
 #[test]
+fn repl_without_a_key_reports_the_credential_hint() {
+    let workspace = temp_workspace();
+    let output = Command::new(env!("CARGO_BIN_EXE_slowcode"))
+        .arg("repl")
+        .arg("--workspace")
+        .arg(&workspace)
+        // Keep dotenvy from walking up into a developer's repo .env.
+        .current_dir(&workspace)
+        .env_remove("DEEPSEEK_API_KEY")
+        .stdin(Stdio::null())
+        .output()
+        .expect("slowcode runs");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no DeepSeek API key is configured"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty());
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn repl_role_command_switches_between_turns() {
     let workspace = temp_workspace();
     let mut child = Command::new(env!("CARGO_BIN_EXE_slowcode"))
         .arg("repl")
         .arg("--workspace")
         .arg(&workspace)
+        // The REPL refuses to start without a credential. The fake key keeps
+        // this test hermetic: CI has no workspace .env, and /role never calls
+        // the provider.
+        .env("DEEPSEEK_API_KEY", "sk-test")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -119,7 +148,11 @@ fn repl_role_command_switches_between_turns() {
     let output = child.wait_with_output().expect("slowcode exits");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stdout:\n{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("role: navigator"), "{stdout}");
     assert!(stdout.contains("role: driver"), "{stdout}");
     assert!(stdout.contains("role unchanged: driver"), "{stdout}");
