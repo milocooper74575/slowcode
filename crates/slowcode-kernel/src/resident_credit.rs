@@ -100,6 +100,9 @@ impl ResidentCreditPool {
         }
     }
 
+    // See the note in `tools/plugin/actor.rs`: `try_update` is newer than the
+    // 1.88 MSRV.
+    #[allow(deprecated)]
     pub(super) fn try_acquire(
         &self,
         bytes: usize,

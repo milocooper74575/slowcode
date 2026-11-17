@@ -56,6 +56,16 @@ include those JSON fixtures by relative path.
   `AsyncFd::new`. The helper documents the ownership invariant; see
   `docs/adr/0017-async-fd-registration-seam.md`. A reactor test covers the
   registration path.
+- `tools/process.rs`: the escaped-pipe-holder test no longer asserts that
+  process spawn and shell startup finish inside three seconds. It still checks
+  the one-second drain grace lower bound and the `PipeDrainTimeout` cause, with
+  a 31-second ceiling so an unbounded wait fails. The shell readiness loop now
+  sleeps instead of busy-spinning. On a four-thread machine under heavy load
+  the old upper bound failed even though the drain window itself was correct.
+- `tools/plugin/actor.rs` and `resident_credit.rs`: kept `Atomic::fetch_update`
+  with a local `#[allow(deprecated)]`. Rust 1.100 renamed it to `try_update`,
+  but the crate still declares `rust-version = 1.88`, where the new name does
+  not exist.
 - `tools/workspace.rs`: `walk_files` now skips the same heavy directories as
   the file catalogue (`.git`, `target`, `node_modules`, `.venv`, `build`,
   `dist`, and the other entries in `is_skipped_search_directory`). Before, it

@@ -453,6 +453,10 @@ impl PluginActor {
             })
     }
 
+    // `fetch_update` is deprecated in newer toolchains in favour of
+    // `try_update`, which does not exist on the 1.88 MSRV. Keep the old name
+    // until the MSRV moves.
+    #[allow(deprecated)]
     fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _ = self

@@ -2440,7 +2440,7 @@ mod api_tests {
         let executable = std::env::current_exe().unwrap();
         let command = format!(
             "{} --exact tools::process::api_tests::escaped_pipe_helper_entry --nocapture & \
-             while [ ! -f {} ]; do :; done",
+             until [ -f {} ]; do sleep 0.01; done",
             shell_quote(&executable),
             shell_quote(&ready)
         );
@@ -2472,7 +2472,16 @@ mod api_tests {
         assert_eq!(report.primary(), ProcessPrimaryCause::PipeDrainTimeout);
         assert!(report.flags().pipe_drain_timed_out());
         assert!(started.elapsed() >= PIPE_DRAIN_GRACE);
-        assert!(started.elapsed() < Duration::from_secs(3));
+        // The contract is the bounded drain window, not a three-second budget
+        // for process spawn plus shell startup. A loaded machine can spend
+        // seconds before the helper is ready. Keep a generous ceiling so an
+        // unbounded wait still fails, while the lower bound and the timeout
+        // cause above prove the window actually expired.
+        assert!(
+            started.elapsed() < PIPE_DRAIN_GRACE + Duration::from_secs(30),
+            "drain window must stay bounded, took {:?}",
+            started.elapsed()
+        );
         std::fs::write(&stop, b"stop").unwrap();
         wait_for_file(&done).await;
         std::fs::remove_dir_all(directory).unwrap();
