@@ -27,6 +27,9 @@ skill installation.
 | `crates/slowcode-context` | AGENTS.md state, GLOSSARY stable prefix, HANDOFF pointer. |
 | `crates/slowcode-mcp` | MCP config merge, stdio and HTTP connections, tool calls. |
 | `crates/slowcode-skills` | Local skill install, validation, lock file, removal. |
+| `crates/slowcode-feedback` | Issue-ready feedback bundles from a session journal. |
+| `crates/slowcode-update` | Release checks and verified self-replace. |
+| `crates/slowcode-audit` | Offline session audit: tokens, repeated reads, idle retries, plan churn. |
 | `crates/slowcode-tests` | Cross-crate integration tests. |
 
 Public references:

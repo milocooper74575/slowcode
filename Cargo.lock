@@ -2122,6 +2122,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slowcode-audit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "slowcode-cli"
 version = "0.1.0"
 dependencies = [
