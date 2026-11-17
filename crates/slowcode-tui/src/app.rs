@@ -12,7 +12,9 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 use slowcode_app::plan::PlanOutcome;
-use slowcode_app::workflow::{ApprovalDecision, ApprovalRecord, ApprovalStatus, WorkflowStore};
+use slowcode_app::workflow::{
+    ApprovalDecision, ApprovalRecord, ApprovalStatus, Question, WorkflowStore,
+};
 use slowcode_app::{
     Command, CommandCompletion, CredentialSourceKind, CredentialStatus, Runtime, SessionCommand,
     command_specs, complete, complete_answer, credential_status, escape_terminal, parse_command,
@@ -1153,11 +1155,20 @@ impl App {
             ));
             return KeyAction::none();
         }
-        if let Some(question_id) = self.pending_plan_question() {
+        if let Some(question) = self.pending_plan_question_details() {
+            if answer_matches_question(&question, &input) {
+                self.push(MessageBlock::System(format!(
+                    "recording answer to {}",
+                    question.question_id
+                )));
+                return self.handle_plan_command(Command::Answer(input)).await;
+            }
             self.push(MessageBlock::System(format!(
-                "recording answer to {question_id}"
+                "this text was not recorded as an answer.\n\n{}\n\nchoose a listed option, type its number, or use /answer #{} <answer>.",
+                question.render(),
+                question.question_id
             )));
-            return self.handle_plan_command(Command::Answer(input)).await;
+            return KeyAction::none();
         }
         if self.plan_review_ready() && is_approval_text(&input) {
             self.push(MessageBlock::System(
@@ -1172,9 +1183,16 @@ impl App {
 
     /// The open Plan question that a plain-text submission answers.
     ///
-    /// While a workflow is in Interview or Reclassify, ordinary text is an
-    /// answer, not a new turn. `/ask` stays available for side questions.
+    /// While a workflow has an open question in Interview, Reclassify, Review,
+    /// or Distill, ordinary text may be an answer, not a new turn. `/ask`
+    /// stays available for side questions.
+    #[cfg(test)]
     fn pending_plan_question(&self) -> Option<String> {
+        self.pending_plan_question_details()
+            .map(|question| question.question_id)
+    }
+
+    fn pending_plan_question_details(&self) -> Option<Question> {
         let state = WorkflowStore::new(&self.workspace())
             .load_active()
             .ok()
@@ -1183,6 +1201,7 @@ impl App {
             state.phase,
             slowcode_app::workflow::Phase::Interview
                 | slowcode_app::workflow::Phase::Reclassify
+                | slowcode_app::workflow::Phase::Review
                 | slowcode_app::workflow::Phase::Distill
         ) {
             return None;
@@ -1190,7 +1209,7 @@ impl App {
         state
             .open_questions()
             .first()
-            .map(|question| question.question_id.clone())
+            .map(|question| (*question).clone())
     }
 
     fn plan_review_ready(&self) -> bool {
@@ -1524,9 +1543,9 @@ impl App {
 
     /// Continue an approved workflow without asking for the next phase command.
     ///
-    /// Approval decides the phase. Scaffold runs for user-owned core tasks,
-    /// and TestFix runs the fixed test contract. The phase after those steps
-    /// still stops where a human is required.
+    /// Approval decides the phase. Scaffold runs for user-owned core tasks, and
+    /// TestFix first executes the known AI tasks before running the contract.
+    /// The phase after those steps still stops where a human is required.
     fn start_approved_step(&mut self) {
         let Some(phase) = self.active_phase() else {
             return;
@@ -3415,7 +3434,7 @@ fn approved_step_command(
 ) -> Option<slowcode_app::plan::PlanCommand> {
     match phase {
         slowcode_app::workflow::Phase::Scaffold => Some(slowcode_app::plan::PlanCommand::Scaffold),
-        slowcode_app::workflow::Phase::TestFix => Some(slowcode_app::plan::PlanCommand::Test),
+        slowcode_app::workflow::Phase::TestFix => Some(slowcode_app::plan::PlanCommand::Execute),
         _ => None,
     }
 }
@@ -4100,6 +4119,23 @@ fn is_approval_text(text: &str) -> bool {
         "请开始",
     ];
     APPROVALS.contains(&normalized.as_str())
+}
+
+/// Whether plain text is a real answer to the open question.
+///
+/// Free text stays a side conversation unless the question has no options.
+/// A question with options only accepts an exact option or its 1-based number,
+/// so "还有哪些问题需要回答？" cannot become a test selector.
+fn answer_matches_question(question: &Question, text: &str) -> bool {
+    let input = text.trim();
+    if question.options.is_empty() {
+        return true;
+    }
+    question
+        .options
+        .iter()
+        .enumerate()
+        .any(|(index, option)| input == option.trim() || input == (index + 1).to_string())
 }
 
 /// Whether finishing this command should immediately run the next fixed step.
@@ -6283,7 +6319,7 @@ mod tests {
         );
         assert_eq!(
             approved_step_command(Phase::TestFix),
-            Some(slowcode_app::plan::PlanCommand::Test)
+            Some(slowcode_app::plan::PlanCommand::Execute)
         );
         assert_eq!(approved_step_command(Phase::Review), None);
         assert_eq!(approved_step_command(Phase::AwaitUser), None);
@@ -6313,7 +6349,7 @@ mod tests {
         // Both paths that end in TestFix converge on the same next command.
         assert_eq!(
             approved_step_command(Phase::TestFix),
-            Some(PlanCommand::Test)
+            Some(PlanCommand::Execute)
         );
     }
 
@@ -6324,6 +6360,35 @@ mod tests {
         assert!(hint.starts_with("next: /answer #q-1"), "{hint}");
         assert!(hint.contains("question q-1"), "{hint}");
         assert_eq!(plan_followup("no marker"), None);
+    }
+
+    #[test]
+    fn free_text_does_not_match_an_option_question() {
+        use slowcode_app::workflow::{Question, QuestionKind, QuestionStatus};
+
+        let question = Question {
+            question_id: "q-1".to_owned(),
+            task_id: None,
+            kind: QuestionKind::TestSelector,
+            prompt: "选择一个 selector？".to_owned(),
+            options: vec!["-p alpha".to_owned(), "-p beta".to_owned()],
+            recommendation: Some("-p alpha".to_owned()),
+            reason: "two packages".to_owned(),
+            status: QuestionStatus::Open,
+            criteria: "必须是选项之一".to_owned(),
+            created_at: 0,
+            answer: None,
+            answer_source: None,
+            answer_snapshot: None,
+            attempts: 0,
+            last_gap: None,
+        };
+        assert!(answer_matches_question(&question, "-p beta"));
+        assert!(answer_matches_question(&question, "2"));
+        assert!(!answer_matches_question(
+            &question,
+            "还有哪些问题需要回答？"
+        ));
     }
 
     #[tokio::test]

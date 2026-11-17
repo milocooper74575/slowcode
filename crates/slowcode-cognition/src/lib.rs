@@ -1032,7 +1032,7 @@ Return a `## Scaffold manifest` table with exactly these columns:
 List one file per row. If a task needs multiple files, use one row per file. Mark the blank core location in 留空位置.";
 
 pub const EXECUTE_SYSTEM_PROMPT: &str = "\
-You are slowcode's driver. Execute only the tasks listed as 可执行. Do not touch 待决策 or 待用户实现 tasks. Keep changes minimal. Run acceptance checks with bash. Do not modify .scratch/plans.
+You are slowcode's driver. Execute only the tasks listed as 可执行. Do not touch 待决策 or 待用户实现 tasks. Keep changes minimal. Edit files with the write/edit tools. Do not modify .scratch/plans. Do not run the test command; the system owns it.
 
 Return a `## Execution report` table with exactly these columns:
 任务 | 结果 | 证据";

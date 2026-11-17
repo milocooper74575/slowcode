@@ -18,15 +18,15 @@ use std::{
 
 use slowcode_cognition::{
     ANSWER_SYSTEM_PROMPT, AnswerVerdictKind, CognitiveTask, DISTILL_SYSTEM_PROMPT,
-    FIX_SYSTEM_PROMPT, HINT_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, PLAN_TURN_INSTRUCTION,
-    PlanValidation, QuestionDraft, SCAFFOLD_SYSTEM_PROMPT, answer_user_prompt,
-    answer_verdict_repair_prompt, append_section, apply_decisions, artifact_slug,
-    distill_follow_up, distill_repair_prompt, distill_user_prompt,
-    failure_classification_repair_prompt, fix_user_prompt, hint_user_prompt, parse_answer_verdict,
-    parse_decision_tables, parse_failure_classifications, parse_question_table,
-    parse_scaffold_manifest, parse_task_table, question_answer_user_prompt, render_artifact,
-    render_task_bullets, repair_prompt, scaffold_tasks, scaffold_user_prompt, set_artifact_status,
-    validate_answer_verdict, validate_decisions, validate_distill_output,
+    EXECUTE_SYSTEM_PROMPT, FIX_SYSTEM_PROMPT, HINT_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT,
+    PLAN_TURN_INSTRUCTION, PlanValidation, QuestionDraft, SCAFFOLD_SYSTEM_PROMPT,
+    answer_user_prompt, answer_verdict_repair_prompt, append_section, apply_decisions,
+    artifact_slug, distill_follow_up, distill_repair_prompt, distill_user_prompt, executable_tasks,
+    execute_user_prompt, failure_classification_repair_prompt, fix_user_prompt, hint_user_prompt,
+    parse_answer_verdict, parse_decision_tables, parse_failure_classifications,
+    parse_question_table, parse_scaffold_manifest, parse_task_table, question_answer_user_prompt,
+    render_artifact, render_task_bullets, repair_prompt, scaffold_tasks, scaffold_user_prompt,
+    set_artifact_status, validate_answer_verdict, validate_decisions, validate_distill_output,
     validate_failure_classifications, validate_plan_output,
 };
 use slowcode_kernel::skill_roots::SkillRoots;
@@ -254,6 +254,7 @@ impl PlanCommand {
             Self::Plan(_)
                 | Self::Answer(_)
                 | Self::Scaffold
+                | Self::Execute
                 | Self::Fix
                 | Self::Distill(_)
                 | Self::Hint(_)
@@ -914,6 +915,14 @@ fn run_answer_body<'a>(
                 invalid("test selector needs a Cargo package or pytest configuration")
             })?;
             let selector = resolve_selector_answer(&question.options, &answer_text);
+            if !question.options.is_empty()
+                && !question.options.iter().any(|option| option == &selector)
+            {
+                return Err(invalid(format!(
+                    "selector must be one of the offered options: {}",
+                    question.options.join(" / ")
+                )));
+            }
             validate_selector(&project, &selector)
                 .map_err(|error| invalid(format!("invalid test selector: {error}")))?;
             let state = store.answer_test_selector(
@@ -922,17 +931,15 @@ fn run_answer_body<'a>(
                 &selector,
                 source,
             )?;
-            let body = format!(
-                "### 测试选择器\n\n{selector}\n\n### 下一步\n\n{}",
-                answer_next_step(&state)
-            );
+            let body = format!("### 测试选择器\n\n{selector}");
             let heading = format!("决策记录 {}", now_unix()?);
             let updated = append_section(&artifact, &heading, &body);
             let updated = set_artifact_status(&updated, "answered");
             fs::write(&path, updated)?;
+            let output = outcome_with_next(&state, body);
             return Ok(PlanOutcome {
                 path,
-                output: body,
+                output,
                 workflow_id: Some(state.workflow_id),
             });
         }
@@ -1092,10 +1099,7 @@ fn answer_distill_question(
         }
         DistillDecision::AcceptGaps => "已显式接受剩余缺口，workflow 完成。",
     };
-    let body = format!(
-        "### 用户回答\n\n{answer_text}\n\n### 结果\n\n{result}\n\n### 下一步\n\n{}",
-        answer_next_step(&state)
-    );
+    let body = format!("### 用户回答\n\n{answer_text}\n\n### 结果\n\n{result}");
     let heading = format!("Distill 追问 {}", now_unix()?);
     let updated = append_section(artifact, &heading, &body);
     let updated = set_artifact_status(
@@ -1107,9 +1111,10 @@ fn answer_distill_question(
         },
     );
     fs::write(path, updated)?;
+    let output = outcome_with_next(&state, body);
     Ok(PlanOutcome {
         path: path.to_owned(),
-        output: body,
+        output,
         workflow_id: Some(state.workflow_id),
     })
 }
@@ -1177,17 +1182,15 @@ fn answer_unknown_question(
     update.follow_up = follow_up;
     update.next_phase = next_phase;
     let state = store.apply_answer(&active.workflow_id, update)?;
-    let body = format!(
-        "### 用户选择\n\n{answer_text}\n\n### 结果\n\n{label}\n\n### 下一步\n\n{}",
-        answer_next_step(&state)
-    );
+    let body = format!("### 用户选择\n\n{answer_text}\n\n### 结果\n\n{label}");
     let heading = format!("决策记录 {}", now_unix()?);
     let updated = append_section(artifact, &heading, &body);
     let updated = set_artifact_status(&updated, "answered");
     fs::write(path, updated)?;
+    let output = outcome_with_next(&state, body);
     Ok(PlanOutcome {
         path: path.to_owned(),
-        output: body,
+        output,
         workflow_id: Some(state.workflow_id),
     })
 }
@@ -1256,7 +1259,7 @@ async fn answer_model_question(
         }
         return Ok(PlanOutcome {
             path: path.to_owned(),
-            output: body,
+            output: outcome_with_next(&state, body),
             workflow_id: Some(state.workflow_id),
         });
     }
@@ -1284,17 +1287,17 @@ async fn answer_model_question(
     update.tasks = Some(workflow_tasks);
     let state = store.apply_answer(&active.workflow_id, update)?;
     let body = format!(
-        "### 用户回答\n\n{answer_text}\n\n### 回答判定\n\nsufficient\n\n### 决策表\n\n{output}\n\n### 有效状态\n\n{}\n\n### 下一步\n\n{}",
-        render_task_bullets(&effective),
-        answer_next_step(&state)
+        "### 用户回答\n\n{answer_text}\n\n### 回答判定\n\nsufficient\n\n### 决策表\n\n{output}\n\n### 有效状态\n\n{}",
+        render_task_bullets(&effective)
     );
     let heading = format!("决策记录 {}", now_unix()?);
     let updated = append_section(artifact, &heading, &body);
     let updated = set_artifact_status(&updated, "answered");
     fs::write(path, updated)?;
+    let output = outcome_with_next(&state, body);
     Ok(PlanOutcome {
         path: path.to_owned(),
-        output: body,
+        output,
         workflow_id: Some(state.workflow_id),
     })
 }
@@ -1440,9 +1443,10 @@ async fn run_scaffold_with_session(
             fs::write(&path, updated)?;
             let state =
                 store.finish_scaffold(&active.workflow_id, contract, Some(selector))?;
+            let output = outcome_with_next(&state, body);
             Ok(PlanOutcome {
                 path,
-                output: body,
+                output,
                 workflow_id: Some(state.workflow_id),
             })
         }),
@@ -1633,6 +1637,11 @@ pub async fn run_test(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
     let store = WorkflowStore::new(&config.workspace);
     let active = store.require_active()?;
     active.can_enter_test()?;
+    if active.needs_ai_execution() {
+        return Err(invalid(
+            "/test is blocked until /execute implements the known executable tasks",
+        ));
+    }
     let contract = active
         .test_contract
         .clone()
@@ -1650,6 +1659,11 @@ pub async fn run_test(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
     }
     let (run, flaky_reruns, total_ms) =
         run_contract_with_retries(&config.workspace, &contract).await?;
+    if run.succeeded() && run.passed.is_empty() && run.failures.is_empty() {
+        return Err(invalid(
+            "test selector matched no tests; a green run with zero tests cannot prove the change",
+        ));
+    }
     let update = test_run_update(&run, flaky_reruns, total_ms);
     let state = store.record_test_run(&active.workflow_id, update, MAX_CONSECUTIVE_SAME_FAILURE)?;
     let path = resolve_plan_path(config)?;
@@ -1839,17 +1853,9 @@ async fn run_fix_with_session(
 
                 if !unknown.is_empty() {
                     let state = store.ask_unknown_gaps(&state.workflow_id, &unknown)?;
-                    let question = state
-                        .open_questions()
-                        .first()
-                        .map(|question| question.question_id.clone())
-                        .unwrap_or_default();
                     return Ok(PlanOutcome {
                         path,
-                        output: format!(
-                            "{body}\n\nunknown gap: {}\nnext question: {question}",
-                            question
-                        ),
+                        output: outcome_with_next(&state, body),
                         workflow_id: Some(state.workflow_id),
                     });
                 }
@@ -1860,9 +1866,12 @@ async fn run_fix_with_session(
                     )?;
                     return Ok(PlanOutcome {
                         path,
-                        output: format!(
-                            "{body}\n\ncontract error: {}; back to Review, run /approve again",
-                            row.evidence
+                        output: outcome_with_next(
+                            &state,
+                            format!(
+                                "{body}\n\ncontract error: {}; back to Review, run /approve again",
+                                row.evidence
+                            ),
                         ),
                         workflow_id: Some(state.workflow_id),
                     });
@@ -1876,16 +1885,22 @@ async fn run_fix_with_session(
                     )?;
                     return Ok(PlanOutcome {
                         path,
-                        output: format!("{body}\n\nblocked: environment ({})", row.evidence),
+                        output: outcome_with_next(
+                            &state,
+                            format!("{body}\n\nblocked: environment ({})", row.evidence),
+                        ),
                         workflow_id: Some(state.workflow_id),
                     });
                 }
                 let flaky = rows.iter().filter(|row| row.kind == "flaky").count();
                 Ok(PlanOutcome {
                     path,
-                    output: format!(
-                        "{body}\n\nclassified {} failure(s), flaky {flaky}\nnext: /test",
-                        rows.len()
+                    output: outcome_with_next(
+                        &state,
+                        format!(
+                            "{body}\n\nclassified {} failure(s), flaky {flaky}",
+                            rows.len()
+                        ),
                     ),
                     workflow_id: Some(state.workflow_id),
                 })
@@ -1914,7 +1929,7 @@ fn render_fix_evidence(run: &TestRunRecord, expected_failures: &[String]) -> Str
     )
 }
 
-/// `/execute` is a compatibility alias: ensure a red run, fix it, then test.
+/// `/execute` implements the known executable tasks, then runs the contract.
 async fn run_execute_with_session(
     config: &PlanConfig,
     provider: Arc<dyn ModelProvider>,
@@ -1928,10 +1943,88 @@ async fn run_execute_with_session(
     let store = WorkflowStore::new(&config.workspace);
     let active = store.require_active()?;
     active.can_enter_test()?;
-    let first = if active.test.last_status == Some(TestStatus::Failed) {
+    if !active.allows_workspace_write() {
+        return Err(invalid(format!(
+            "/execute cannot write in phase {}",
+            active.phase
+        )));
+    }
+    let path = resolve_plan_path(config)?;
+    let artifact = fs::read_to_string(&path)?;
+    let mut output = String::new();
+    let mut state = active.clone();
+    if state.needs_ai_execution() {
+        let tasks = effective_tasks(&artifact)?;
+        let targets = executable_tasks(&tasks);
+        if targets.is_empty() {
+            return Err(invalid("no executable tasks to run"));
+        }
+        let (file_change, _) = write_policies(&approval);
+        record_manifest(
+            &config.workspace,
+            &active.workflow_id,
+            active.phase,
+            CapabilityProfile::Driver,
+        )?;
+        let plan_config = config.clone();
+        let execute_store = store.clone();
+        let execute_cancel = cancellation.clone();
+        let (next, body) = with_plan_agent(
+            sessions,
+            config,
+            Arc::clone(&provider),
+            PlanAgentPolicy {
+                system: EXECUTE_SYSTEM_PROMPT,
+                profile: CapabilityProfile::Driver,
+                registry: RegistryMode::Workspace,
+                file_change,
+                session_prefix: "slowcode-execute-",
+                approval: approval.clone(),
+                workflow_id: Some(active.workflow_id.clone()),
+                audit_sink: None,
+                max_steps_per_turn: None,
+            },
+            move |agent| {
+                Box::pin(async move {
+                    let config = &plan_config;
+                    let report = run_text_turn(
+                        agent,
+                        &execute_user_prompt(&artifact, &targets),
+                        1,
+                        config,
+                        &execute_cancel,
+                    )
+                    .await?;
+                    if !report.contains("## Execution report") {
+                        return Err(invalid(format!(
+                            "execute output did not contain a `## Execution report` table\n\n{report}"
+                        )));
+                    }
+                    let body = format!("### 报告\n\n{}", report.trim());
+                    let heading = format!("Execution {}", now_unix()?);
+                    let updated = append_section(&artifact, &heading, &body);
+                    let updated = set_artifact_status(&updated, "executed");
+                    fs::write(&path, updated)?;
+                    let state =
+                        execute_store.record_execution(&active.workflow_id, Some(report))?;
+                    Ok((state, body))
+                })
+            },
+        )
+        .await?;
+        state = next;
+        output.push_str(&body);
+    }
+
+    let first = if state.test.last_status == Some(TestStatus::Failed) {
         None
     } else {
-        Some(run_test(config).await?)
+        let outcome = run_test(config).await?;
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(&outcome.output);
+        Some(outcome)
     };
     if let Some(outcome) = &first {
         let state = store.load(
@@ -1942,7 +2035,11 @@ async fn run_execute_with_session(
         )?;
         if state.phase != Phase::TestFix || state.status != crate::workflow::WorkflowStatus::Active
         {
-            return Ok(outcome.clone());
+            return Ok(PlanOutcome {
+                path: outcome.path.clone(),
+                output: outcome_with_next(&state, output),
+                workflow_id: outcome.workflow_id.clone(),
+            });
         }
     }
     let fix = Box::pin(run_fix_with_session(
@@ -1958,9 +2055,7 @@ async fn run_execute_with_session(
             .as_deref()
             .ok_or_else(|| invalid("fix run has no workflow"))?,
     )?;
-    let mut output = String::new();
-    if let Some(first) = first {
-        output.push_str(&first.output);
+    if !output.is_empty() {
         output.push_str("\n\n");
     }
     output.push_str(&fix.output);
@@ -1968,15 +2063,20 @@ async fn run_execute_with_session(
         let test = run_test(config).await?;
         output.push_str("\n\n");
         output.push_str(&test.output);
+        let state = store.load(
+            test.workflow_id
+                .as_deref()
+                .ok_or_else(|| invalid("test run has no workflow"))?,
+        )?;
         return Ok(PlanOutcome {
             path: test.path,
-            output,
+            output: outcome_with_next(&state, output),
             workflow_id: test.workflow_id,
         });
     }
     Ok(PlanOutcome {
         path: fix.path,
-        output,
+        output: outcome_with_next(&state, output),
         workflow_id: fix.workflow_id,
     })
 }
@@ -2061,10 +2161,10 @@ async fn run_distill_with_session(
                     &active.workflow_id,
                     Some(distill_follow_up_question(follow_up)),
                 )?;
-                let body = format!("{body}\n\n### 下一步\n\n{}", answer_next_step(&state));
+                let output = outcome_with_next(&state, body);
                 Ok(PlanOutcome {
                     path,
-                    output: body,
+                    output,
                     workflow_id: Some(state.workflow_id),
                 })
             })
@@ -2194,21 +2294,21 @@ pub async fn run_approve(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
             SelectorChoice::Resolved(selector) => Some(selector),
             SelectorChoice::NeedsUser { options, reason } => {
                 let state = store.ask_test_selector(&active.workflow_id, &options, &reason)?;
-                let question = state
-                    .open_questions()
-                    .first()
-                    .map(|question| question.question_id.clone())
-                    .unwrap_or_default();
+                let question = state.open_questions().first().cloned();
+                let output = match &question {
+                    Some(question) => format!(
+                        "selector required: {reason}\n\n{}\n\nnext: /answer #{} <selector>",
+                        question.render(),
+                        question.question_id
+                    ),
+                    None => format!(
+                        "selector required: {reason}\noptions: {}",
+                        options.join(", ")
+                    ),
+                };
                 return Ok(PlanOutcome {
                     path: store.root().join(&state.workflow_id).join("state.json"),
-                    output: format!(
-                        "selector required: {reason}\noptions: {}\nnext question: {question}\nanswer with /answer {question} <selector>",
-                        if options.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            options.join(", ")
-                        }
-                    ),
+                    output,
                     workflow_id: Some(state.workflow_id),
                 });
             }
@@ -2240,6 +2340,11 @@ pub async fn run_approve(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
             return Err(invalid(format!(
                 "review baseline is red; fix these pre-existing failures or exclude them before /approve:\n{failures}"
             )));
+        }
+        if baseline.passed.is_empty() && baseline.failures.is_empty() {
+            return Err(invalid(
+                "review baseline matched no tests; choose a selector that runs at least one test",
+            ));
         }
         Some(build_review_contract(project, selector, &baseline)?.test_contract())
     };
@@ -2479,7 +2584,9 @@ fn next_action(state: &WorkflowState) -> String {
         Phase::Scaffold => "/scaffold".to_owned(),
         Phase::AwaitUser => "implement the core regions, then /continue".to_owned(),
         Phase::TestFix => {
-            if state.test.last_status == Some(TestStatus::Failed) {
+            if state.needs_ai_execution() {
+                "/execute".to_owned()
+            } else if state.test.last_status == Some(TestStatus::Failed) {
                 "/fix, then /test".to_owned()
             } else {
                 "/test".to_owned()
@@ -2513,12 +2620,26 @@ fn next_action(state: &WorkflowState) -> String {
 fn answer_next_step(state: &WorkflowState) -> String {
     if let Some(question) = state.open_questions().first() {
         format!(
-            "next: /answer #{} <answer>\nquestion {}: {}",
-            question.question_id, question.question_id, question.prompt
+            "next: /answer #{} <answer>\n{}",
+            question.question_id,
+            question.render()
         )
     } else {
         format!("next: {}", next_action(state))
     }
+}
+
+/// Body plus the workflow marker and the next step.
+///
+/// Model-driven commands stream their body, so the TUI only reprints text
+/// after `[workflow:`. Without this block the next question and command are
+/// invisible after `/answer`, `/execute`, `/fix`, `/scaffold`, and `/distill`.
+fn outcome_with_next(state: &WorkflowState, body: String) -> String {
+    format!(
+        "{body}\n\n{}\n{}",
+        workflow_marker(state),
+        answer_next_step(state)
+    )
 }
 
 /// Map cognitive tasks from the model output onto workflow tasks, preserving
@@ -4940,7 +5061,7 @@ validation: ok
             .await
             .expect("reclassify succeeds");
         assert!(
-            state.output.contains("phase: interview"),
+            state.output.contains("phase: reclassify"),
             "{}",
             state.output
         );
@@ -5059,7 +5180,66 @@ validation: ok
             )
             .expect("approval");
         assert_eq!(state.phase, Phase::TestFix);
+        store
+            .record_execution(&state.workflow_id, Some("seeded execution".to_owned()))
+            .expect("execution is recorded");
         state.workflow_id
+    }
+
+    #[tokio::test]
+    async fn test_waits_for_execute_when_known_tasks_are_pending() {
+        let workspace = temp_workspace();
+        seed_red_cargo_project(&workspace);
+        write_plan(&workspace, known_plan_text());
+        let store = WorkflowStore::new(&workspace);
+        let tasks = workflow_tasks(&parse_task_table(known_plan_text()), &[]);
+        let state = store
+            .create_with_tasks("test", None, tasks)
+            .expect("workflow");
+        let state = store
+            .approve(
+                &state.workflow_id,
+                Some(test_fix_contract(&workspace)),
+                Some("-p fixture".to_owned()),
+            )
+            .expect("approval");
+        assert_eq!(state.phase, Phase::TestFix);
+        assert!(state.needs_ai_execution());
+
+        let error = run_test(&PlanConfig::new(workspace.clone()))
+            .await
+            .expect_err("test cannot skip execution");
+        assert!(error.to_string().contains("/execute"), "{error}");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn selector_answer_must_match_an_offered_option() {
+        let workspace = temp_workspace();
+        seed_cargo_baseline(&workspace);
+        write_plan(&workspace, plan_text());
+        let store = WorkflowStore::new(&workspace);
+        let state = store
+            .create_with_tasks("test", None, Vec::new())
+            .expect("workflow");
+        store
+            .ask_test_selector(
+                &state.workflow_id,
+                &["-p fixture".to_owned(), "-p other".to_owned()],
+                "two packages",
+            )
+            .expect("selector question");
+
+        let error = run_answer(
+            &PlanConfig::new(workspace.clone()),
+            Arc::new(PanicProvider),
+            "还有哪些问题需要回答？",
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("free text is not a selector");
+        assert!(error.to_string().contains("offered options"), "{error}");
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     const KNOWN_CLASSIFICATION: &str = "\
@@ -5131,7 +5311,11 @@ validation: ok
         let fixed = run_fix(&config, provider, None, CancellationToken::new())
             .await
             .expect("fix reports an unknown gap");
-        assert!(fixed.output.contains("unknown gap"), "{}", fixed.output);
+        assert!(
+            fixed.output.contains("测试失败暴露了新的未知域"),
+            "{}",
+            fixed.output
+        );
         let store = WorkflowStore::new(&workspace);
         let state = store.load(&workflow_id).expect("state");
         assert_eq!(state.phase, Phase::Reclassify);

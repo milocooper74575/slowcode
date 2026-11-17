@@ -25,8 +25,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use super::state::{
-    AnswerSnapshot, AnswerSource, PendingApproval, Phase, Question, QuestionKind, QuestionStatus,
-    Task, TestRunRecord, TestStatus, WorkflowState, WorkflowStatus, changed_task_ids,
+    AnswerSnapshot, AnswerSource, ExecutionState, PendingApproval, Phase, Question, QuestionKind,
+    QuestionStatus, Task, TestRunRecord, TestStatus, WorkflowState, WorkflowStatus,
+    changed_task_ids,
 };
 use super::{
     approval::{
@@ -530,6 +531,7 @@ impl WorkflowStore {
                 follow_up.created_at = now_ms();
             }
             let question_id = state.append_question(follow_up);
+            state.phase = Phase::Interview;
             events.push((
                 "question.asked",
                 json!({ "question_id": question_id, "follow_up": true }),
@@ -766,6 +768,29 @@ impl WorkflowStore {
             output_tail: failure.unwrap_or_default(),
         };
         self.record_test_run(workflow_id, TestRunUpdate::new(record), u32::MAX)
+    }
+
+    /// Record that the AI finished implementing the executable known tasks.
+    ///
+    /// The phase stays in TestFix; `/test` becomes the next step.
+    pub fn record_execution(
+        &self,
+        workflow_id: &str,
+        report: Option<String>,
+    ) -> Result<WorkflowState, WorkflowError> {
+        let _lock = self.lock()?;
+        let mut state = self.load(workflow_id)?;
+        state.can_enter_test()?;
+        let execution = state.execution.get_or_insert_with(ExecutionState::default);
+        execution.reported = true;
+        execution.attempts += 1;
+        execution.last_report = report;
+        let attempts = execution.attempts;
+        self.commit(
+            &mut state,
+            vec![("execution.reported", json!({ "attempts": attempts }))],
+        )?;
+        Ok(state)
     }
 
     /// Record one fixed-contract test run.
@@ -1361,6 +1386,7 @@ impl WorkflowStore {
                     // The knowledge question needs an answer, so the workflow
                     // moves through Reclassify into Interview in this commit.
                     let follow_up_id = state.append_question(question);
+                    state.phase = Phase::Interview;
                     events.push((
                         "question.asked",
                         json!({ "question_id": follow_up_id, "kind": "knowledge" }),
@@ -2993,7 +3019,7 @@ mod tests {
         let state = store
             .reclassify(&state.workflow_id, "缓存一致性语义未定")
             .expect("reclassify");
-        assert_eq!(state.phase, Phase::Interview);
+        assert_eq!(state.phase, Phase::Reclassify);
         assert_eq!(state.questions.len(), 1);
         assert_eq!(state.questions[0].kind, QuestionKind::Knowledge);
         let events = fs::read_to_string(store.events_path(&state.workflow_id)).expect("events");
@@ -3002,7 +3028,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_question_moves_through_interview_and_back_to_review() {
+    fn selector_question_stays_in_review() {
         let workspace = temp_workspace();
         let store = WorkflowStore::new(&workspace);
         let state = store
@@ -3016,7 +3042,7 @@ mod tests {
                 "tasks span two packages",
             )
             .expect("selector question");
-        assert_eq!(state.phase, Phase::Interview);
+        assert_eq!(state.phase, Phase::Review);
         assert_eq!(state.questions[0].kind, QuestionKind::TestSelector);
 
         let state = store

@@ -358,6 +358,34 @@ pub struct Question {
     pub last_gap: Option<String>,
 }
 
+impl Question {
+    /// Render the whole question for the console.
+    ///
+    /// The model receives options and criteria as prompt data; the human never
+    /// did. Every command that leaves a question open must print this so the
+    /// next answer is not a guess.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut text = format!("question {}: {}\n", self.question_id, self.prompt);
+        if !self.options.is_empty() {
+            text.push_str("options:\n");
+            for (index, option) in self.options.iter().enumerate() {
+                text.push_str(&format!("  {}. {}\n", index + 1, option));
+            }
+        }
+        if !self.criteria.trim().is_empty() {
+            text.push_str(&format!("criteria: {}\n", self.criteria.trim()));
+        }
+        if self.attempts > 0 {
+            text.push_str(&format!("attempts: {}\n", self.attempts));
+        }
+        if let Some(gap) = &self.last_gap {
+            text.push_str(&format!("last gap: {gap}\n"));
+        }
+        text.trim_end().to_owned()
+    }
+}
+
 /// File snapshot recorded for `@file` answers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AnswerSnapshot {
@@ -517,6 +545,21 @@ pub struct TestState {
     pub last_failure_signature: Option<String>,
 }
 
+/// AI execution bookkeeping for the TestFix phase.
+///
+/// A plan made of known, AI-implemented tasks must be executed before tests
+/// can prove anything. Without this record `/test` could pass on an untouched
+/// workspace and complete the workflow.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionState {
+    #[serde(default)]
+    pub reported: bool,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_report: Option<String>,
+}
+
 /// Distill bookkeeping.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DistillState {
@@ -590,6 +633,8 @@ pub struct WorkflowState {
     #[serde(default)]
     pub test: TestState,
     #[serde(default)]
+    pub execution: Option<ExecutionState>,
+    #[serde(default)]
     pub distill: Option<DistillState>,
     /// Latest Skill manifest recorded for this workflow.
     #[serde(default)]
@@ -645,6 +690,7 @@ impl WorkflowState {
             test_contract: None,
             test_selector: None,
             test: TestState::default(),
+            execution: None,
             distill: None,
             context_manifest: None,
             workspace_fingerprint: None,
@@ -682,6 +728,27 @@ impl WorkflowState {
             .iter()
             .filter(|task| task.exec_state == ExecState::PendingDecision)
             .collect()
+    }
+
+    /// Known tasks the AI still has to implement.
+    #[must_use]
+    pub fn executable_ai_tasks(&self) -> Vec<&Task> {
+        self.tasks
+            .iter()
+            .filter(|task| {
+                task.strategy == Strategy::AiImplements && task.exec_state == ExecState::Executable
+            })
+            .collect()
+    }
+
+    /// Whether `/execute` still needs to run before `/test` is meaningful.
+    #[must_use]
+    pub fn needs_ai_execution(&self) -> bool {
+        !self.executable_ai_tasks().is_empty()
+            && !self
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.reported)
     }
 
     #[must_use]
@@ -898,11 +965,12 @@ impl WorkflowState {
         Some(question.attempts)
     }
 
-    /// Append a system-generated question and move to Interview.
+    /// Append a system-generated question.
+    ///
+    /// The caller owns the phase. A test-selector question asked during Review
+    /// must not move the workflow back to Interview.
     pub fn append_question(&mut self, question: Question) -> String {
-        let question_id = self.push_question(question);
-        self.phase = Phase::Interview;
-        question_id
+        self.push_question(question)
     }
 
     /// Append a question without changing the phase.
@@ -1046,6 +1114,43 @@ mod tests {
         state.tasks = tasks;
         state.phase = Phase::Review;
         state
+    }
+
+    fn question() -> Question {
+        Question {
+            question_id: "q-1".to_owned(),
+            task_id: None,
+            kind: QuestionKind::SemiKnown,
+            prompt: "选 A 还是 B？".to_owned(),
+            options: vec!["A".to_owned(), "B".to_owned()],
+            recommendation: Some("A".to_owned()),
+            reason: "兼容".to_owned(),
+            status: QuestionStatus::Open,
+            criteria: "必须选一个".to_owned(),
+            created_at: 1,
+            answer: None,
+            answer_source: None,
+            answer_snapshot: None,
+            attempts: 2,
+            last_gap: Some("没有说明兼容性".to_owned()),
+        }
+    }
+
+    #[test]
+    fn question_render_shows_options_criteria_and_attempts() {
+        let text = question().render();
+        assert!(text.contains("question q-1: 选 A 还是 B？"), "{text}");
+        assert!(text.contains("1. A") && text.contains("2. B"), "{text}");
+        assert!(text.contains("criteria: 必须选一个"), "{text}");
+        assert!(text.contains("attempts: 2"), "{text}");
+        assert!(text.contains("last gap: 没有说明兼容性"), "{text}");
+    }
+
+    #[test]
+    fn append_question_keeps_the_caller_phase() {
+        let mut state = review_state(vec![]);
+        state.append_question(question());
+        assert_eq!(state.phase, Phase::Review);
     }
 
     #[test]

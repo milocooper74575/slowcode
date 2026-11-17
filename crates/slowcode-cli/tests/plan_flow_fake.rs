@@ -16,11 +16,15 @@ use futures_util::stream;
 use serde_json::json;
 use slowcode_app::{
     plan::{PlanConfig, run_approve},
-    workflow::{Domain, ExecState, ScaffoldContract, Strategy, Task, TestContract, WorkflowStore},
+    workflow::{
+        Domain, ExecState, Phase, ScaffoldContract, Strategy, Task, TestContract, WorkflowStatus,
+        WorkflowStore,
+    },
 };
 use slowcode_cli::{
     CliOptions, run_answer_with_provider, run_continue_with_provider, run_distill_with_provider,
-    run_execute_with_provider, run_fix_with_provider, run_scaffold_with_provider,
+    run_execute_with_provider, run_fix_with_provider, run_plan_with_provider,
+    run_scaffold_with_provider,
 };
 use slowcode_kernel::{
     model::{
@@ -373,6 +377,7 @@ async fn answer_scaffold_execute_distill_flow() {
             "pub fn parse(value: &str) -> String {\n    // TODO(user)\n    String::new()\n}\n",
         ),
         text_response(SCAFFOLD),
+        text_response(EXECUTION_REPORT),
         text_response(DISTILL),
     ]));
     let options = options(&workspace);
@@ -404,7 +409,7 @@ async fn answer_scaffold_execute_distill_flow() {
         .await
         .expect("continue succeeds");
     assert!(
-        continued.output.contains("next: /test"),
+        continued.output.contains("next: /execute"),
         "{}",
         continued.output
     );
@@ -528,6 +533,128 @@ async fn distill_keeps_the_artifact_undistilled_after_a_failed_repair() {
         "a rejected report must not change the artifact"
     );
     assert!(after.contains("status: paused"), "{after}");
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+const FULL_PLAN: &str = "\
+---
+kind: plan
+created_at_unix: 1000
+model: fake
+workspace: test
+status: paused
+phases: Explore, Navigate
+validation: ok
+---
+
+# Plan: add a rule
+
+## Agent output
+
+## 证据包
+- notes.md 存在，尚无规则小节
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 写入规则 | 已知域 | notes.md 的现有标题结构 | 可执行 | 自主执行 | 审查者 | 编辑 notes.md | 文件包含规则 |
+| 确认措辞 | 半已知域 | 仓库没有既定措辞 | 待决策 | 给出选项 | 决策者 | 回答后写入 | 一条规则 |
+
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 确认措辞 | 规则写在新小节还是追加到末尾？ | 新建小节 / 追加到末尾 | 新建小节 | 可见度高 | 必须指定唯一落点 |
+";
+
+const FULL_ANSWER: &str = "\
+## 回答判定
+| 问题 | 结论 | 缺口 |
+|---|---|---|
+| q-1 | sufficient | |
+
+## 决策记录
+| 任务 | 用户决策 | 新认知属性 | 新执行状态 |
+|---|---|---|---|
+| 确认措辞 | 新建小节 | 已知域 | 可执行 |
+";
+
+const EXECUTION_REPORT: &str = "\
+## Execution report
+| 任务 | 结果 | 证据 |
+|---|---|---|
+| 写入规则 | done | notes.md |
+| 确认措辞 | done | notes.md |
+";
+
+#[tokio::test]
+async fn plan_answer_approve_execute_completes_with_file_change() {
+    let workspace = temp_workspace();
+    seed_cargo_project(&workspace);
+    fs::write(workspace.join("notes.md"), "# Notes\n").expect("baseline notes");
+    let options = options(&workspace);
+
+    let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::with_attempts(vec![
+        text_response(FULL_PLAN),
+        text_response(FULL_ANSWER),
+        write_call_response(
+            "notes.md",
+            "# Notes\n\n## 独立判断\n- 不迎合用户，先给证据。\n",
+        ),
+        text_response(EXECUTION_REPORT),
+    ]));
+
+    let plan = run_plan_with_provider(&options, Arc::clone(&provider), "给 notes.md 加一条规则")
+        .await
+        .expect("plan succeeds");
+    assert!(
+        plan.output.contains("options:") && plan.output.contains("criteria:"),
+        "the plan must print the full question: {}",
+        plan.output
+    );
+
+    let answered = run_answer_with_provider(&options, Arc::clone(&provider), None, "新建小节")
+        .await
+        .expect("answer succeeds");
+    assert!(
+        answered.output.contains("next: /approve"),
+        "answer must print the next step: {}",
+        answered.output
+    );
+
+    run_approve(&PlanConfig::new(workspace.clone()))
+        .await
+        .expect("approval succeeds");
+    let workflow_id = WorkflowStore::new(&workspace)
+        .require_active()
+        .expect("active workflow")
+        .workflow_id;
+
+    let executed = run_execute_with_provider(&options, Arc::clone(&provider), None)
+        .await
+        .expect("execute implements the tasks and runs the contract");
+    assert!(
+        executed.output.contains("### 报告"),
+        "execute must report the implementation: {}",
+        executed.output
+    );
+
+    let state = WorkflowStore::new(&workspace)
+        .load(&workflow_id)
+        .expect("workflow state");
+    assert_eq!(state.phase, Phase::Done, "{}", executed.output);
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert!(
+        state.execution.is_some_and(|execution| execution.reported),
+        "execution must be recorded"
+    );
+
+    let notes = fs::read_to_string(workspace.join("notes.md")).expect("notes readable");
+    assert!(notes.contains("## 独立判断"), "{notes}");
+    assert!(notes.contains("先给证据"), "{notes}");
+
+    let artifact = fs::read_to_string(executed.path).expect("artifact readable");
+    assert!(artifact.contains("## Execution"), "{artifact}");
 
     let _ = fs::remove_dir_all(&workspace);
 }
