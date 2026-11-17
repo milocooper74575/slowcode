@@ -37,11 +37,185 @@ pub struct BundleRequest<'a> {
     pub expected: Option<String>,
     /// How to reproduce it. Rendered under `## 复现步骤`.
     pub reproduction: Option<String>,
+    /// Which turns the issue draft should show evidence for.
+    pub scope: EvidenceScope,
     pub plan: Option<PathBuf>,
     /// Errors the UI showed on screen that the durable journal does not
     /// contain. Plan commands run on ephemeral sessions, so their failures only
     /// exist in the console until the caller passes them here.
     pub console_errors: &'a [String],
+}
+
+/// Which part of the journal the issue draft should emphasize.
+///
+/// The raw `session.jsonl` is always kept whole; this only filters the
+/// human-readable evidence in `issue.md`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EvidenceScope {
+    /// The last turn that produced an error, or the last turn.
+    #[default]
+    Auto,
+    /// One explicit turn, with two turns of context on each side.
+    Turn(u64),
+    /// Every turn.
+    Full,
+}
+
+/// Structured feedback text written by the user.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FeedbackText {
+    pub actual: String,
+    pub expected: Option<String>,
+    pub reproduction: Option<String>,
+}
+
+/// Parse `实际 / 期望 / 复现` sections from free text.
+///
+/// Labels are optional. Without labels the whole text is the actual behavior.
+/// Labels accept Chinese and English names and either colon width.
+#[must_use]
+pub fn parse_feedback_text(text: &str) -> FeedbackText {
+    let markers = feedback_markers(text);
+    if markers.is_empty() {
+        return FeedbackText {
+            actual: text.trim().to_owned(),
+            expected: None,
+            reproduction: None,
+        };
+    }
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    let mut reproduction = Vec::new();
+    let mut section = Section::Actual;
+    let mut last = 0;
+    for marker in markers {
+        push_section(
+            &mut actual,
+            &mut expected,
+            &mut reproduction,
+            section,
+            &text[last..marker.start],
+        );
+        section = marker.section;
+        last = marker.content_start;
+    }
+    push_section(
+        &mut actual,
+        &mut expected,
+        &mut reproduction,
+        section,
+        &text[last..],
+    );
+    FeedbackText {
+        actual: trim_lines(actual).unwrap_or_default(),
+        expected: trim_lines(expected),
+        reproduction: trim_lines(reproduction),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Section {
+    Actual,
+    Expected,
+    Reproduction,
+}
+
+struct Marker {
+    start: usize,
+    section: Section,
+    content_start: usize,
+}
+
+const LABELS: &[(&str, Section)] = &[
+    ("实际发生", Section::Actual),
+    ("发生了什么", Section::Actual),
+    ("what happened", Section::Actual),
+    ("actual", Section::Actual),
+    ("实际", Section::Actual),
+    ("expectation", Section::Expected),
+    ("expected", Section::Expected),
+    ("应该", Section::Expected),
+    ("期望", Section::Expected),
+    ("复现步骤", Section::Reproduction),
+    ("reproduction", Section::Reproduction),
+    ("repro", Section::Reproduction),
+    ("steps", Section::Reproduction),
+    ("步骤", Section::Reproduction),
+    ("复现", Section::Reproduction),
+];
+
+fn feedback_markers(text: &str) -> Vec<Marker> {
+    let mut markers = Vec::new();
+    for (start, _) in text.char_indices() {
+        let boundary = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        if !boundary {
+            continue;
+        }
+        if let Some(marker) = marker_at(text, start) {
+            markers.push(marker);
+        }
+    }
+    markers
+}
+
+fn marker_at(text: &str, start: usize) -> Option<Marker> {
+    let rest = &text[start..];
+    for (label, section) in LABELS {
+        let Some(candidate) = rest.get(..label.len()) else {
+            continue;
+        };
+        if !candidate.eq_ignore_ascii_case(label) {
+            continue;
+        }
+        let after = start + label.len();
+        let tail = &text[after..];
+        let trimmed = tail.trim_start_matches([' ', '\t']);
+        let colon = trimmed.chars().next()?;
+        if colon != ':' && colon != '：' {
+            continue;
+        }
+        let content_start = after + (tail.len() - trimmed.len()) + colon.len_utf8();
+        return Some(Marker {
+            start,
+            section: *section,
+            content_start,
+        });
+    }
+    None
+}
+
+fn push_section(
+    actual: &mut Vec<String>,
+    expected: &mut Vec<String>,
+    reproduction: &mut Vec<String>,
+    section: Section,
+    content: &str,
+) {
+    let content = content.trim();
+    if content.is_empty() {
+        return;
+    }
+    match section {
+        Section::Actual => actual.push(content.to_owned()),
+        Section::Expected => expected.push(content.to_owned()),
+        Section::Reproduction => reproduction.push(content.to_owned()),
+    }
+}
+
+fn trim_lines(lines: Vec<String>) -> Option<String> {
+    let mut start = 0;
+    while start < lines.len() && lines[start].trim().is_empty() {
+        start += 1;
+    }
+    let mut end = lines.len();
+    while end > start && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    (start < end).then(|| lines[start..end].join("\n"))
 }
 
 /// What the bundle contains after a successful write.
@@ -62,6 +236,11 @@ pub struct BundleOutcome {
 pub struct BundlePreview {
     pub title: String,
     pub note: Option<String>,
+    pub expected: Option<String>,
+    pub reproduction: Option<String>,
+    pub scope: EvidenceScope,
+    pub focus_turn: Option<u64>,
+    pub redactions: usize,
     pub plan: Option<PathBuf>,
     pub out_dir: PathBuf,
     pub complete: bool,
@@ -115,6 +294,7 @@ struct Analysis {
     errors: Vec<ErrorFact>,
     tool_calls: usize,
     turn_reasons: BTreeMap<String, usize>,
+    last_turn: Option<u64>,
     usage: BTreeMap<String, u64>,
     event_count: usize,
     first_seq: Option<u64>,
@@ -134,6 +314,9 @@ pub fn write_bundle(request: BundleRequest<'_>) -> Result<BundleOutcome, Feedbac
         note,
         expected,
         reproduction,
+        scope,
+        focus_turn,
+        redactions,
         plan,
         sha256,
     } = prepared;
@@ -164,6 +347,9 @@ pub fn write_bundle(request: BundleRequest<'_>) -> Result<BundleOutcome, Feedbac
             note: note.as_deref(),
             expected: expected.as_deref(),
             reproduction: reproduction.as_deref(),
+            scope,
+            focus_turn,
+            redactions,
             workspace_name,
             version: request.version,
             model: request.model.or(analysis.model.as_deref()),
@@ -216,6 +402,11 @@ pub fn preview(request: &BundleRequest<'_>) -> Result<BundlePreview, FeedbackErr
     Ok(BundlePreview {
         title: prepared.title,
         note: prepared.note,
+        expected: prepared.expected,
+        reproduction: prepared.reproduction,
+        scope: prepared.scope,
+        focus_turn: prepared.focus_turn,
+        redactions: prepared.redactions,
         plan: prepared.plan,
         out_dir: request.out_dir.clone(),
         complete: prepared.analysis.complete,
@@ -234,6 +425,9 @@ struct Prepared {
     note: Option<String>,
     expected: Option<String>,
     reproduction: Option<String>,
+    scope: EvidenceScope,
+    focus_turn: Option<u64>,
+    redactions: usize,
     plan: Option<PathBuf>,
     sha256: String,
 }
@@ -245,6 +439,7 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         .or(analysis.workspace.as_deref())
         .map(str::to_owned);
     let redact_paths = redact_paths(request, &analysis);
+    let redactions = redact_paths.len();
     for message in analysis
         .user_messages
         .iter_mut()
@@ -297,6 +492,7 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(|text| redact(text, &redact_paths));
+    let focus_turn = resolve_focus(&analysis, request.scope);
     let plan = match &request.plan {
         Some(plan) if !plan.is_file() => return Err(FeedbackError::PlanMissing(plan.clone())),
         plan => plan.clone(),
@@ -309,9 +505,25 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         note,
         expected,
         reproduction,
+        scope: request.scope,
+        focus_turn,
+        redactions,
         plan,
         sha256,
     })
+}
+
+fn resolve_focus(analysis: &Analysis, scope: EvidenceScope) -> Option<u64> {
+    match scope {
+        EvidenceScope::Full => None,
+        EvidenceScope::Turn(turn) => Some(turn),
+        EvidenceScope::Auto => analysis
+            .errors
+            .iter()
+            .rev()
+            .find_map(|error| error.turn)
+            .or(analysis.last_turn),
+    }
 }
 
 /// A console line that repeats a journaled error adds no information. The UI
@@ -423,6 +635,7 @@ impl Analysis {
             errors: Vec::new(),
             tool_calls: 0,
             turn_reasons: BTreeMap::new(),
+            last_turn: None,
             usage: BTreeMap::new(),
             event_count,
             first_seq: None,
@@ -448,6 +661,9 @@ fn scan_event(analysis: &mut Analysis, scan: &mut ScanState, value: &Value) {
         .unwrap_or_default();
     scan_seq(analysis, scan, value, kind);
     let data = value.get("data").unwrap_or(&Value::Null);
+    if let Some(turn) = data.get("turn").and_then(Value::as_u64) {
+        analysis.last_turn = Some(analysis.last_turn.map_or(turn, |last| last.max(turn)));
+    }
     match kind {
         "request/header" => apply_request_header(analysis, scan, data),
         "session/title" => apply_title(analysis, data),
@@ -670,6 +886,9 @@ struct RenderContext<'a> {
     note: Option<&'a str>,
     expected: Option<&'a str>,
     reproduction: Option<&'a str>,
+    scope: EvidenceScope,
+    focus_turn: Option<u64>,
+    redactions: usize,
     workspace_name: &'a str,
     version: &'a str,
     model: Option<&'a str>,
@@ -719,8 +938,19 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
             issue.push_str(&format!("  - {warning}\n"));
         }
     }
+    let evidence = match (context.scope, context.focus_turn) {
+        (EvidenceScope::Full, _) | (EvidenceScope::Auto, None) => "all turns".to_owned(),
+        (EvidenceScope::Turn(turn), _) | (EvidenceScope::Auto, Some(turn)) => {
+            format!("turn {turn} (±2)")
+        }
+    };
+    let visible_errors = focused_errors(
+        &analysis.errors,
+        context.focus_turn,
+        context.scope == EvidenceScope::Full,
+    );
     issue.push_str(&format!(
-        "\n## Trace\n\n- traceId: `{}`\n- slowcode: `{}`\n- model: `{}`\n- provider: `{}`\n- OS: `{}`\n- workspace: `<workspace>`\n- workspace-name: `{}`\n- started: `{}`\n- journal: `session.jsonl`\n- plan artifact: `{}`\n",
+        "\n## Trace\n\n- traceId: `{}`\n- slowcode: `{}`\n- model: `{}`\n- provider: `{}`\n- OS: `{}`\n- workspace: `<workspace>`\n- workspace-name: `{}`\n- started: `{}`\n- journal: `session.jsonl`\n- plan artifact: `{}`\n- evidence: `{}`\n- errors: {} of {}\n- redactions: {} workspace path(s)\n",
         analysis.header_id,
         context.version,
         context.model.unwrap_or("unknown"),
@@ -732,9 +962,13 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
             .map(format_unix_millis)
             .unwrap_or_else(|| "unknown".to_owned()),
         context.plan.unwrap_or("none"),
+        evidence,
+        visible_errors.len(),
+        analysis.errors.len(),
+        context.redactions,
     ));
     issue.push_str("\n## 关键错误\n\n");
-    issue.push_str(&render_errors(&analysis.errors));
+    issue.push_str(&render_errors(&visible_errors));
     issue.push_str(&format!(
         "\n## 期望\n\n{}\n\n## 实际\n\n{}\n",
         context.expected.unwrap_or("请补充你期望的行为。"),
@@ -798,6 +1032,19 @@ fn render_issue(analysis: &Analysis, context: RenderContext<'_>) -> String {
     }
     issue.push_str("\n## 反馈类型\n\n- [ ] 功能不正确\n- [ ] 输出质量\n- [ ] 工具或权限\n- [ ] 性能或成本\n- [ ] 文档或可用性\n");
     issue
+}
+
+fn focused_errors(errors: &[ErrorFact], focus: Option<u64>, full: bool) -> Vec<ErrorFact> {
+    let Some(focus) = focus.filter(|_| !full) else {
+        return errors.to_vec();
+    };
+    let low = focus.saturating_sub(2);
+    let high = focus.saturating_add(2);
+    errors
+        .iter()
+        .filter(|error| error.turn.is_none_or(|turn| (low..=high).contains(&turn)))
+        .cloned()
+        .collect()
 }
 
 /// Render the most recent errors, newest first. This is the part a reader
@@ -1233,6 +1480,154 @@ mod tests {
     }
 
     #[test]
+    fn parses_labeled_feedback_text() {
+        let parsed = parse_feedback_text(
+            "实际：/approve 卡住\n\n期望：重新问 selector\n\n复现：\n1. 打开计划\n2. 运行 /approve",
+        );
+
+        assert_eq!(parsed.actual, "/approve 卡住");
+        assert_eq!(parsed.expected.as_deref(), Some("重新问 selector"));
+        assert_eq!(
+            parsed.reproduction.as_deref(),
+            Some("1. 打开计划\n2. 运行 /approve")
+        );
+    }
+
+    #[test]
+    fn parses_english_labels_and_text_before_the_first_label() {
+        let parsed =
+            parse_feedback_text("prefix\nActual: it failed\nExpected: a retry\nSteps: 1. run");
+
+        assert_eq!(parsed.actual, "prefix\nit failed");
+        assert_eq!(parsed.expected.as_deref(), Some("a retry"));
+        assert_eq!(parsed.reproduction.as_deref(), Some("1. run"));
+    }
+
+    #[test]
+    fn plain_text_stays_actual() {
+        let parsed = parse_feedback_text("the plan never paused");
+        assert_eq!(parsed.actual, "the plan never paused");
+        assert!(parsed.expected.is_none());
+        assert!(parsed.reproduction.is_none());
+    }
+
+    #[test]
+    fn inline_labels_split_sections() {
+        let parsed = parse_feedback_text("实际：卡住 期望：继续 复现：1. 运行 2. 等待");
+
+        assert_eq!(parsed.actual, "卡住");
+        assert_eq!(parsed.expected.as_deref(), Some("继续"));
+        assert_eq!(parsed.reproduction.as_deref(), Some("1. 运行 2. 等待"));
+    }
+
+    #[test]
+    fn labels_allow_spaces_before_the_colon() {
+        let parsed = parse_feedback_text("卡住 实际 ： 卡住");
+
+        assert_eq!(parsed.actual, "卡住\n卡住");
+    }
+
+    #[test]
+    fn a_label_inside_a_longer_word_is_not_a_section() {
+        let parsed = parse_feedback_text("myactual: still a sentence");
+
+        assert_eq!(parsed.actual, "myactual: still a sentence");
+        assert!(parsed.expected.is_none());
+    }
+
+    #[test]
+    fn full_width_colon_and_empty_sections_are_tolerated() {
+        let parsed = parse_feedback_text("实际：卡住\n期望：\n复现：1. 运行");
+        assert_eq!(parsed.actual, "卡住");
+        assert!(parsed.expected.is_none());
+        assert_eq!(parsed.reproduction.as_deref(), Some("1. 运行"));
+    }
+
+    #[test]
+    fn focus_includes_two_turns_of_context() {
+        let errors = vec![
+            fact(1, "old"),
+            fact(3, "edge-in"),
+            fact(5, "focus"),
+            fact(7, "edge-out"),
+            fact(9, "too-new"),
+            ErrorFact {
+                source: "console",
+                code: "UI_ERROR".to_owned(),
+                message: "console".to_owned(),
+                turn: None,
+                step: None,
+            },
+        ];
+
+        let focused = focused_errors(&errors, Some(5), false);
+        let messages: Vec<&str> = focused.iter().map(|error| error.message.as_str()).collect();
+        assert_eq!(messages, ["edge-in", "focus", "edge-out", "console"]);
+        assert_eq!(focused_errors(&errors, Some(5), true).len(), 6);
+    }
+
+    #[test]
+    fn auto_focus_prefers_the_last_error_turn() {
+        let mut analysis = Analysis::start(&Value::Null, 0, Vec::new());
+        analysis.errors.push(fact(3, "boom"));
+        analysis.last_turn = Some(7);
+
+        assert_eq!(resolve_focus(&analysis, EvidenceScope::Auto), Some(3));
+        assert_eq!(resolve_focus(&analysis, EvidenceScope::Full), None);
+        assert_eq!(resolve_focus(&analysis, EvidenceScope::Turn(9)), Some(9));
+    }
+
+    #[test]
+    fn preview_exposes_expected_steps_scope_and_redactions() {
+        let base = temp_dir("preview-fields");
+        let out = base.join("out");
+        let bytes = journal().into_bytes();
+        let mut request = request(&out, &bytes);
+        request.workspace = Some("/tmp/example-project");
+        request.expected = Some("pause".to_owned());
+        request.reproduction = Some("1. run".to_owned());
+        request.scope = EvidenceScope::Turn(1);
+
+        let preview = preview(&request).unwrap();
+
+        assert_eq!(preview.expected.as_deref(), Some("pause"));
+        assert_eq!(preview.reproduction.as_deref(), Some("1. run"));
+        assert_eq!(preview.scope, EvidenceScope::Turn(1));
+        assert_eq!(preview.focus_turn, Some(1));
+        assert_eq!(preview.redactions, 1);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn issue_keeps_only_errors_near_the_focused_turn() {
+        let base = temp_dir("focused-errors");
+        let out = base.join("out");
+        let journal = two_error_journal();
+        let mut request = request(&out, journal.as_bytes());
+        request.scope = EvidenceScope::Turn(1);
+
+        let outcome = write_bundle(request).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        assert!(issue.contains("old failure"), "{issue}");
+        assert!(!issue.contains("new failure"), "{issue}");
+        assert!(issue.contains("evidence: `turn 1 (±2)`"), "{issue}");
+        assert!(issue.contains("errors: 1 of 2"), "{issue}");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn fact(turn: u64, message: &str) -> ErrorFact {
+        ErrorFact {
+            source: "turn",
+            code: "TURN_ERROR".to_owned(),
+            message: message.to_owned(),
+            turn: Some(turn),
+            step: None,
+        }
+    }
+
+    #[test]
     fn multiple_steps_in_one_turn_do_not_warn() {
         let mut analysis = Analysis::start(&Value::Null, 0, Vec::new());
         analysis.model = Some("model".to_owned());
@@ -1301,6 +1696,65 @@ mod tests {
         )
     }
 
+    fn two_error_journal() -> String {
+        [
+            serde_json::json!({
+                "type": "session",
+                "id": SESSION_ID,
+                "createdAt": 1792466172940u64,
+                "cwd": "/tmp/example-project",
+            }),
+            serde_json::json!({
+                "type": "request/header",
+                "seq": 0,
+                "time": 1,
+                "data": {"header": {"config": {
+                    "model": "deepseek-flash",
+                    "provider": "deepseek-official",
+                }}},
+            }),
+            serde_json::json!({
+                "type": "turn/start",
+                "seq": 1,
+                "time": 2,
+                "data": {"turn": 1},
+            }),
+            serde_json::json!({
+                "type": "turn/end",
+                "seq": 2,
+                "time": 3,
+                "data": {
+                    "turn": 1,
+                    "reason": {
+                        "kind": "error",
+                        "error": {"code": "OLD", "message": "old failure"},
+                    },
+                },
+            }),
+            serde_json::json!({
+                "type": "turn/start",
+                "seq": 3,
+                "time": 4,
+                "data": {"turn": 5},
+            }),
+            serde_json::json!({
+                "type": "turn/end",
+                "seq": 4,
+                "time": 5,
+                "data": {
+                    "turn": 5,
+                    "reason": {
+                        "kind": "error",
+                        "error": {"code": "NEW", "message": "new failure"},
+                    },
+                },
+            }),
+        ]
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect()
+    }
+
     fn request<'a>(out_dir: &Path, journal: &'a [u8]) -> BundleRequest<'a> {
         BundleRequest {
             session_id: SESSION_ID,
@@ -1315,6 +1769,7 @@ mod tests {
             note: Some("expected success".to_owned()),
             expected: None,
             reproduction: None,
+            scope: EvidenceScope::Auto,
             plan: None,
             console_errors: &[],
         }
