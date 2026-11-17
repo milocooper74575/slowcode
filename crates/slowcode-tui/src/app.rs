@@ -4016,27 +4016,39 @@ fn is_approval_text(text: &str) -> bool {
                 )
         })
         .collect::<String>();
-    if normalized.is_empty() {
-        return false;
-    }
-    matches!(
-        normalized.as_str(),
-        "y" | "yes"
-            | "ok"
-            | "okay"
-            | "approve"
-            | "approved"
-            | "同意"
-            | "批准"
-            | "通过"
-            | "可以"
-            | "继续"
-            | "进入下一阶段"
-            | "开始执行"
-            | "执行"
-    ) || normalized.starts_with("同意")
-        || normalized.starts_with("批准")
-        || normalized.starts_with("通过")
+    // Exact matches only. Prefix matching treated "同意但是先别执行" and
+    // "同意个屁" as approvals, which could start writes the user did not
+    // ask for. Ambiguous text should stay a side conversation; /approve is
+    // always available for an explicit decision.
+    const APPROVALS: &[&str] = &[
+        "y",
+        "yes",
+        "ok",
+        "okay",
+        "approve",
+        "approved",
+        "同意",
+        "批准",
+        "通过",
+        "可以",
+        "继续",
+        "执行",
+        "开始执行",
+        "进入下一阶段",
+        "同意执行",
+        "同意开始",
+        "同意开始执行",
+        "同意继续",
+        "同意进入下一阶段",
+        "批准执行",
+        "批准开始",
+        "通过执行",
+        "通过开始执行",
+        "可以执行",
+        "请执行",
+        "请开始",
+    ];
+    APPROVALS.contains(&normalized.as_str())
 }
 
 fn is_plan_command(command: &Command) -> bool {
@@ -6180,9 +6192,17 @@ mod tests {
     fn plain_language_approval_is_recognized_narrowly() {
         assert!(is_approval_text("同意"));
         assert!(is_approval_text("同意，进入下一阶段"));
+        assert!(is_approval_text("同意，开始执行"));
         assert!(is_approval_text("Approve."));
         assert!(is_approval_text("y"));
         assert!(!is_approval_text("不同意"));
+        assert!(!is_approval_text("不可以"));
+        assert!(!is_approval_text("同意但是先别执行"));
+        assert!(!is_approval_text("同意，但我还想改一下任务表"));
+        assert!(!is_approval_text("同意个屁"));
+        assert!(!is_approval_text("通过个鬼，我还要改表"));
+        assert!(!is_approval_text("ok but wait"));
+        assert!(!is_approval_text("yesterday"));
         assert!(!is_approval_text("如何才能进入 review 阶段？"));
         assert!(!is_approval_text(""));
     }
