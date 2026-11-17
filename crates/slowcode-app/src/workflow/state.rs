@@ -655,6 +655,20 @@ impl WorkflowState {
             .collect()
     }
 
+    /// Whether the workflow still needs a teach-back distill.
+    ///
+    /// Distill exists so the user keeps ownership of logic only they can
+    /// supply. A plan made entirely of known, AI-implemented tasks has no such
+    /// logic, so it completes after the tests pass.
+    #[must_use]
+    pub fn requires_distill(&self) -> bool {
+        self.tasks.iter().any(|task| {
+            task.domain == Domain::Unknown
+                || task.exec_state == ExecState::PendingUser
+                || task.strategy == Strategy::UserImplementsCore
+        })
+    }
+
     #[must_use]
     pub fn review_is_current(&self) -> bool {
         self.review.approved_table_hash.as_deref() == Some(self.table_hash().as_str())

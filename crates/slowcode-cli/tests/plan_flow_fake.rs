@@ -16,7 +16,7 @@ use futures_util::stream;
 use serde_json::json;
 use slowcode_app::{
     plan::{PlanConfig, run_approve},
-    workflow::{Domain, ExecState, Strategy, Task, TestContract, WorkflowStore},
+    workflow::{Domain, ExecState, ScaffoldContract, Strategy, Task, TestContract, WorkflowStore},
 };
 use slowcode_cli::{
     CliOptions, run_answer_with_provider, run_continue_with_provider, run_distill_with_provider,
@@ -280,9 +280,29 @@ fn seed_test_fix_workflow(workspace: &Path) {
 }
 
 fn seed_green_workflow(workspace: &Path) {
-    seed_test_fix_workflow(workspace);
     let store = WorkflowStore::new(workspace);
-    let state = store.require_active().expect("active workflow");
+    let state = store
+        .create_with_tasks(
+            "distill",
+            None,
+            vec![workflow_task(
+                "task-1",
+                "读取输入",
+                Domain::Known,
+                ExecState::Executable,
+                Strategy::UserImplementsCore,
+            )],
+        )
+        .expect("workflow is seeded");
+    let state = store
+        .approve(&state.workflow_id, Some(TestContract::default()), None)
+        .expect("approval");
+    let state = store
+        .finish_scaffold(&state.workflow_id, ScaffoldContract::default(), None)
+        .expect("scaffold enters await user");
+    let state = store
+        .complete_user_implementation(&state.workflow_id, true, None)
+        .expect("continue enters test fix");
     store
         .record_test(&state.workflow_id, true, None)
         .expect("test is recorded");

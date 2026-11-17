@@ -796,7 +796,12 @@ impl WorkflowStore {
         if record.status == TestStatus::Passed {
             state.test.consecutive_same_failure = 0;
             state.test.last_failure_signature = None;
-            state.phase = Phase::Distill;
+            if state.requires_distill() {
+                state.phase = Phase::Distill;
+            } else {
+                state.phase = Phase::Done;
+                state.status = WorkflowStatus::Completed;
+            }
             events.push((
                 "test.run",
                 json!({
@@ -811,6 +816,12 @@ impl WorkflowStore {
                 events.push(("test.flaky", json!({ "flaky_reruns": record.flaky_reruns })));
             }
             events.push(("test.passed", json!({})));
+            if state.status == WorkflowStatus::Completed {
+                events.push((
+                    "workflow.completed",
+                    json!({ "reason": "known-only plan needs no distill" }),
+                ));
+            }
             state.test.last_run = Some(record);
             self.commit(&mut state, events)?;
             return Ok(state);
@@ -2463,7 +2474,16 @@ mod tests {
     fn distill_ready(workspace: &Path) -> (WorkflowStore, WorkflowState) {
         let store = WorkflowStore::new(workspace);
         let state = store
-            .create_with_tasks("distill", None, vec![known_task()])
+            .create_with_tasks(
+                "distill",
+                None,
+                vec![task(
+                    "task-1",
+                    Domain::Known,
+                    ExecState::Executable,
+                    Strategy::UserImplementsCore,
+                )],
+            )
             .expect("workflow");
         store
             .approve(
@@ -2472,6 +2492,16 @@ mod tests {
                 None,
             )
             .expect("approval");
+        store
+            .finish_scaffold(
+                &state.workflow_id,
+                crate::workflow::state::ScaffoldContract::default(),
+                None,
+            )
+            .expect("scaffold enters await user");
+        store
+            .complete_user_implementation(&state.workflow_id, true, None)
+            .expect("continue enters test fix");
         let state = store
             .record_test(&state.workflow_id, true, None)
             .expect("green test");

@@ -38,7 +38,8 @@ pub const DRIVER: &str = "driver";
 
 pub const NAVIGATOR_PROMPT: &str = "\
 You are the navigator. Make directional decisions: choose an approach, adjust constraints, and mark cognitive gaps for the driver. Do not implement the user's core logic yourself.
-This role is read-only: only inspection tools are available. If a task needs a file change or a shell command, describe the step for the driver instead of attempting it. A missing write or shell tool is the expected role boundary, not an error.";
+This role is read-only: only inspection tools are available. If a task needs a file change or a shell command, describe the step for the driver instead of attempting it. A missing write or shell tool is the expected role boundary, not an error.
+During an active Plan workflow, workflow state changes only through the plan commands. Never present prose as a recorded decision, an approval, or a completed phase transition. If the phase is unclear, ask the user to run /status instead of guessing.";
 pub const DRIVER_PROMPT: &str = "\
 You are the driver. Execute the chosen direction with tools, keep changes small, and stop at a cognitive gap instead of guessing.
 This role may edit files and run commands when the current request lists those tools. Use them to carry out the chosen direction rather than re-deciding it.";

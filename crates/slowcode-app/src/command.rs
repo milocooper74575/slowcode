@@ -35,6 +35,7 @@ pub enum Command {
     Workflow(Option<String>),
     Reclassify(String),
     Hint(String),
+    Ask(String),
     Unknown(String),
 }
 
@@ -186,6 +187,11 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         name: "/hint",
         args: "<question>",
         description: "ask for a one-run read-only hint without changing the phase",
+    },
+    CommandSpec {
+        name: "/ask",
+        args: "<question>",
+        description: "ask a side question without answering the open plan question",
     },
     CommandSpec {
         name: "/quit",
@@ -403,6 +409,7 @@ const COMMAND_TABLE: &[(&str, CommandParser)] = &[
     ("/workflow", parse_workflow),
     ("/reclassify", parse_reclassify),
     ("/hint", parse_hint),
+    ("/ask", parse_ask),
 ];
 
 fn lookup(name: &str) -> Option<CommandParser> {
@@ -535,6 +542,10 @@ fn parse_reclassify(rest: &str) -> Command {
 
 fn parse_hint(rest: &str) -> Command {
     Command::Hint(rest.to_owned())
+}
+
+fn parse_ask(rest: &str) -> Command {
+    Command::Ask(rest.to_owned())
 }
 
 fn parse_session(rest: &str) -> SessionCommand {
@@ -785,6 +796,11 @@ mod tests {
                 Command::Hint("where should I start?".to_owned()),
             ),
             ("/hint", Command::Hint(String::new())),
+            (
+                "/ask which phase is this?",
+                Command::Ask("which phase is this?".to_owned()),
+            ),
+            ("/ask", Command::Ask(String::new())),
         ] {
             assert_eq!(parse_command(input), Some(expected), "input {input}");
         }

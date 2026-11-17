@@ -165,7 +165,13 @@ Required output structure:
 2. `## 认知任务分配表` followed by a Markdown table with these exact columns: 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收
 3. `## 半已知域问题` with the question table when any non-unknown task is 待决策. Omit it when there are no such tasks.
 
-Stop after the table and pause. Do not start Execute.";
+Stop after the table and pause. Do not start Execute.
+
+Workflow state changes only through the plan commands. A prose reply is a
+side conversation: never claim that a decision was recorded, that the
+classification was approved, or that a phase advanced. `/approve` is valid
+only after the workflow reaches Review. If you are unsure which phase is
+active, ask the user to run `/status` instead of guessing.";
 
 /// Instruction the workflow adds after the human task in a `/plan` turn.
 pub const PLAN_TURN_INSTRUCTION: &str =

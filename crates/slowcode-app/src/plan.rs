@@ -762,8 +762,10 @@ async fn run_plan_with_session(
                     CapabilityProfile::Navigator,
                 )?;
                 let output = format!(
-                    "{output}\n\n[workflow: {} phase: {}]",
-                    state.workflow_id, state.phase
+                    "{output}\n\n[workflow: {} phase: {}]\n{}",
+                    state.workflow_id,
+                    state.phase,
+                    answer_next_step(&state)
                 );
                 Ok(PlanOutcome {
                     path,
@@ -2288,14 +2290,7 @@ pub async fn run_status(
 pub async fn run_next(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
     let store = WorkflowStore::new(&config.workspace);
     let state = store.require_active()?;
-    let output = if let Some(question) = state.open_questions().first() {
-        format!(
-            "next question: {}\n{}",
-            question.question_id, question.prompt
-        )
-    } else {
-        format!("next: {}", next_action(&state))
-    };
+    let output = answer_next_step(&state);
     Ok(PlanOutcome {
         path: store.root().join(&state.workflow_id).join("state.json"),
         output,
@@ -2362,11 +2357,13 @@ fn render_workflow_status(state: &WorkflowState) -> String {
     let pending = state.pending_decisions().len();
     let approval = if state.review_is_current() {
         "approved".to_owned()
-    } else {
+    } else if state.phase == Phase::Review {
         "approval required (run /approve)".to_owned()
+    } else {
+        "not approved".to_owned()
     };
     format!(
-        "workflow: {}\ntask: {}\nphase: {}\nstatus: {}\nversion: {}\nquestions: {open} open / {} total\ntasks: {} ({pending} pending decision)\napproval: {approval}\nnext: {}",
+        "workflow: {}\ntask: {}\nphase: {}\nstatus: {}\nversion: {}\nquestions: {open} open / {} total\ntasks: {} ({pending} pending decision)\napproval: {approval}\n{}",
         state.workflow_id,
         state.task,
         state.phase,
@@ -2374,7 +2371,7 @@ fn render_workflow_status(state: &WorkflowState) -> String {
         state.version,
         state.questions.len(),
         state.tasks.len(),
-        next_action(state),
+        answer_next_step(state),
     ) + &format!(
         "\nselector: {}\ntest: {} rounds, {} attempts, last {}{}",
         state.test_selector.as_deref().unwrap_or("(unresolved)"),
@@ -2496,8 +2493,8 @@ fn next_action(state: &WorkflowState) -> String {
 fn answer_next_step(state: &WorkflowState) -> String {
     if let Some(question) = state.open_questions().first() {
         format!(
-            "next question: {} {}",
-            question.question_id, question.prompt
+            "next: /answer #{} <answer>\nquestion {}: {}",
+            question.question_id, question.question_id, question.prompt
         )
     } else {
         format!("next: {}", next_action(state))
@@ -4325,7 +4322,7 @@ validation: ok
     }
 
     #[tokio::test]
-    async fn known_task_workflow_runs_plan_to_distill() {
+    async fn known_task_workflow_runs_plan_to_completion() {
         let workspace = temp_workspace();
         seed_cargo_baseline(&workspace);
         let config = PlanConfig::new(workspace.clone());
@@ -4347,30 +4344,6 @@ validation: ok
 | 任务 | 结果 | 证据 |
 |---|---|---|
 | 读取输入 | ok | read 工具输出 |
-",
-            ),
-            text_response(
-                "\
-## 理解漏洞报告
-### 清晰
-读取与计数分离。
-### 模糊
-无。
-### 未覆盖边界
-空文件。
-### 追问
-空文件怎么计数？
-",
-            ),
-            text_response(
-                "\
-## 证据包
-- read src/main.rs
-
-## 认知任务分配表
-| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
-|---|---|---|---|---|---|---|---|
-| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
 ",
             ),
         ]));
@@ -4412,42 +4385,14 @@ validation: ok
         .expect("execute succeeds");
         let store = WorkflowStore::new(&workspace);
         let state = store.load(&workflow_id).expect("state is readable");
-        assert_eq!(state.phase, Phase::Distill);
+        assert_eq!(state.phase, Phase::Done);
+        assert_eq!(state.status, crate::workflow::WorkflowStatus::Completed);
         assert_eq!(state.test.attempts, 1);
         assert_eq!(
             state.test.last_status,
             Some(crate::workflow::TestStatus::Passed)
         );
-
-        let distill = run_distill(
-            &config,
-            Arc::clone(&provider),
-            "I implemented the line counter",
-            CancellationToken::new(),
-        )
-        .await
-        .expect("distill succeeds");
-        assert!(
-            distill.output.contains("## 理解漏洞报告"),
-            "{}",
-            distill.output
-        );
-
-        let ended = run_workflow(&config, Some("end".to_owned()))
-            .await
-            .expect("workflow ends");
-        assert!(ended.output.contains("status: ended"), "{}", ended.output);
         assert_eq!(store.active_id().expect("index is readable"), None);
-
-        let second = run_plan(
-            &config,
-            Arc::clone(&provider),
-            "count lines again",
-            CancellationToken::new(),
-        )
-        .await
-        .expect("a new workflow may start after /workflow end");
-        assert_ne!(second.workflow_id.as_deref(), Some(workflow_id.as_str()));
         let _ = fs::remove_dir_all(&workspace);
     }
 
@@ -4457,10 +4402,7 @@ validation: ok
         write_plan(&workspace, plan_text());
         let config = PlanConfig::new(workspace.clone());
         let store = WorkflowStore::new(&workspace);
-        let tasks = workflow_tasks(&parse_task_table(plan_text()), &[])
-            .into_iter()
-            .filter(|task| task.domain == Domain::Known)
-            .collect();
+        let tasks = workflow_tasks(&parse_task_table(plan_text()), &[]);
         let state = store
             .create_with_tasks("test", None, tasks)
             .expect("workflow");
@@ -4471,6 +4413,16 @@ validation: ok
                 None,
             )
             .expect("approval");
+        let state = store
+            .finish_scaffold(
+                &state.workflow_id,
+                crate::workflow::ScaffoldContract::default(),
+                None,
+            )
+            .expect("scaffold enters await user");
+        let state = store
+            .complete_user_implementation(&state.workflow_id, true, None)
+            .expect("continue enters test fix");
         store
             .record_test(&state.workflow_id, true, None)
             .expect("green test");
@@ -4761,6 +4713,66 @@ validation: ok
     }
 
     #[tokio::test]
+    async fn a_plan_that_asks_questions_names_the_answer_command() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(FakeProvider::with_attempts(vec![text_response(
+                question_plan_text(),
+            )]));
+
+        let plan = run_plan(
+            &config,
+            provider,
+            "cache and parser",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("plan succeeds");
+
+        assert!(plan.output.contains("phase: interview"), "{}", plan.output);
+        assert!(
+            plan.output.contains("next: /answer #q-1 <answer>"),
+            "{}",
+            plan.output
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn status_during_interview_does_not_suggest_approve() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(FakeProvider::with_attempts(vec![text_response(
+                question_plan_text(),
+            )]));
+
+        run_plan(
+            &config,
+            provider,
+            "cache and parser",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("plan succeeds");
+        let status = run_status(&config, None).await.expect("status succeeds");
+
+        assert!(
+            status.output.contains("phase: interview"),
+            "{}",
+            status.output
+        );
+        assert!(!status.output.contains("run /approve"), "{}", status.output);
+        assert!(
+            status.output.contains("next: /answer #q-1 <answer>"),
+            "{}",
+            status.output
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
     async fn file_answers_record_a_redacted_snapshot() {
         let workspace = temp_workspace();
         fs::write(workspace.join("notes.md"), "选 A\n").expect("notes");
@@ -5031,7 +5043,7 @@ validation: ok
 ";
 
     #[tokio::test]
-    async fn test_fix_repairs_a_known_regression_then_passes() {
+    async fn test_fix_repairs_a_known_regression_then_completes() {
         let workspace = temp_workspace();
         seed_red_cargo_project(&workspace);
         let workflow_id = seed_test_fix_workflow(&workspace);
@@ -5060,9 +5072,15 @@ validation: ok
         let state = WorkflowStore::new(&workspace)
             .load(&workflow_id)
             .expect("state");
-        assert_eq!(state.phase, Phase::Distill);
+        assert_eq!(state.phase, Phase::Done);
+        assert_eq!(state.status, crate::workflow::WorkflowStatus::Completed);
         assert_eq!(state.test.last_status, Some(TestStatus::Passed));
         assert!(green.output.contains("status: passed"), "{}", green.output);
+        assert!(
+            green.output.contains("workflow complete"),
+            "{}",
+            green.output
+        );
         let _ = fs::remove_dir_all(&workspace);
     }
 
