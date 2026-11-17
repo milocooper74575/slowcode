@@ -349,7 +349,7 @@ pub struct App {
     last_prompt_tokens: u64,
     context_window: Option<u64>,
     message_area: Rect,
-    message_screen: Vec<String>,
+    message_screen: Vec<ScreenRow>,
     selection: Option<Selection>,
     had_turn: bool,
     handoff_running: bool,
@@ -4771,18 +4771,36 @@ fn char_offset(text: &str, column: usize) -> usize {
         .map_or(text.len(), |(index, _)| index)
 }
 
-fn snapshot_area(buffer: &Buffer, area: Rect) -> Vec<String> {
+/// One screen row aligned to terminal cells.
+///
+/// `None` marks the cell that a wide grapheme covers beyond its own cell, so
+/// copying never turns that padding into a character.
+type ScreenRow = Vec<Option<String>>;
+
+fn snapshot_area(buffer: &Buffer, area: Rect) -> Vec<ScreenRow> {
     (0..area.height)
         .map(|row| {
-            (0..area.width)
-                .map(|column| {
-                    buffer
-                        .cell((area.x + column, area.y + row))
-                        .map_or(" ", |cell| cell.symbol())
-                })
-                .collect()
+            let mut cells = Vec::with_capacity(area.width as usize);
+            let mut covered = 0;
+            for column in 0..area.width {
+                if covered > 0 {
+                    cells.push(None);
+                    covered -= 1;
+                    continue;
+                }
+                let symbol = buffer
+                    .cell((area.x + column, area.y + row))
+                    .map_or(" ", |cell| cell.symbol());
+                covered = symbol_width(symbol).saturating_sub(1);
+                cells.push(Some(symbol.to_owned()));
+            }
+            cells
         })
         .collect()
+}
+
+fn symbol_width(symbol: &str) -> usize {
+    Line::from(symbol).width()
 }
 
 fn ordered_selection(selection: &Selection) -> ((u16, u16), (u16, u16)) {
@@ -4793,25 +4811,28 @@ fn ordered_selection(selection: &Selection) -> ((u16, u16), (u16, u16)) {
     }
 }
 
-fn selected_text(screen: &[String], selection: &Selection) -> String {
+fn selected_text(screen: &[ScreenRow], selection: &Selection) -> String {
     let ((start_row, start_column), (end_row, end_column)) = ordered_selection(selection);
     let mut out = String::new();
     for row in start_row..=end_row {
-        let line = screen.get(row as usize).map(String::as_str).unwrap_or("");
-        let characters = line.chars().collect::<Vec<_>>();
+        let cells = screen.get(row as usize).map(Vec::as_slice).unwrap_or(&[]);
         let from = if row == start_row {
             start_column as usize
         } else {
             0
         }
-        .min(characters.len());
+        .min(cells.len());
         let to = if row == end_row {
             (end_column as usize).saturating_add(1)
         } else {
-            characters.len()
+            cells.len()
         }
-        .min(characters.len());
-        let segment = characters[from..to].iter().collect::<String>();
+        .min(cells.len());
+        let segment = cells[from..to]
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<String>();
         out.push_str(segment.trim_end());
         if row != end_row {
             out.push('\n');
@@ -4940,6 +4961,31 @@ mod tests {
             std::env::temp_dir().join(format!("slowcode-tui-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&path).expect("temp dir");
         path
+    }
+
+    fn screen_text(buffer: &Buffer, area: Rect) -> String {
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| {
+                        buffer
+                            .cell((area.x + column, area.y + row))
+                            .map_or(" ", |cell| cell.symbol())
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn screen_rows(rows: &[&str]) -> Vec<ScreenRow> {
+        rows.iter()
+            .map(|row| {
+                row.chars()
+                    .map(|character| Some(character.to_string()))
+                    .collect()
+            })
+            .collect()
     }
 
     async fn test_app() -> App {
@@ -5235,7 +5281,7 @@ mod tests {
 
     #[test]
     fn selection_text_is_extracted_between_two_points() {
-        let screen = vec!["abc def  ".to_owned(), "ghi jkl".to_owned()];
+        let screen = screen_rows(&["abc def  ", "ghi jkl"]);
         let selection = Selection {
             anchor: (0, 4),
             cursor: (1, 2),
@@ -5247,6 +5293,59 @@ mod tests {
             cursor: (0, 0),
         };
         assert_eq!(selected_text(&screen, &selection), "abc def\nghi jkl");
+    }
+
+    #[test]
+    fn selected_text_keeps_cjk_without_inserted_spaces() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_stringn(0, 0, "状态", 6, Style::default());
+        let screen = snapshot_area(&buffer, area);
+        let selection = Selection {
+            anchor: (0, 0),
+            cursor: (0, 3),
+        };
+        assert_eq!(selected_text(&screen, &selection), "状态");
+    }
+
+    #[test]
+    fn rendered_wide_table_keeps_full_cell_text() {
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let table = "| 项 | 状态 |\n|---|---|\n\
+| `AGENTS.md` 新增 `## Independent judgment` | 已改，纯新增 10 行 |";
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    Paragraph::new(message_lines(&[MessageBlock::Assistant(table.to_owned())]))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            })
+            .expect("draw");
+        let screen = screen_text(terminal.backend().buffer(), Rect::new(0, 0, 100, 8));
+        assert!(screen.contains("Independent judgment"), "{screen}");
+        assert!(!screen.contains('…'), "{screen}");
+    }
+
+    #[test]
+    fn copied_cjk_selection_has_no_padding_spaces() {
+        let backend = TestBackend::new(20, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(Line::from("状态 已改")), frame.area());
+            })
+            .expect("draw");
+        let screen = snapshot_area(terminal.backend().buffer(), Rect::new(0, 0, 20, 2));
+        let selection = Selection {
+            anchor: (0, 0),
+            cursor: (0, 9),
+        };
+        let copied = selected_text(&screen, &selection);
+        assert!(copied.contains("状态 已改"), "{copied:?}");
+        assert!(!copied.contains("状 态"), "{copied:?}");
     }
 
     #[test]
