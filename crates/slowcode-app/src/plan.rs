@@ -23,10 +23,11 @@ use slowcode_cognition::{
     answer_user_prompt, answer_verdict_repair_prompt, append_section, apply_decisions,
     artifact_slug, distill_follow_up, distill_repair_prompt, distill_user_prompt, executable_tasks,
     execute_user_prompt, failure_classification_repair_prompt, fix_user_prompt, hint_user_prompt,
-    parse_answer_verdict, parse_decision_tables, parse_failure_classifications,
-    parse_question_table, parse_scaffold_manifest, parse_task_table, question_answer_user_prompt,
-    render_artifact, render_task_bullets, repair_prompt, scaffold_tasks, scaffold_user_prompt,
-    set_artifact_status, validate_answer_verdict, validate_decisions, validate_distill_output,
+    is_question_only_reason, parse_answer_verdict, parse_decision_tables,
+    parse_failure_classifications, parse_question_table, parse_scaffold_manifest, parse_task_table,
+    question_answer_user_prompt, question_repair_prompt, render_artifact, render_task_bullets,
+    repair_prompt, scaffold_tasks, scaffold_user_prompt, set_artifact_status,
+    validate_answer_verdict, validate_decisions, validate_distill_output,
     validate_failure_classifications, validate_plan_output,
 };
 use slowcode_kernel::skill_roots::SkillRoots;
@@ -732,13 +733,41 @@ async fn run_plan_with_session(
                     run_task_turn_usage(agent, task, 1, config, &cancellation).await?;
                 let mut validation = validate_plan_output(&output);
                 if !validation.is_valid() {
-                    let repair = repair_prompt(&validation.reasons);
-                    let (repaired, repair_usage) =
-                        run_text_turn_usage(agent, &repair, 2, config, &cancellation).await?;
-                    usage.model_calls += repair_usage.model_calls;
-                    usage.output_tokens += repair_usage.output_tokens;
-                    output = repaired;
-                    validation = validate_plan_output(&output);
+                    let question_only = validation
+                        .reasons
+                        .iter()
+                        .all(|reason| is_question_only_reason(reason));
+                    if question_only {
+                        let current = question_section(&output).to_owned();
+                        let repair = question_repair_prompt(&validation.reasons, &current);
+                        let (repaired, repair_usage) =
+                            run_text_turn_usage(agent, &repair, 2, config, &cancellation).await?;
+                        usage.model_calls += repair_usage.model_calls;
+                        usage.output_tokens += repair_usage.output_tokens;
+                        let merged = replace_question_section(&output, &repaired);
+                        let merged_validation = validate_plan_output(&merged);
+                        if merged_validation.is_valid() {
+                            output = merged;
+                            validation = merged_validation;
+                        } else {
+                            let repair = repair_prompt(&merged_validation.reasons);
+                            let (full, full_usage) =
+                                run_text_turn_usage(agent, &repair, 3, config, &cancellation)
+                                    .await?;
+                            usage.model_calls += full_usage.model_calls;
+                            usage.output_tokens += full_usage.output_tokens;
+                            output = full;
+                            validation = validate_plan_output(&output);
+                        }
+                    } else {
+                        let repair = repair_prompt(&validation.reasons);
+                        let (repaired, repair_usage) =
+                            run_text_turn_usage(agent, &repair, 2, config, &cancellation).await?;
+                        usage.model_calls += repair_usage.model_calls;
+                        usage.output_tokens += repair_usage.output_tokens;
+                        output = repaired;
+                        validation = validate_plan_output(&output);
+                    }
                 }
 
                 let path = write_plan_artifact(config, task, &output, &validation)?;
@@ -3551,6 +3580,36 @@ fn write_plan_artifact(
     Ok(path)
 }
 
+fn question_section(output: &str) -> &str {
+    let Some(start) = output.find("## 半已知域问题") else {
+        return "";
+    };
+    let rest = &output[start..];
+    let end = rest[1..]
+        .find("\n## ")
+        .map_or(rest.len(), |index| index + 1);
+    &rest[..end]
+}
+
+fn replace_question_section(output: &str, repaired: &str) -> String {
+    let repaired = repaired.trim();
+    let repaired = if repaired.starts_with("## 半已知域问题") {
+        repaired.to_owned()
+    } else {
+        format!("## 半已知域问题\n\n{repaired}")
+    };
+    match output.find("## 半已知域问题") {
+        Some(start) => {
+            let rest = &output[start..];
+            let end = rest[1..]
+                .find("\n## ")
+                .map_or(rest.len(), |index| index + 1);
+            format!("{}{}{}", &output[..start], repaired, &rest[end..])
+        }
+        None => format!("{}\n\n{}", output.trim_end(), repaired),
+    }
+}
+
 fn now_unix() -> Result<u64, BoxError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
@@ -4056,7 +4115,7 @@ validation: ok
 ## 半已知域问题
 | 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
 |---|---|---|---|---|---|
-| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有接口兼容 | 必须二选一并说明兼容性 |
+| 选择缓存策略 | 缓存策略选 A 还是 B？ | 1) A 2) B | A | 与现有接口兼容 | 必须二选一并说明兼容性 |
 "
     }
 
@@ -4214,6 +4273,52 @@ validation: ok
 
         assert!(outcome.path.exists(), "{}", outcome.path.display());
         assert!(outcome.output.contains("认知任务分配表"));
+    }
+
+    #[tokio::test]
+    async fn a_bad_option_cell_repairs_only_the_question_table() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider = FakeProvider::new(&[
+            "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+| 选择缓存策略 | 半已知域 | 仓库有缓存层 | 待决策 | 给出选项 | 决策者 | 决策后实现 | 用户确认 |
+
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有接口兼容 | 必须二选一 |
+",
+            "\
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 选择缓存策略 | 缓存策略选 A 还是 B？ | 1) A 2) B | A | 与现有接口兼容 | 必须二选一 |
+",
+        ]);
+
+        let outcome = run_plan(
+            &config,
+            Arc::new(provider),
+            "选缓存策略",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("targeted question repair succeeds");
+
+        assert!(outcome.output.contains("1) A 2) B"), "{}", outcome.output);
+        assert!(outcome.output.contains("读取输入"), "{}", outcome.output);
+        assert!(!outcome.output.contains("| A / B |"), "{}", outcome.output);
+        let artifact = fs::read_to_string(&outcome.path).expect("artifact");
+        assert!(artifact.contains("1) A 2) B"), "{artifact}");
+        assert!(artifact.contains("读取输入"), "{artifact}");
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[tokio::test]

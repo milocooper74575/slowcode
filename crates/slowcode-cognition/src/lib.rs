@@ -149,7 +149,7 @@ For every task whose 执行状态 is 待决策 and whose 认知属性 is not 未
 
 - 任务 must match the task text exactly.
 - 问题 must end with `？`.
-- 选项 uses ` / ` between 2 or 3 options.
+- 选项 uses numbered items `1) ... 2) ... 3) ...` in one cell, with 2 or 3 options. Never use `/`, `|` or `、` between options.
 - 推荐 must be one of the options.
 - 判定标准 states what the answer must cover.
 - One question per task in the first round. Do not ask follow-up questions yet.
@@ -202,6 +202,35 @@ pub fn repair_prompt(reasons: &[String]) -> String {
         "\nReturn only the complete corrected answer. It must include `## 证据包`, `## 认知任务分配表` with the exact required columns including 判定依据 and 执行状态, and `## 半已知域问题` with one question for every non-unknown 待决策 task.",
         reasons,
     )
+}
+
+/// A validation reason that can be fixed by rewriting only the question table.
+#[must_use]
+pub fn is_question_only_reason(reason: &str) -> bool {
+    reason.starts_with("question for ")
+        || reason.starts_with("recommendation ")
+        || reason.starts_with("question references ")
+        || reason.starts_with("unknown-domain task ")
+        || reason.starts_with("executable task ")
+        || (reason.starts_with("task `") && reason.contains("first-round question"))
+        || (reason.starts_with("task `") && reason.contains("has no question"))
+}
+
+/// Ask for only the corrected `## 半已知域问题` section. This avoids
+/// regenerating and re-printing the whole plan for a malformed option cell.
+#[must_use]
+pub fn question_repair_prompt(reasons: &[String], current_table: &str) -> String {
+    let mut prompt = String::from("Your /plan answer has question-table problems:\n");
+    for reason in reasons {
+        prompt.push_str("- ");
+        prompt.push_str(reason);
+        prompt.push('\n');
+    }
+    prompt.push_str(
+        "\nReturn only the corrected `## 半已知域问题` section. Keep the task table unchanged. Use numbered options `1) ... 2) ...`; keep any `/` or `、` inside an option.\n\n## Current question table\n\n",
+    );
+    prompt.push_str(current_table.trim());
+    prompt
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -335,13 +364,8 @@ pub fn parse_question_table(output: &str) -> Vec<QuestionDraft> {
         if cells.len() <= maximum {
             continue;
         }
-        let options = cells[options_col]
-            .split(['/', '|', '｜', '、'])
-            .map(str::trim)
-            .filter(|option| !option.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let recommendation = cells[recommendation_col].trim();
+        let options = parse_option_cell(&cells[options_col]);
+        let recommendation = strip_option_marker(&cells[recommendation_col]);
         questions.push(QuestionDraft {
             task: cells[task_col].clone(),
             prompt: cells[prompt_col].clone(),
@@ -349,12 +373,79 @@ pub fn parse_question_table(output: &str) -> Vec<QuestionDraft> {
             recommendation: (!recommendation.is_empty()
                 && recommendation != "-"
                 && !recommendation.eq_ignore_ascii_case("none"))
-            .then(|| recommendation.to_owned()),
+            .then_some(recommendation),
             reason: cells[reason_col].clone(),
             criteria: cells[criteria_col].clone(),
         });
     }
     questions
+}
+
+/// Parse a question cell that uses numbered options such as
+/// `1) A 2) B 3) C`. Option text may contain `/` and `、`; only the numbered
+/// markers split it.
+fn parse_option_cell(cell: &str) -> Vec<String> {
+    let characters: Vec<char> = cell.chars().collect();
+    let mut markers = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if !characters[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index + 1;
+        while end < characters.len() && characters[end].is_ascii_digit() {
+            end += 1;
+        }
+        let number: String = characters[start..end].iter().collect();
+        let allowed = matches!(number.as_str(), "1" | "2" | "3");
+        let preceded = start == 0
+            || characters[start - 1].is_whitespace()
+            || matches!(characters[start - 1], '；' | ';' | '：' | ':');
+        let marker = characters.get(end).copied();
+        let followed_by_space = end + 1 >= characters.len() || characters[end + 1].is_whitespace();
+        let marker_ok = match marker {
+            Some(')') | Some('）') => true,
+            Some('、') => characters
+                .get(end + 1)
+                .is_none_or(|next| !next.is_ascii_digit()),
+            Some('.') | Some('．') => followed_by_space,
+            _ => false,
+        };
+        let is_marker = allowed && preceded && marker_ok;
+        if is_marker {
+            markers.push((start, end + 1));
+            index = end + 1;
+            continue;
+        }
+        index = end;
+    }
+    if markers.is_empty() {
+        return vec![cell.trim().to_owned()];
+    }
+    let mut options = Vec::new();
+    for (position, (_, content_start)) in markers.iter().enumerate() {
+        let end = markers
+            .get(position + 1)
+            .map(|(marker_start, _)| *marker_start)
+            .unwrap_or(characters.len());
+        let option: String = characters[*content_start..end].iter().collect();
+        let option = option.trim().trim_matches('|').trim();
+        if !option.is_empty() {
+            options.push(option.to_owned());
+        }
+    }
+    options
+}
+
+fn strip_option_marker(cell: &str) -> String {
+    let parsed = parse_option_cell(cell);
+    if parsed.len() == 1 {
+        parsed.into_iter().next().unwrap_or_default()
+    } else {
+        cell.trim().to_owned()
+    }
 }
 
 /// Validate the question table against the task table.
@@ -401,8 +492,8 @@ pub fn validate_question_table(
         }
         if !(2..=3).contains(&question.options.len()) {
             reasons.push(format!(
-                "question for `{}` must have 2 or 3 options",
-                question.task
+                "question for `{}` must have 2 or 3 numbered options; use `1) ... 2) ...` in the 选项 cell",
+                question.task,
             ));
         }
         let mut unique = std::collections::BTreeSet::new();
@@ -1430,7 +1521,7 @@ mod tests {
 ## 半已知域问题
 | 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
 |---|---|---|---|---|---|
-| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |
+| 选择缓存策略 | 缓存策略选 A 还是 B？ | 1) A 2) B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |
 ";
 
     #[test]
@@ -1498,8 +1589,8 @@ mod tests {
     #[test]
     fn accepts_known_blocked_by_decision() {
         let output = VALID.replace("| 可执行 |", "| 待决策 |").replace(
-            "| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |",
-            "| 读取输入 | 缓存未定？ | A / B | A | 兼容 | 选一个 |\n| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |",
+            "| 选择缓存策略 | 缓存策略选 A 还是 B？ | 1) A 2) B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |",
+            "| 读取输入 | 缓存未定？ | 1) A 2) B | A | 兼容 | 选一个 |\n| 选择缓存策略 | 缓存策略选 A 还是 B？ | 1) A 2) B | A | 与现有缓存层兼容 | 必须二选一并说明兼容性 |",
         );
         let validation = validate_plan_output(&output);
         assert!(validation.is_valid(), "{:?}", validation.reasons);
@@ -1708,6 +1799,34 @@ CRLF 的处理。
     }
 
     #[test]
+    fn question_only_reasons_are_not_task_table_reasons() {
+        assert!(is_question_only_reason(
+            "question for `缓存` must have 2 or 3 numbered options"
+        ));
+        assert!(is_question_only_reason(
+            "recommendation `A` for `缓存` is not one of the options"
+        ));
+        assert!(is_question_only_reason(
+            "task `缓存` is 待决策 but has no question"
+        ));
+        assert!(!is_question_only_reason(
+            "the 认知任务分配表 needs the column 判定依据"
+        ));
+        assert!(!is_question_only_reason("unknown section `## 证据包`"));
+    }
+
+    #[test]
+    fn question_repair_prompt_keeps_the_current_table() {
+        let prompt = question_repair_prompt(
+            &["question for `缓存` must have 2 or 3 numbered options".to_owned()],
+            "| 缓存 | 选哪个？ | A / B |",
+        );
+        assert!(prompt.contains("Return only the corrected `## 半已知域问题` section."));
+        assert!(prompt.contains("| 缓存 | 选哪个？ | A / B |"));
+        assert!(prompt.contains("1) ... 2) ..."));
+    }
+
+    #[test]
     fn distill_repair_prompt_lists_every_reason() {
         let prompt = distill_repair_prompt(&["missing section".to_owned()]);
         assert!(prompt.starts_with(
@@ -1746,7 +1865,7 @@ CRLF 的处理。
 ## 半已知域问题
 | 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
 |---|---|---|---|---|---|
-| 选择缓存策略 | 缓存策略选 A 还是 B？ | A / B | A | 与现有接口兼容 | 必须二选一并说明兼容性 |
+| 选择缓存策略 | 缓存策略选 A 还是 B？ | 1) A 2) B | A | 与现有接口兼容 | 必须二选一并说明兼容性 |
 ",
         );
         let validation = validate_plan_output(&output);
@@ -1755,6 +1874,51 @@ CRLF 的处理。
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].options, vec!["A", "B"]);
         assert_eq!(questions[0].recommendation.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn numbered_options_keep_slashes_and_ideographic_commas() {
+        let output = question_plan(
+            "\
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 选择缓存策略 | 选哪种？ | 1) 保留\"独立思考 / 保持清醒\" 2) 第 1、2 条合并 3) 只写一句 | 1) 保留\"独立思考 / 保持清醒\" | 兼容 | 选一个 |
+",
+        );
+        let validation = validate_plan_output(&output);
+        assert!(validation.is_valid(), "{:?}", validation.reasons);
+        let questions = parse_question_table(&output);
+        assert_eq!(questions.len(), 1);
+        assert_eq!(
+            questions[0].options,
+            vec!["保留\"独立思考 / 保持清醒\"", "第 1、2 条合并", "只写一句"]
+        );
+        assert_eq!(
+            questions[0].recommendation.as_deref(),
+            Some("保留\"独立思考 / 保持清醒\"")
+        );
+    }
+
+    #[test]
+    fn unnumbered_options_get_an_actionable_reason() {
+        let output = question_plan(
+            "\
+## 半已知域问题
+| 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
+|---|---|---|---|---|---|
+| 选择缓存策略 | 选哪种？ | A / B | A | 兼容 | 选一个 |
+",
+        );
+        let validation = validate_plan_output(&output);
+        assert!(
+            validation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("numbered options")),
+            "{:?}",
+            validation.reasons
+        );
     }
 
     #[test]
@@ -1785,7 +1949,7 @@ CRLF 的处理。
 ## 半已知域问题
 | 任务 | 问题 | 选项 | 推荐 | 推荐理由 | 判定标准 |
 |---|---|---|---|---|---|
-| 设计解析算法 | 谁来写？ | A / B | A | 理由 | 标准 |
+| 设计解析算法 | 谁来写？ | 1) A 2) B | A | 理由 | 标准 |
 ";
         let validation = validate_plan_output(output);
         assert!(
