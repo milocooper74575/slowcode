@@ -15,14 +15,15 @@ use std::{
 
 use slowcode_cognition::{
     ANSWER_SYSTEM_PROMPT, AnswerVerdictKind, CognitiveTask, DISTILL_SYSTEM_PROMPT,
-    FIX_SYSTEM_PROMPT, HINT_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, PlanValidation, QuestionDraft,
-    SCAFFOLD_SYSTEM_PROMPT, answer_user_prompt, answer_verdict_repair_prompt, append_section,
-    apply_decisions, artifact_slug, distill_follow_up, distill_repair_prompt, distill_user_prompt,
+    FIX_SYSTEM_PROMPT, HINT_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, PLAN_TURN_INSTRUCTION,
+    PlanValidation, QuestionDraft, SCAFFOLD_SYSTEM_PROMPT, answer_user_prompt,
+    answer_verdict_repair_prompt, append_section, apply_decisions, artifact_slug,
+    distill_follow_up, distill_repair_prompt, distill_user_prompt,
     failure_classification_repair_prompt, fix_user_prompt, hint_user_prompt, parse_answer_verdict,
     parse_decision_tables, parse_failure_classifications, parse_question_table,
-    parse_scaffold_manifest, parse_task_table, plan_user_prompt, question_answer_user_prompt,
-    render_artifact, render_task_bullets, repair_prompt, scaffold_tasks, scaffold_user_prompt,
-    set_artifact_status, validate_answer_verdict, validate_decisions, validate_distill_output,
+    parse_scaffold_manifest, parse_task_table, question_answer_user_prompt, render_artifact,
+    render_task_bullets, repair_prompt, scaffold_tasks, scaffold_user_prompt, set_artifact_status,
+    validate_answer_verdict, validate_decisions, validate_distill_output,
     validate_failure_classifications, validate_plan_output,
 };
 use slowcode_kernel::skill_roots::SkillRoots;
@@ -636,8 +637,7 @@ async fn run_plan_with_session(
                 let config = &plan_config;
                 let task = plan_task.as_str();
                 let (mut output, mut usage) =
-                    run_text_turn_usage(agent, &plan_user_prompt(task), 1, config, &cancellation)
-                        .await?;
+                    run_task_turn_usage(agent, task, 1, config, &cancellation).await?;
                 let mut validation = validate_plan_output(&output);
                 if !validation.is_valid() {
                     let repair = repair_prompt(&validation.reasons);
@@ -858,14 +858,9 @@ fn run_answer_with_session<'a>(
                 .await;
             }
 
-            let mut output = run_text_turn(
-                agent,
-                &answer_user_prompt(&artifact, &answer_text),
-                1,
-                config,
-                &cancellation,
-            )
-            .await?;
+            let prompt = answer_user_prompt(&artifact, &answer_text);
+            let mut output =
+                run_human_turn(agent, &prompt, &answer_text, 1, config, &cancellation).await?;
             let mut decisions = parse_decision_tables(&output);
             let mut validation = validate_decisions(&decisions);
             if !validation.is_valid() {
@@ -1083,7 +1078,7 @@ async fn answer_model_question(
         &question.criteria,
         answer_text,
     );
-    let mut output = run_text_turn(agent, &prompt, 1, config, cancellation).await?;
+    let mut output = run_human_turn(agent, &prompt, answer_text, 1, config, cancellation).await?;
     let mut validation = validate_answer_verdict(&output, &question.question_id);
     let mut verdict = parse_answer_verdict(&output);
     if !validation.is_valid() || verdict.is_none() {
@@ -1894,14 +1889,9 @@ async fn run_distill_with_session(
             Box::pin(async move {
                 let config = &plan_config;
                 let explanation = plan_explanation.as_str();
-                let mut output = run_text_turn(
-                    agent,
-                    &distill_user_prompt(&artifact, explanation),
-                    1,
-                    config,
-                    &cancellation,
-                )
-                .await?;
+                let prompt = distill_user_prompt(&artifact, explanation);
+                let mut output =
+                    run_human_turn(agent, &prompt, explanation, 1, config, &cancellation).await?;
                 let mut validation = validate_distill_output(&output);
                 if !validation.is_valid() {
                     output = run_text_turn(
@@ -2018,14 +2008,9 @@ async fn run_hint_with_session(
             Box::pin(async move {
                 let config = &plan_config;
                 let question = plan_question.as_str();
-                let output = run_text_turn(
-                    agent,
-                    &hint_user_prompt(&artifact, question),
-                    1,
-                    config,
-                    &cancellation,
-                )
-                .await?;
+                let prompt = hint_user_prompt(&artifact, question);
+                let output =
+                    run_human_turn(agent, &prompt, question, 1, config, &cancellation).await?;
                 let state =
                     store.record_capability_override(&active.workflow_id, question, "coach")?;
                 Ok(PlanOutcome {
@@ -2931,9 +2916,101 @@ async fn run_text_turn_usage(
         vec![ContentBlock::text(text)?],
         MessageSource::plugin("slowcode-plan")?,
     )?;
+    run_messages_usage(agent, vec![message], text, turn, config, cancellation).await
+}
+
+/// One turn whose trailing text was typed by the human.
+///
+/// The human text is persisted with the `User` source so replay and titles can
+/// use it. Everything the workflow adds stays a plugin message, which the UI
+/// hides.
+async fn run_human_turn(
+    agent: &mut AgentLoop,
+    prompt: &str,
+    human: &str,
+    turn: u64,
+    config: &PlanConfig,
+    cancellation: &CancellationToken,
+) -> Result<String, BoxError> {
+    Ok(
+        run_human_turn_usage(agent, prompt, human, turn, config, cancellation)
+            .await?
+            .0,
+    )
+}
+
+async fn run_human_turn_usage(
+    agent: &mut AgentLoop,
+    prompt: &str,
+    human: &str,
+    turn: u64,
+    config: &PlanConfig,
+    cancellation: &CancellationToken,
+) -> Result<(String, TurnUsage), BoxError> {
+    let (instruction, human) = split_trailing_human(prompt, human)
+        .ok_or_else(|| io::Error::other("prompt does not end with the human text"))?;
+    let messages = vec![
+        Message::user(
+            format!("plan-context-{turn}"),
+            vec![ContentBlock::text(instruction)?],
+            MessageSource::plugin("slowcode-plan")?,
+        )?,
+        Message::user(
+            format!("plan-human-{turn}"),
+            vec![ContentBlock::text(human)?],
+            MessageSource::user()?,
+        )?,
+    ];
+    run_messages_usage(agent, messages, prompt, turn, config, cancellation).await
+}
+
+/// One `/plan` turn: the task is the human text, the workflow instruction
+/// follows it in the same turn.
+async fn run_task_turn_usage(
+    agent: &mut AgentLoop,
+    task: &str,
+    turn: u64,
+    config: &PlanConfig,
+    cancellation: &CancellationToken,
+) -> Result<(String, TurnUsage), BoxError> {
+    let messages = vec![
+        Message::user(
+            format!("plan-human-{turn}"),
+            vec![ContentBlock::text(task)?],
+            MessageSource::user()?,
+        )?,
+        Message::user(
+            format!("plan-context-{turn}"),
+            vec![ContentBlock::text(PLAN_TURN_INSTRUCTION)?],
+            MessageSource::plugin("slowcode-plan")?,
+        )?,
+    ];
+    let request = format!("{task}\n\n{PLAN_TURN_INSTRUCTION}");
+    run_messages_usage(agent, messages, &request, turn, config, cancellation).await
+}
+
+/// Split a prompt that ends with the human text into the workflow prefix and
+/// the human suffix. The suffix is returned from `prompt` so it keeps the
+/// exact text the prompt builder used.
+fn split_trailing_human<'a>(prompt: &'a str, human: &str) -> Option<(&'a str, &'a str)> {
+    if human.is_empty() {
+        return None;
+    }
+    let index = prompt.rfind(human)?;
+    Some((&prompt[..index], &prompt[index..]))
+}
+
+async fn run_messages_usage(
+    agent: &mut AgentLoop,
+    messages: Vec<Message>,
+    request: &str,
+    turn: u64,
+    config: &PlanConfig,
+    cancellation: &CancellationToken,
+) -> Result<(String, TurnUsage), BoxError> {
     reserve_model_call()?;
     let outcome = agent
-        .run_turn(TurnProposal::Enter(vec![message]), cancellation.clone())
+        .run_turn(TurnProposal::Enter(messages), cancellation.clone())
         .await?;
     let usage = TurnUsage {
         model_calls: u64::try_from(outcome.attempts()).unwrap_or(u64::MAX),
@@ -2941,7 +3018,7 @@ async fn run_text_turn_usage(
     };
     settle_model_usage(usage);
     let output = crate::outcome_text(&outcome);
-    record_model_turn(config, turn, text, &output, usage);
+    record_model_turn(config, turn, request, &output, usage);
     match outcome.reason() {
         TurnEndReason::Completed | TurnEndReason::MaxTokens => {}
         TurnEndReason::Aborted { .. } => {
@@ -5625,18 +5702,49 @@ validation: ok
                 .any(|event| matches!(event.kind, UiEventKind::AssistantMessage { .. })),
             "the assistant answer is replayable"
         );
-        assert!(
-            !replayed.iter().any(|event| matches!(
-                event.kind,
+        let human: Vec<&str> = replayed
+            .iter()
+            .filter_map(|event| match &event.kind {
                 UiEventKind::UserMessage {
                     source: UiMessageSource::Human,
+                    text,
                     ..
-                }
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            human,
+            vec!["count lines"],
+            "the human task is replayable verbatim"
+        );
+        assert!(
+            session.messages().iter().any(|message| matches!(
+                message.source().kind(),
+                slowcode_kernel::model::MessageSourceKind::Plugin { plugin, .. }
+                    if plugin == "slowcode-plan"
             )),
-            "the generated plan prompt is not replayable as a human message"
+            "the workflow instruction stays a plugin message"
         );
         assert!(outcome.output.contains("## 证据包"));
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn split_trailing_human_keeps_the_last_occurrence() {
+        let prompt = "## Plan artifact\n\nPLAN\n\n## User answer\n\nPLAN";
+        let (instruction, human) = split_trailing_human(prompt, "PLAN").expect("prompt splits");
+        assert_eq!(
+            instruction,
+            "## Plan artifact\n\nPLAN\n\n## User answer\n\n"
+        );
+        assert_eq!(human, "PLAN");
+    }
+
+    #[test]
+    fn split_trailing_human_rejects_a_missing_suffix() {
+        assert!(split_trailing_human("## Plan artifact\n\nPLAN", "missing").is_none());
+        assert!(split_trailing_human("## Plan artifact\n\nPLAN", "").is_none());
     }
 
     #[tokio::test]

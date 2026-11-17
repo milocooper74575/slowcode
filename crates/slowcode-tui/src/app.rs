@@ -1088,7 +1088,7 @@ impl App {
         self.scroll_to_bottom();
 
         if let Some(command) = command {
-            if is_plan_command(&command) {
+            if echoes_command_locally(&command, self.active_phase()) {
                 self.messages.push(MessageBlock::User(input));
                 self.stick_to_bottom();
             }
@@ -3798,6 +3798,22 @@ fn is_plan_command(command: &Command) -> bool {
     )
 }
 
+/// Whether the raw command should be echoed before dispatch.
+///
+/// Plan commands echo so the user sees what they typed. Commands whose human
+/// text is persisted as a session message are rendered from the UI event
+/// stream instead, so echoing them here would show the text twice.
+fn echoes_command_locally(command: &Command, phase: Option<slowcode_app::workflow::Phase>) -> bool {
+    if !is_plan_command(command) {
+        return false;
+    }
+    match command {
+        Command::Plan(_) | Command::Distill(_) | Command::Hint(_) => false,
+        Command::Answer(_) => phase == Some(slowcode_app::workflow::Phase::Distill),
+        _ => true,
+    }
+}
+
 fn composer_view(
     composer: &str,
     cursor: usize,
@@ -5872,6 +5888,44 @@ mod tests {
         assert!(is_plan_command(&Command::Hint("why".to_owned())));
         assert!(!is_plan_command(&Command::Help(None)));
         assert!(!is_plan_command(&Command::Model(None)));
+    }
+
+    #[test]
+    fn plan_input_rendered_by_the_session_is_not_echoed_twice() {
+        use slowcode_app::workflow::Phase;
+
+        // Human text that becomes a session message is rendered from the UI
+        // event stream.
+        assert!(!echoes_command_locally(
+            &Command::Plan("count lines".to_owned()),
+            Some(Phase::Classify)
+        ));
+        assert!(!echoes_command_locally(
+            &Command::Hint("why".to_owned()),
+            Some(Phase::Interview)
+        ));
+        assert!(!echoes_command_locally(
+            &Command::Distill("because".to_owned()),
+            Some(Phase::Distill)
+        ));
+        assert!(!echoes_command_locally(
+            &Command::Answer("yes".to_owned()),
+            Some(Phase::Interview)
+        ));
+
+        // The distill answer path only records workflow state, so the raw
+        // command stays the only visible copy.
+        assert!(echoes_command_locally(
+            &Command::Answer("accept the rest".to_owned()),
+            Some(Phase::Distill)
+        ));
+
+        // Commands with no persisted human text keep the local echo.
+        assert!(echoes_command_locally(
+            &Command::Status(None),
+            Some(Phase::Classify)
+        ));
+        assert!(!echoes_command_locally(&Command::Help(None), None));
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

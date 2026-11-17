@@ -167,11 +167,13 @@ Required output structure:
 
 Stop after the table and pause. Do not start Execute.";
 
+/// Instruction the workflow adds after the human task in a `/plan` turn.
+pub const PLAN_TURN_INSTRUCTION: &str =
+    "先执行 Explore，再执行 Navigate。输出证据包与认知任务分配表，然后暂停。";
+
 #[must_use]
 pub fn plan_user_prompt(task: &str) -> String {
-    format!(
-        "任务：{task}\n\n先执行 Explore，再执行 Navigate。输出证据包与认知任务分配表，然后暂停。"
-    )
+    format!("任务：{task}\n\n{PLAN_TURN_INSTRUCTION}")
 }
 
 /// Render a repair prompt: the contract header, one bullet per reason, then

@@ -1034,7 +1034,7 @@ mod tests {
             ProviderPrepareError, ProviderRequest, ProviderRequestDraft, ProviderStream,
             ProviderStreamError,
         },
-        ui::{UiEventKind, UiEventReceiver},
+        ui::{UiEventKind, UiEventReceiver, UiMessageSource},
     };
 
     /// Env-mutating runtime tests run one at a time in this binary.
@@ -1277,16 +1277,26 @@ mod tests {
         assert!(outcome.output.contains("## 证据包"));
         let mut saw_delta = false;
         let mut saw_assistant = false;
+        let mut human_events = 0;
         while let Ok(event) = events.try_recv() {
             match event.kind {
                 UiEventKind::AssistantTextDelta { .. } => saw_delta = true,
                 UiEventKind::AssistantMessage { .. } => saw_assistant = true,
+                UiEventKind::UserMessage {
+                    source: UiMessageSource::Human,
+                    text,
+                    ..
+                } if text == "count lines" => human_events += 1,
                 _ => {}
             }
         }
         assert!(
             saw_delta || saw_assistant,
             "plan output reaches the UI event stream"
+        );
+        assert_eq!(
+            human_events, 1,
+            "the human task reaches the UI event stream exactly once"
         );
         assert_eq!(runtime.session_id(), id);
         let snapshot = runtime
