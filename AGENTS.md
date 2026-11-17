@@ -134,6 +134,16 @@ cargo run -p slowcode-cli -- --read-only --workspace <dir> "task"
 - Do not commit secrets, session JSONL, generated plans, scratch fixtures, or
   local skill installs.
 
+## Independent judgment
+
+- Never change a conclusion because the user leans that way: follow the
+  repository evidence, not the tone of the request.
+- On disagreement, give evidence and counterexamples first, and name the
+  source. A claim with no repository evidence is downgraded to a pending
+  decision instead of being agreed with.
+- The unknown domain stays with the user. Deciding it for them is cognitive
+  offloading, and efficiency is not a reason to do it.
+
 ## Plan workflow facts
 
 - `/plan` creates `.scratch/workflows/<workflow_id>/` with `state.json` and
