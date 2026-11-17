@@ -56,6 +56,17 @@ include those JSON fixtures by relative path.
   `AsyncFd::new`. The helper documents the ownership invariant; see
   `docs/adr/0017-async-fd-registration-seam.md`. A reactor test covers the
   registration path.
+- `tools/workspace.rs`: `walk_files` now skips the same heavy directories as
+  the file catalogue (`.git`, `target`, `node_modules`, `.venv`, `build`,
+  `dist`, and the other entries in `is_skipped_search_directory`). Before, it
+  only skipped VCS directories, so a 24 GB `target/` tree exhausted
+  `MAX_VISITED_ENTRIES` and `grep`/`glob` failed with
+  `SEARCH_LIMIT_EXCEEDED`. Test:
+  `traversal_skips_catalogue_directories`.
+- `agent/mod.rs`: raised the default `AgentLimits::max_steps_per_turn` from
+  16 to 32. Ordinary codebase questions were ending with `AGENT_MAX_STEPS`
+  before the agent could answer. The absolute ceiling stays
+  `MAX_AGENT_STEPS_PER_TURN = 64`, and `/plan` still requests 64 explicitly.
 - `lib.rs`: exports the new `skill_roots` module.
 - Unit tests that used `.dsh/skills` as a discovery root now use
   `.slowcode/skills`. A few tests still create `.dsh/skills` fixtures only to

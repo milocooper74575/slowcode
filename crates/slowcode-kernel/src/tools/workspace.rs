@@ -1090,13 +1090,14 @@ impl Workspace {
                         display: entry.display,
                         modified: entry.modified.unwrap_or(SystemTime::UNIX_EPOCH),
                     }),
-                    EntryKind::Directory if !is_vcs_directory(&entry.name) => queue.push_back((
-                        ResolvedPath {
-                            relative: entry.relative,
-                            display: entry.display,
-                        },
-                        depth + 1,
-                    )),
+                    EntryKind::Directory if !is_skipped_search_directory(&entry.name) => queue
+                        .push_back((
+                            ResolvedPath {
+                                relative: entry.relative,
+                                display: entry.display,
+                            },
+                            depth + 1,
+                        )),
                     EntryKind::Directory | EntryKind::Symlink | EntryKind::Other => {}
                 }
             }
@@ -1360,7 +1361,7 @@ fn read_catalogue_directory(
         } else if file_type.is_file() {
             CatalogueEntryKind::File
         } else if file_type.is_dir() {
-            if is_file_catalogue_skipped_directory(&name) {
+            if is_skipped_search_directory(&name) {
                 CatalogueEntryKind::Ignored
             } else {
                 CatalogueEntryKind::Directory
@@ -1477,8 +1478,7 @@ fn join_catalogue_path(parent: &str, name: &str) -> Result<String, WorkspaceFile
     Ok(display)
 }
 
-#[cfg(unix)]
-fn is_file_catalogue_skipped_directory(name: &str) -> bool {
+fn is_skipped_search_directory(name: &str) -> bool {
     matches!(
         name,
         ".git"
@@ -2021,10 +2021,6 @@ fn shell_component_count(path: &Path) -> usize {
         .count()
 }
 
-fn is_vcs_directory(name: &str) -> bool {
-    matches!(name, ".git" | ".svn" | ".hg" | ".bzr" | ".jj" | ".sl")
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2044,7 +2040,7 @@ mod tests {
         MutationCommitTestPhase, PreparedWorkspaceMutation, WorkspaceCommitStatus,
         WorkspaceMutationOperation, publication_error,
     };
-    use super::{Workspace, file_changed};
+    use super::{Workspace, file_changed, is_skipped_search_directory};
     #[cfg(unix)]
     use super::{WorkspaceFileCatalogue, WorkspaceFileCatalogueError};
     use crate::tools::error::ToolCallError;
@@ -2870,6 +2866,32 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn traversal_skips_catalogue_directories() {
+        let root = TempRoot::new();
+        fs::create_dir_all(root.0.join("target/deep")).unwrap();
+        fs::write(root.0.join("target/deep/artifact"), b"x").unwrap();
+        fs::create_dir_all(root.0.join("node_modules/pkg")).unwrap();
+        fs::write(root.0.join("node_modules/pkg/index.js"), b"x").unwrap();
+        fs::write(root.0.join("keep.txt"), b"x").unwrap();
+        let workspace = Workspace::open(&root.0).unwrap();
+        let directory = workspace.resolve(".").unwrap();
+        let token = CancellationToken::new();
+
+        let files = workspace
+            .walk_files(&directory, 1_000, &token)
+            .await
+            .unwrap();
+        let names = files
+            .iter()
+            .map(|file| file.display.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["keep.txt"]);
+        assert!(is_skipped_search_directory("target"));
+        assert!(is_skipped_search_directory(".git"));
+        assert!(!is_skipped_search_directory("src"));
     }
 
     #[tokio::test]

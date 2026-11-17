@@ -147,7 +147,7 @@ pub struct AgentLimits {
 impl Default for AgentLimits {
     fn default() -> Self {
         Self {
-            max_steps_per_turn: 16,
+            max_steps_per_turn: 32,
             max_attempts_per_turn: 24,
             max_retries_per_step: 8,
             max_tool_calls_per_step: 16,
