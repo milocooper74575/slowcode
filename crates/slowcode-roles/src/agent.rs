@@ -13,8 +13,9 @@ use std::{
 use slowcode_kernel::{
     agent::{
         AgentLoop, AgentLoopConfig, ApprovalProvider, FileChangePolicy, NoApprovalProvider,
-        PluginPolicy, ShellPolicy, ToolClaimProfile, ToolExecutionFuture, ToolExecutionMode,
-        ToolExecutionRequest, ToolExecutor, ToolPreparationFuture, ToolShutdownFuture,
+        NoTools, PluginPolicy, ShellPolicy, ToolClaimProfile, ToolExecutionFuture,
+        ToolExecutionMode, ToolExecutionRequest, ToolExecutor, ToolPreparationFuture,
+        ToolShutdownFuture,
     },
     model::{LlmCallConfig, ToolSchema},
     provider::ModelProvider,
@@ -30,6 +31,8 @@ use thiserror::Error;
 /// Which workspace registry the agent should use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryMode {
+    /// No tools at all. Used for a coach turn that must not act.
+    None,
     /// Read-only tools plus Skill loading.
     ReadOnly,
     /// Read and text-mutation tools plus Skill loading. No shell.
@@ -103,7 +106,7 @@ impl AgentSpec {
         system: String,
         registry: RegistryMode,
     ) -> Self {
-        let read_only = registry == RegistryMode::ReadOnly;
+        let read_only = matches!(registry, RegistryMode::None | RegistryMode::ReadOnly);
         Self {
             workspace,
             call,
@@ -246,12 +249,13 @@ fn open_registry(
     skill_roots: &SkillRoots,
     read_only: bool,
 ) -> Result<(Arc<dyn ToolExecutor>, Vec<ToolSchema>), AgentBuildError> {
-    if read_only {
+    if read_only && mode != RegistryMode::None {
         let registry = ReadOnlyToolRegistry::open_with_skill_roots(workspace, skill_roots)?;
         let schemas = registry.schemas().to_vec();
         return Ok((Arc::new(registry), schemas));
     }
     match mode {
+        RegistryMode::None => Ok((Arc::new(NoTools), Vec::new())),
         RegistryMode::ReadOnly => {
             let registry = ReadOnlyToolRegistry::open_with_skill_roots(workspace, skill_roots)?;
             let schemas = registry.schemas().to_vec();
@@ -377,4 +381,21 @@ pub enum AgentBuildError {
     Instructions(#[from] WorkspaceInstructionError),
     #[error("tool {0} is declared by more than one registry")]
     DuplicateTool(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_tools_mode_exposes_no_schemas() {
+        let (_, schemas) = open_registry(
+            Path::new("."),
+            RegistryMode::None,
+            &SkillRoots::empty(),
+            true,
+        )
+        .expect("no-tools registry");
+        assert!(schemas.is_empty());
+    }
 }

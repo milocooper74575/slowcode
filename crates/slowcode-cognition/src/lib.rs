@@ -1321,6 +1321,18 @@ pub fn hint_user_prompt(plan: &str, question: &str) -> String {
     format!("## Plan artifact\n\n{plan}\n\n## Hint request\n\n{question}")
 }
 
+/// A side message while a Plan question is open is not an answer.
+pub const COACH_SYSTEM_PROMPT: &str = "\
+You are slowcode's coach. The user typed a side message while a Plan question is open.
+This message is NOT an answer and must not be recorded as one.
+Do not change the workflow, do not write files, and do not call tools.
+Explain the open question, the trade-offs, or what the user must decide. Keep the reply short.";
+
+#[must_use]
+pub fn coach_user_prompt(plan: &str, message: &str) -> String {
+    format!("## Plan artifact\n\n{plan}\n\n## Side message (not an answer)\n\n{message}")
+}
+
 /// Required heading of a Teach-back report.
 pub const DISTILL_REPORT_HEADING: &str = "## 理解漏洞报告";
 
@@ -1505,6 +1517,15 @@ mod tests {
             execute_user_prompt("PLAN", &[]),
             "## Plan artifact\n\nPLAN\n\n## Executable tasks\n\n"
         );
+    }
+
+    #[test]
+    fn coach_prompt_marks_the_message_as_not_an_answer() {
+        let prompt = coach_user_prompt("PLAN", "why does this matter?");
+        assert!(prompt.contains("Side message (not an answer)"));
+        assert!(prompt.ends_with("why does this matter?"));
+        assert!(COACH_SYSTEM_PROMPT.contains("must not be recorded as one"));
+        assert!(COACH_SYSTEM_PROMPT.contains("call tools"));
     }
 
     const VALID: &str = "\

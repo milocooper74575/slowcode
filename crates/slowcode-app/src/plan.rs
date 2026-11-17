@@ -17,12 +17,13 @@ use std::{
 };
 
 use slowcode_cognition::{
-    ANSWER_SYSTEM_PROMPT, AnswerVerdictKind, CognitiveTask, DISTILL_SYSTEM_PROMPT,
-    EXECUTE_SYSTEM_PROMPT, FIX_SYSTEM_PROMPT, HINT_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT,
-    PLAN_TURN_INSTRUCTION, PlanValidation, QuestionDraft, SCAFFOLD_SYSTEM_PROMPT,
-    answer_user_prompt, answer_verdict_repair_prompt, append_section, apply_decisions,
-    artifact_slug, distill_follow_up, distill_repair_prompt, distill_user_prompt, executable_tasks,
-    execute_user_prompt, failure_classification_repair_prompt, fix_user_prompt, hint_user_prompt,
+    ANSWER_SYSTEM_PROMPT, AnswerVerdictKind, COACH_SYSTEM_PROMPT, CognitiveTask,
+    DISTILL_SYSTEM_PROMPT, EXECUTE_SYSTEM_PROMPT, FIX_SYSTEM_PROMPT, HINT_SYSTEM_PROMPT,
+    PLAN_SYSTEM_PROMPT, PLAN_TURN_INSTRUCTION, PlanValidation, QuestionDraft,
+    SCAFFOLD_SYSTEM_PROMPT, answer_user_prompt, answer_verdict_repair_prompt, append_section,
+    apply_decisions, artifact_slug, coach_user_prompt, distill_follow_up, distill_repair_prompt,
+    distill_user_prompt, executable_tasks, execute_user_prompt,
+    failure_classification_repair_prompt, fix_user_prompt, hint_user_prompt,
     is_question_only_reason, parse_answer_verdict, parse_decision_tables,
     parse_failure_classifications, parse_question_table, parse_scaffold_manifest, parse_task_table,
     question_answer_user_prompt, question_repair_prompt, render_artifact, render_task_bullets,
@@ -225,6 +226,7 @@ pub enum PlanCommand {
     Workflow(Option<String>),
     Reclassify(String),
     Hint(String),
+    Coach(String),
 }
 
 impl PlanCommand {
@@ -245,6 +247,7 @@ impl PlanCommand {
             Self::Workflow(_) => "workflow",
             Self::Reclassify(_) => "reclassify",
             Self::Hint(_) => "hint",
+            Self::Coach(_) => "coach",
         }
     }
 
@@ -260,6 +263,7 @@ impl PlanCommand {
                 | Self::Fix
                 | Self::Distill(_)
                 | Self::Hint(_)
+                | Self::Coach(_)
         )
     }
 }
@@ -440,6 +444,7 @@ fn command_human_text(command: &PlanCommand) -> Option<(&'static str, &str)> {
         PlanCommand::Answer(answer) => Some(("slowcode-answer-", answer)),
         PlanCommand::Distill(explanation) => Some(("slowcode-distill-", explanation)),
         PlanCommand::Hint(question) => Some(("slowcode-hint-", question)),
+        PlanCommand::Coach(message) => Some(("slowcode-coach-", message)),
         _ => None,
     }
 }
@@ -575,6 +580,10 @@ async fn run_command_inner(
             PlanCommand::Reclassify(text) => run_reclassify(config, &text).await,
             PlanCommand::Hint(question) => {
                 run_hint_with_session(config, provider, &question, cancellation.clone(), sessions)
+                    .await
+            }
+            PlanCommand::Coach(message) => {
+                run_coach_with_session(config, provider, &message, cancellation.clone(), sessions)
                     .await
             }
         }
@@ -2351,6 +2360,75 @@ async fn run_hint_with_session(
     .await
 }
 
+/// A side message on an open question gets a coach reply, not an answer.
+///
+/// The turn has no tools and at most one step. It records the human text so
+/// the model has the context, but it never writes an answer to the workflow.
+async fn run_coach_with_session(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    message: &str,
+    cancellation: CancellationToken,
+    sessions: &mut PlanSession,
+) -> Result<PlanOutcome, BoxError> {
+    let message = message.trim().to_owned();
+    if message.is_empty() {
+        return Err(invalid("coach message must not be empty"));
+    }
+    sessions.record_human("slowcode-coach-", &message).await?;
+    let store = WorkflowStore::new(&config.workspace);
+    let active = store.require_active()?;
+    if active.status != crate::workflow::WorkflowStatus::Active
+        || active.phase.capability_profile().is_none()
+    {
+        return Err(invalid(format!(
+            "/coach is not available in phase {}",
+            active.phase
+        )));
+    }
+    let path = resolve_plan_path(config)?;
+    let artifact = fs::read_to_string(&path)?;
+    record_manifest(
+        &config.workspace,
+        &active.workflow_id,
+        active.phase,
+        CapabilityProfile::Coach,
+    )?;
+    let plan_config = config.clone();
+    let plan_message = message.clone();
+    with_plan_agent(
+        sessions,
+        config,
+        provider,
+        PlanAgentPolicy {
+            system: COACH_SYSTEM_PROMPT,
+            profile: CapabilityProfile::Coach,
+            registry: RegistryMode::None,
+            file_change: FileChangePolicy::Deny,
+            session_prefix: "slowcode-coach-",
+            approval: None,
+            workflow_id: Some(active.workflow_id.clone()),
+            audit_sink: None,
+            max_steps_per_turn: Some(1),
+        },
+        move |agent| {
+            Box::pin(async move {
+                let config = &plan_config;
+                let message = plan_message.as_str();
+                let prompt = coach_user_prompt(&artifact, message);
+                let output =
+                    run_human_turn(agent, &prompt, message, 1, config, &cancellation).await?;
+                Ok(PlanOutcome {
+                    path,
+                    output,
+                    workflow_id: Some(active.workflow_id),
+                })
+            })
+        },
+    )
+    .await
+}
+
 /// `/approve` accepts the current Review table and advances the phase.
 pub async fn run_approve(config: &PlanConfig) -> Result<PlanOutcome, BoxError> {
     let store = WorkflowStore::new(&config.workspace);
@@ -3089,7 +3167,7 @@ fn plan_agent<'a>(
         );
         let mut spec = AgentSpec::new(config.workspace.clone(), call, system, policy.registry);
         spec.skill_roots = skill_roots_for(policy.profile)?;
-        spec.read_only = policy.registry == RegistryMode::ReadOnly;
+        spec.read_only = matches!(policy.registry, RegistryMode::None | RegistryMode::ReadOnly);
         spec.file_change = policy.file_change;
         // Plan drivers have no shell. Tests and process work go through the
         // system-owned TestExecutor.
@@ -3097,7 +3175,7 @@ fn plan_agent<'a>(
         spec.approval = approval;
         spec.install_workspace_instructions = true;
         spec.max_steps_per_turn = policy.max_steps_per_turn;
-        if policy.profile.is_read_only() {
+        if policy.registry != RegistryMode::None && policy.profile.is_read_only() {
             let store = WorkflowStore::new(&config.workspace);
             let shell = match policy.audit_sink.clone() {
                 Some(sink) => crate::workflow::AuditedReadonlyShell::open_with_sink(
@@ -3695,6 +3773,17 @@ async fn run_hint(
 ) -> Result<PlanOutcome, BoxError> {
     let mut sessions = PlanSession::new(None);
     run_hint_with_session(config, provider, question, cancellation, &mut sessions).await
+}
+
+#[cfg(test)]
+async fn run_coach(
+    config: &PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    message: &str,
+    cancellation: CancellationToken,
+) -> Result<PlanOutcome, BoxError> {
+    let mut sessions = PlanSession::new(None);
+    run_coach_with_session(config, provider, message, cancellation, &mut sessions).await
 }
 
 #[cfg(test)]
@@ -5227,6 +5316,43 @@ validation: ok
         let _ = fs::remove_dir_all(&workspace);
     }
 
+    #[tokio::test]
+    async fn coach_replies_to_a_side_message_without_recording_an_answer() {
+        let workspace = temp_workspace();
+        write_plan(&workspace, plan_text());
+        let config = PlanConfig::new(workspace.clone());
+        let store = WorkflowStore::new(&workspace);
+        let tasks = workflow_tasks(&parse_task_table(plan_text()), &[]);
+        let state = store
+            .create_with_tasks("test", None, tasks)
+            .expect("workflow");
+        let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::new(&[
+            "This decides the cache key, so pick the interface you can keep.",
+        ]));
+
+        let outcome = run_coach(
+            &config,
+            provider,
+            "为什么这个选择重要？",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("coach succeeds");
+
+        assert!(outcome.output.contains("cache key"), "{}", outcome.output);
+        let reloaded = store.load(&state.workflow_id).expect("state loads");
+        assert_eq!(reloaded.phase, Phase::Review);
+        assert!(reloaded.questions.is_empty());
+        let events = fs::read_to_string(store.root().join(&state.workflow_id).join("events.jsonl"))
+            .expect("events");
+        assert!(events.contains("\"profile\":\"coach\""), "{events}");
+        assert!(
+            !events.contains("\"kind\":\"question.answered\""),
+            "{events}"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
     const SEMI_ANSWER: &str = "\
 ## 回答判定
 | 问题 | 结论 | 缺口 |
@@ -5879,6 +6005,13 @@ validation: ok
         assert_eq!(state.budget.enforced_tokens, 11);
         assert_eq!(state.status, WorkflowStatus::Active);
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn coach_is_a_model_turn() {
+        let command = PlanCommand::Coach("why does this matter?".to_owned());
+        assert_eq!(command.label(), "coach");
+        assert!(command.uses_model());
     }
 
     #[tokio::test]

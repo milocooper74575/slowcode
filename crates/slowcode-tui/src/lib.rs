@@ -158,7 +158,7 @@ async fn run_inner(
             }
             app_event = app_rx.recv() => {
                 if let Some(app_event) = app_event {
-                    app.handle_app_event(app_event);
+                    app.handle_app_event(app_event).await;
                 }
             }
             _ = tick.tick() => {

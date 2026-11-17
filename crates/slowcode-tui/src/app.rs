@@ -311,6 +311,7 @@ pub struct App {
     reasoning_live: Option<usize>,
     composer: String,
     composer_cursor: usize,
+    queued_input: Vec<String>,
     history: Vec<String>,
     history_cursor: Option<usize>,
     scroll: u16,
@@ -368,6 +369,7 @@ impl App {
             reasoning_live: None,
             composer: String::new(),
             composer_cursor: 0,
+            queued_input: Vec::new(),
             history: Vec::new(),
             history_cursor: None,
             scroll: 0,
@@ -498,7 +500,7 @@ impl App {
         self.scroll_to_bottom();
     }
 
-    pub fn handle_app_event(&mut self, event: AppEvent) {
+    pub async fn handle_app_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::TurnFinished(result) => {
                 self.running = false;
@@ -629,6 +631,7 @@ impl App {
                 Err(error) => self.push_error(format!("update failed: {error}")),
             },
         }
+        self.flush_queued_input().await;
     }
 
     pub fn handle_ui_event(&mut self, event: UiEvent) {
@@ -1150,11 +1153,17 @@ impl App {
             return self.handle_command(command).await;
         }
         if self.running {
-            self.push(MessageBlock::System(
-                "a turn is already running; press Ctrl-C to cancel".to_owned(),
-            ));
+            self.queued_input.push(input);
+            self.push(MessageBlock::System(format!(
+                "queued: {} message(s) will send after this turn",
+                self.queued_input.len()
+            )));
             return KeyAction::none();
         }
+        self.submit_text(input).await
+    }
+
+    async fn submit_text(&mut self, input: String) -> KeyAction {
         if let Some(question) = self.pending_plan_question_details() {
             if answer_matches_question(&question, &input) {
                 self.push(MessageBlock::System(format!(
@@ -1164,10 +1173,11 @@ impl App {
                 return self.handle_plan_command(Command::Answer(input)).await;
             }
             self.push(MessageBlock::System(format!(
-                "this text was not recorded as an answer.\n\n{}\n\nchoose a listed option, type its number, or use /answer #{} <answer>.",
+                "this text was not recorded as an answer.\n\n{}\n\nrunning a coach turn with your text; use /answer #{} <answer> to record a decision.",
                 question.render(),
                 question.question_id
             )));
+            self.start_plan(slowcode_app::plan::PlanCommand::Coach(input));
             return KeyAction::none();
         }
         if self.plan_review_ready() && is_approval_text(&input) {
@@ -1179,6 +1189,27 @@ impl App {
         self.ensure_await_user_coach().await;
         self.start_turn(input);
         KeyAction::none()
+    }
+
+    async fn flush_queued_input(&mut self) {
+        if self.running || self.queued_input.is_empty() {
+            return;
+        }
+        if self.pending_login.is_some()
+            || self.pending_approval.is_some()
+            || self.pending_skill.is_some()
+            || self.pending_feedback.is_some()
+            || self.pending_mcp.is_some()
+            || self.pending_plan_new.is_some()
+        {
+            return;
+        }
+        let input = self.queued_input.remove(0);
+        self.push(MessageBlock::System(format!(
+            "sending queued message ({} left)",
+            self.queued_input.len()
+        )));
+        self.submit_text(input).await;
     }
 
     /// The open Plan question that a plain-text submission answers.
@@ -4820,7 +4851,8 @@ mod tests {
         let before = app.messages.len();
         let info = update_info("99.0.0");
 
-        app.handle_app_event(AppEvent::UpdateChecked(Ok(Some(info.clone()))));
+        app.handle_app_event(AppEvent::UpdateChecked(Ok(Some(info.clone()))))
+            .await;
 
         assert_eq!(app.messages.len(), before + 1);
         assert!(matches!(
@@ -4830,7 +4862,8 @@ mod tests {
                     && text.contains("type /update")
         ));
 
-        app.handle_app_event(AppEvent::UpdateChecked(Ok(Some(info))));
+        app.handle_app_event(AppEvent::UpdateChecked(Ok(Some(info))))
+            .await;
         assert_eq!(app.messages.len(), before + 1, "notice is not repeated");
     }
 
@@ -5203,7 +5236,8 @@ mod tests {
 
         app.handle_app_event(AppEvent::TurnFinished(Err(
             "tool executor failed".to_owned()
-        )));
+        )))
+        .await;
 
         assert!(!app.running);
         assert_eq!(app.state, RunState::Error);
@@ -5222,7 +5256,7 @@ mod tests {
         let mut app = test_app().await;
         app.running = true;
 
-        app.handle_app_event(AppEvent::TurnFinished(Ok(())));
+        app.handle_app_event(AppEvent::TurnFinished(Ok(()))).await;
         app.handle_ui_event(ui_event(UiEventKind::TurnEnd {
             turn: 1,
             reason: UiTurnEnd::Completed,
@@ -6342,6 +6376,7 @@ mod tests {
             PlanCommand::Answer("x".to_owned()),
             PlanCommand::Scaffold,
             PlanCommand::Test,
+            PlanCommand::Coach("x".to_owned()),
         ] {
             assert!(!auto_starts_next_step(&command), "{command:?}");
         }
@@ -6427,6 +6462,26 @@ mod tests {
         let (app, _, _) = app_in(workspace.clone()).await;
         assert_eq!(app.pending_plan_question().as_deref(), Some("q-1"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn running_input_is_queued_until_the_turn_finishes() {
+        let (workspace, _) = seeded_workspace("queued-input", "task");
+        let (mut app, _, _) = app_in(workspace.clone()).await;
+        app.running = true;
+        app.composer = "review this later".to_owned();
+        app.composer_cursor = app.composer.len();
+
+        app.submit().await;
+
+        assert_eq!(app.queued_input, vec!["review this later".to_owned()]);
+        assert!(app.messages.iter().any(|message| {
+            message_text(message).is_some_and(|text| text.contains("queued: 1 message"))
+        }));
+
+        app.flush_queued_input().await;
+        assert_eq!(app.queued_input, vec!["review this later".to_owned()]);
+        let _ = std::fs::remove_dir_all(workspace.parent().expect("root"));
     }
 
     async fn app_in(
@@ -6550,7 +6605,7 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             app.handle_ui_event(event);
         }
-        app.handle_app_event(finished);
+        app.handle_app_event(finished).await;
 
         assert!(
             app.messages
@@ -6689,7 +6744,8 @@ mod tests {
         app.running = true;
         app.cancel = Some(CancellationToken::new());
 
-        app.handle_app_event(AppEvent::PlanFinished(Err("cancelled".to_owned())));
+        app.handle_app_event(AppEvent::PlanFinished(Err("cancelled".to_owned())))
+            .await;
 
         assert!(!app.running);
         assert!(app.cancel.is_none());
@@ -6710,7 +6766,8 @@ mod tests {
             path: std::path::PathBuf::from(".scratch/plans/p.md"),
             output: "## Plan\n\nbody".to_owned(),
             workflow_id: None,
-        })));
+        })))
+        .await;
 
         assert!(!app.running);
         assert!(app.messages.iter().any(|message| {
@@ -6731,7 +6788,8 @@ mod tests {
             path: std::path::PathBuf::from(".scratch/plans/p.md"),
             output: "final plan".to_owned(),
             workflow_id: None,
-        })));
+        })))
+        .await;
 
         let assistant = app
             .messages
