@@ -133,6 +133,8 @@ pub fn write_bundle(request: BundleRequest<'_>) -> Result<BundleOutcome, Feedbac
     } = prepared;
     let workspace = workspace.as_deref();
     let workspace_name = workspace
+        .filter(|workspace| can_redact_workspace(workspace))
+        .or(analysis.workspace.as_deref())
         .and_then(|workspace| workspace.trim_end_matches('/').rsplit('/').next())
         .filter(|name| !name.is_empty())
         .unwrap_or("unknown");
@@ -232,18 +234,19 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         .workspace
         .or(analysis.workspace.as_deref())
         .map(str::to_owned);
+    let redact_paths = redact_paths(request, &analysis);
     for message in analysis
         .user_messages
         .iter_mut()
         .chain(analysis.assistant_messages.iter_mut())
     {
-        *message = redact(message, workspace.as_deref());
+        *message = redact(message, &redact_paths);
     }
     for error in &mut analysis.errors {
-        error.message = redact(&error.message, workspace.as_deref());
+        error.message = redact(&error.message, &redact_paths);
     }
     for message in request.console_errors {
-        let message = redact(message, workspace.as_deref());
+        let message = redact(message, &redact_paths);
         if message.trim().is_empty()
             || analysis
                 .errors
@@ -267,11 +270,11 @@ fn prepare(request: &BundleRequest<'_>) -> Result<Prepared, FeedbackError> {
         .or_else(|| derive_title(request.note.as_deref()))
         .or_else(|| analysis.title.clone())
         .unwrap_or_else(|| "slowcode session feedback".to_owned());
-    let title = redact(&title, workspace.as_deref());
+    let title = redact(&title, &redact_paths);
     let note = request
         .note
         .clone()
-        .map(|note| redact(&note, workspace.as_deref()));
+        .map(|note| redact(&note, &redact_paths));
     let plan = match &request.plan {
         Some(plan) if !plan.is_file() => return Err(FeedbackError::PlanMissing(plan.clone())),
         plan => plan.clone(),
@@ -819,6 +822,9 @@ fn recent(messages: &[String], limit: usize, max_chars: usize) -> String {
 }
 
 /// Trim text and append a truncation marker past `limit` characters.
+///
+/// The cut backs up to the last newline so a Markdown table row or a file
+/// path is not split in half.
 #[must_use]
 pub fn clip(text: &str, limit: usize) -> String {
     let text = text.trim();
@@ -826,7 +832,11 @@ pub fn clip(text: &str, limit: usize) -> String {
         return text.to_owned();
     }
     let clipped: String = text.chars().take(limit).collect();
-    format!("{clipped}\n...(truncated)")
+    let clipped = match clipped.rfind('\n') {
+        Some(index) if index > 0 && !clipped.ends_with('\n') => clipped[..index].to_owned(),
+        _ => clipped,
+    };
+    format!("{}\n...(truncated)", clipped.trim_end_matches('\n'))
 }
 
 struct MetaContext<'a> {
@@ -956,13 +966,43 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// Replace the workspace path and common credential shapes in visible text.
+fn redact_paths(request: &BundleRequest<'_>, analysis: &Analysis) -> Vec<String> {
+    let mut paths = Vec::new();
+    for workspace in [request.workspace, analysis.workspace.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let workspace = workspace.trim().trim_end_matches(['/', '\\']);
+        if can_redact_workspace(workspace) {
+            paths.push(workspace.to_owned());
+        }
+    }
+    paths.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    paths.dedup();
+    paths
+}
+
+/// A workspace value is only a path when it has a separator and is not the
+/// current directory. Redacting `"."` would rewrite every full stop in the
+/// feedback body.
+fn can_redact_workspace(workspace: &str) -> bool {
+    let workspace = workspace.trim();
+    !workspace.is_empty()
+        && workspace != "."
+        && workspace != ".."
+        && workspace.chars().count() > 2
+        && (workspace.contains('/') || workspace.contains('\\'))
+}
+
+/// Replace workspace paths and common credential shapes in visible text.
 /// The raw `session.jsonl` is never rewritten.
-fn redact(text: &str, workspace: Option<&str>) -> String {
-    let text = match workspace {
-        Some(workspace) if !workspace.is_empty() => text.replace(workspace, "<workspace>"),
-        _ => text.to_owned(),
-    };
+fn redact(text: &str, workspaces: &[String]) -> String {
+    let mut text = text.to_owned();
+    for workspace in workspaces {
+        if text.contains(workspace) {
+            text = text.replace(workspace, "<workspace>");
+        }
+    }
     redact_secrets(&text)
 }
 
@@ -1090,6 +1130,49 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn clip_keeps_whole_lines() {
+        let text = "| task | state |\n|---|---|\n| one | two |\n";
+        let clipped = clip(text, 18);
+        assert_eq!(clipped, "| task | state |\n...(truncated)");
+        assert!(clipped.lines().last().unwrap().contains("(truncated)"));
+        assert_eq!(
+            clip("abcdefghij", 4),
+            "abcd\n...(truncated)",
+            "a single long line still falls back to a character cut"
+        );
+    }
+
+    #[test]
+    fn a_relative_workspace_does_not_rewrite_punctuation() {
+        let base = temp_dir("relative-workspace");
+        let out = base.join("out");
+        let journal = journal();
+        let mut request = request(&out, journal.as_bytes());
+        request.workspace = Some(".");
+        request.title = None;
+        request.note = Some("1. AGENTS.md 表头\n2. GLOSSARY.md:59-61 的表格".to_owned());
+        let outcome = write_bundle(request).unwrap();
+
+        assert!(outcome.complete, "{:?}", outcome.hard_failures);
+        let issue = fs::read_to_string(out.join("issue.md")).unwrap();
+        assert!(issue.contains("# [feedback] 1. AGENTS.md"), "{issue}");
+        assert!(issue.contains("GLOSSARY.md:59-61"), "{issue}");
+        assert!(!issue.contains("AGENTS<workspace>md"), "{issue}");
+        assert!(!issue.contains("GLOSSARY<workspace>md"), "{issue}");
+        assert!(!issue.contains("/tmp/example-project"), "{issue}");
+        assert!(issue.contains("<workspace>"), "{issue}");
+        assert!(
+            issue.contains("workspace-name: `example-project`"),
+            "{issue}"
+        );
+
+        let metadata: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(metadata["workspace"], ".");
+        let _ = fs::remove_dir_all(base);
     }
 
     fn journal() -> String {
