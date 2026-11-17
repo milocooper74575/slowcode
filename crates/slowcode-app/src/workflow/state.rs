@@ -120,6 +120,25 @@ impl Phase {
         }
     }
 
+    /// Short action label for surfaces that should not expose phase names.
+    ///
+    /// Light workflows use this so a one-task change reads as "ready for
+    /// approval" instead of "review". The phase still exists in state.
+    #[must_use]
+    pub fn user_label(self) -> &'static str {
+        match self {
+            Self::Classify => "planning",
+            Self::Interview | Self::Reclassify => "waiting for your answer",
+            Self::Review => "ready for approval",
+            Self::Scaffold => "preparing the change",
+            Self::AwaitUser => "waiting for your implementation",
+            Self::TestFix => "running tests",
+            Self::Distill => "summarizing what you own",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+
     /// Only the phases that own workspace changes may write user files.
     #[must_use]
     pub fn allows_workspace_write(self) -> bool {
@@ -144,6 +163,24 @@ impl Phase {
 impl fmt::Display for Phase {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// How much workflow machinery is worth showing to the user.
+///
+/// The lane is derived from the classification, never chosen by a second model
+/// call. Light workflows have no questions and no user-owned core, so their
+/// only real decision is the approval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowLane {
+    Light,
+    Full,
+}
+
+impl WorkflowLane {
+    #[must_use]
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
     }
 }
 
@@ -669,6 +706,21 @@ impl WorkflowState {
         })
     }
 
+    /// Presentation lane derived from the classification.
+    ///
+    /// Before tasks exist there is nothing to judge, so the full progress trail
+    /// stays visible. Once a plan is known-only, AI-implemented, and asks no
+    /// questions, the workflow is light and only the approval matters.
+    #[must_use]
+    pub fn lane(&self) -> WorkflowLane {
+        let has_tasks = !self.tasks.is_empty();
+        if has_tasks && self.questions.is_empty() && !self.requires_distill() {
+            WorkflowLane::Light
+        } else {
+            WorkflowLane::Full
+        }
+    }
+
     #[must_use]
     pub fn review_is_current(&self) -> bool {
         self.review.approved_table_hash.as_deref() == Some(self.table_hash().as_str())
@@ -994,6 +1046,63 @@ mod tests {
         state.tasks = tasks;
         state.phase = Phase::Review;
         state
+    }
+
+    #[test]
+    fn lane_is_light_only_for_known_ai_work_without_questions() {
+        let mut state = review_state(vec![task(
+            "task-1",
+            Domain::Known,
+            ExecState::Executable,
+            Strategy::AiImplements,
+        )]);
+        assert_eq!(state.lane(), WorkflowLane::Light);
+        assert_eq!(Phase::Review.user_label(), "ready for approval");
+        assert_eq!(Phase::TestFix.user_label(), "running tests");
+
+        state.phase = Phase::TestFix;
+        assert_eq!(state.lane(), WorkflowLane::Light);
+
+        state.tasks.push(task(
+            "task-2",
+            Domain::Unknown,
+            ExecState::PendingUser,
+            Strategy::UserImplementsCore,
+        ));
+        assert_eq!(state.lane(), WorkflowLane::Full);
+    }
+
+    #[test]
+    fn questions_and_empty_tasks_keep_the_full_lane() {
+        let mut state = review_state(Vec::new());
+        assert_eq!(state.lane(), WorkflowLane::Full);
+
+        state.tasks.push(task(
+            "task-1",
+            Domain::Known,
+            ExecState::Executable,
+            Strategy::AiImplements,
+        ));
+        assert_eq!(state.lane(), WorkflowLane::Light);
+
+        state.questions.push(Question {
+            question_id: "q-1".to_owned(),
+            task_id: None,
+            kind: QuestionKind::SemiKnown,
+            prompt: "pick".to_owned(),
+            options: Vec::new(),
+            recommendation: None,
+            reason: String::new(),
+            status: QuestionStatus::Answered,
+            criteria: String::new(),
+            created_at: 1,
+            answer: Some("A".to_owned()),
+            answer_source: None,
+            answer_snapshot: None,
+            attempts: 1,
+            last_gap: None,
+        });
+        assert_eq!(state.lane(), WorkflowLane::Full);
     }
 
     #[test]

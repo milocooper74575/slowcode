@@ -337,6 +337,7 @@ pub struct App {
     handoff_running: bool,
     quit_after_turn: bool,
     plan_phase: Option<slowcode_app::workflow::Phase>,
+    plan_light: bool,
     plan_workflow: Option<String>,
     plan_started: Option<Instant>,
     plan_expects_assistant: bool,
@@ -393,6 +394,7 @@ impl App {
             handoff_running: false,
             quit_after_turn: false,
             plan_phase: None,
+            plan_light: false,
             plan_workflow: None,
             plan_started: None,
             plan_expects_assistant: false,
@@ -1488,10 +1490,13 @@ impl App {
         self.plan_phase = self
             .active_phase()
             .or_else(|| is_plan.then_some(slowcode_app::workflow::Phase::Classify));
+        self.plan_light = self
+            .active_lane()
+            .is_some_and(slowcode_app::workflow::WorkflowLane::is_light);
         self.plan_workflow = self.active_workflow_id();
         self.plan_expects_assistant = expects_assistant;
         self.plan_output_seen = false;
-        self.auto_plan_step = matches!(command, slowcode_app::plan::PlanCommand::Approve);
+        self.auto_plan_step = auto_starts_next_step(&command);
         self.assistant_live = None;
         self.reasoning_live = None;
         self.running = true;
@@ -1695,6 +1700,14 @@ impl App {
             .map(|state| state.phase)
     }
 
+    fn active_lane(&self) -> Option<slowcode_app::workflow::WorkflowLane> {
+        WorkflowStore::new(&self.workspace())
+            .load_active()
+            .ok()
+            .flatten()
+            .map(|state| state.lane())
+    }
+
     fn active_workflow_id(&self) -> Option<String> {
         WorkflowStore::new(&self.workspace())
             .load_active()
@@ -1707,10 +1720,12 @@ impl App {
         match WorkflowStore::new(&self.workspace()).load_active() {
             Ok(Some(state)) => {
                 self.plan_phase = Some(state.phase);
+                self.plan_light = state.lane().is_light();
                 self.plan_workflow = Some(state.workflow_id);
             }
             Ok(None) if !self.running => {
                 self.plan_phase = None;
+                self.plan_light = false;
                 self.plan_workflow = None;
             }
             _ => {}
@@ -3029,6 +3044,10 @@ impl App {
         let Some(current) = self.plan_phase else {
             return;
         };
+        if self.plan_light {
+            self.draw_light_plan_phase(frame, area, current);
+            return;
+        }
         let mut spans = vec![Span::styled("phase ", Style::default().fg(Color::DarkGray))];
         for (index, phase) in PHASE_ORDER.iter().enumerate() {
             if index > 0 {
@@ -3051,6 +3070,38 @@ impl App {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
         }
+        if let Some(started) = self.plan_started {
+            spans.push(Span::styled(
+                format!("  {:.1}s", started.elapsed().as_secs_f64()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(workflow) = &self.plan_workflow {
+            spans.push(Span::styled(
+                format!("  {}", short_session(workflow)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn draw_light_plan_phase(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        current: slowcode_app::workflow::Phase,
+    ) {
+        let style = if matches!(current, slowcode_app::workflow::Phase::Blocked) {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        };
+        let mut spans = vec![
+            Span::styled("plan ", Style::default().fg(Color::DarkGray)),
+            Span::styled(current.user_label(), style),
+        ];
         if let Some(started) = self.plan_started {
             spans.push(Span::styled(
                 format!("  {:.1}s", started.elapsed().as_secs_f64()),
@@ -4049,6 +4100,21 @@ fn is_approval_text(text: &str) -> bool {
         "请开始",
     ];
     APPROVALS.contains(&normalized.as_str())
+}
+
+/// Whether finishing this command should immediately run the next fixed step.
+///
+/// Approval decides the phase, `/continue` claims the user implementation, and
+/// `/fix` repairs a red test. All three leave the workflow in a phase whose
+/// next step is deterministic, so asking the user to type `/scaffold` or
+/// `/test` again is pure ceremony. Scaffold stops at AwaitUser by design.
+fn auto_starts_next_step(command: &slowcode_app::plan::PlanCommand) -> bool {
+    matches!(
+        command,
+        slowcode_app::plan::PlanCommand::Approve
+            | slowcode_app::plan::PlanCommand::Continue
+            | slowcode_app::plan::PlanCommand::Fix
+    )
 }
 
 fn is_plan_command(command: &Command) -> bool {
@@ -6224,6 +6290,34 @@ mod tests {
     }
 
     #[test]
+    fn continue_and_fix_auto_start_the_test_step() {
+        use slowcode_app::plan::PlanCommand;
+        use slowcode_app::workflow::Phase;
+
+        for command in [
+            PlanCommand::Approve,
+            PlanCommand::Continue,
+            PlanCommand::Fix,
+        ] {
+            assert!(auto_starts_next_step(&command), "{command:?}");
+        }
+        for command in [
+            PlanCommand::Plan("x".to_owned()),
+            PlanCommand::Answer("x".to_owned()),
+            PlanCommand::Scaffold,
+            PlanCommand::Test,
+        ] {
+            assert!(!auto_starts_next_step(&command), "{command:?}");
+        }
+
+        // Both paths that end in TestFix converge on the same next command.
+        assert_eq!(
+            approved_step_command(Phase::TestFix),
+            Some(PlanCommand::Test)
+        );
+    }
+
+    #[test]
     fn the_next_plan_step_survives_streamed_output() {
         let output = "## 证据包\n\nbody\n\n[workflow: plan-1 phase: interview]\nnext: /answer #q-1 <answer>\nquestion q-1: pick one";
         let hint = plan_followup(output).expect("hint");
@@ -6683,6 +6777,61 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("blocked"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn light_plan_footer_hides_phase_names() {
+        let mut app = test_app().await;
+        app.plan_phase = Some(slowcode_app::workflow::Phase::Review);
+        app.plan_light = true;
+        app.plan_workflow = Some("plan-1".to_owned());
+        app.plan_started = Some(Instant::now());
+
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.draw_plan_phase(frame, area);
+            })
+            .expect("draw");
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("ready for approval"), "{content}");
+        assert!(!content.contains("phase"), "{content}");
+        assert!(!content.contains("review"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn refresh_plan_phase_detects_the_light_lane() {
+        use slowcode_app::workflow::{Domain, ExecState, Strategy, Task, WorkflowStore};
+
+        let mut app = test_app().await;
+        let store = WorkflowStore::new(&app.workspace());
+        let task = Task::new(
+            "task-1".to_owned(),
+            "read input".to_owned(),
+            Domain::Known,
+            "evidence".to_owned(),
+            ExecState::Executable,
+            "implement".to_owned(),
+            "reviewer".to_owned(),
+            "read".to_owned(),
+            "prints".to_owned(),
+            Strategy::AiImplements,
+        );
+        store
+            .create_with_tasks("light", None, vec![task])
+            .expect("workflow");
+
+        app.refresh_plan_phase();
+        assert!(app.plan_light);
     }
 
     #[tokio::test]

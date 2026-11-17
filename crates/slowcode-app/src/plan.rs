@@ -762,9 +762,8 @@ async fn run_plan_with_session(
                     CapabilityProfile::Navigator,
                 )?;
                 let output = format!(
-                    "{output}\n\n[workflow: {} phase: {}]\n{}",
-                    state.workflow_id,
-                    state.phase,
+                    "{output}\n\n{}\n{}",
+                    workflow_marker(&state),
                     answer_next_step(&state)
                 );
                 Ok(PlanOutcome {
@@ -2352,6 +2351,18 @@ fn workflow_outcome(store: &WorkflowStore, state: &WorkflowState) -> PlanOutcome
     }
 }
 
+/// Workflow marker appended to plan output.
+///
+/// The phase is metadata for full workflows. Light workflows omit it so a
+/// one-task change never leaks "review" or "test_fix" into the console.
+fn workflow_marker(state: &WorkflowState) -> String {
+    if state.lane().is_light() {
+        format!("[workflow: {}]", state.workflow_id)
+    } else {
+        format!("[workflow: {} phase: {}]", state.workflow_id, state.phase)
+    }
+}
+
 fn render_workflow_status(state: &WorkflowState) -> String {
     let open = state.open_questions().len();
     let pending = state.pending_decisions().len();
@@ -2362,12 +2373,21 @@ fn render_workflow_status(state: &WorkflowState) -> String {
     } else {
         "not approved".to_owned()
     };
+    let light = state.lane().is_light();
+    let phase_line = if light {
+        String::new()
+    } else {
+        format!("phase: {}\n", state.phase)
+    };
+    let status = if light {
+        state.phase.user_label().to_owned()
+    } else {
+        state.status.as_str().to_owned()
+    };
     format!(
-        "workflow: {}\ntask: {}\nphase: {}\nstatus: {}\nversion: {}\nquestions: {open} open / {} total\ntasks: {} ({pending} pending decision)\napproval: {approval}\n{}",
+        "workflow: {}\ntask: {}\n{phase_line}status: {status}\nversion: {}\nquestions: {open} open / {} total\ntasks: {} ({pending} pending decision)\napproval: {approval}\n{}",
         state.workflow_id,
         state.task,
-        state.phase,
-        state.status.as_str(),
         state.version,
         state.questions.len(),
         state.tasks.len(),
@@ -4357,9 +4377,15 @@ validation: ok
         .await
         .expect("plan succeeds");
         let workflow_id = plan.workflow_id.expect("plan returns a workflow id");
+        assert!(!plan.output.contains("phase:"), "{}", plan.output);
 
         let status = run_status(&config, None).await.expect("status succeeds");
-        assert!(status.output.contains("phase: review"), "{}", status.output);
+        assert!(
+            status.output.contains("status: ready for approval"),
+            "{}",
+            status.output
+        );
+        assert!(!status.output.contains("phase:"), "{}", status.output);
         assert!(
             status.output.contains("next: /approve"),
             "{}",
@@ -4370,10 +4396,11 @@ validation: ok
 
         let approved = run_approve(&config).await.expect("approval succeeds");
         assert!(
-            approved.output.contains("phase: test_fix"),
+            approved.output.contains("status: running tests"),
             "{}",
             approved.output
         );
+        assert!(!approved.output.contains("phase:"), "{}", approved.output);
 
         run_execute(
             &config,

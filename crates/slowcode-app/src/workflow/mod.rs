@@ -56,7 +56,8 @@ pub use state::{
     AnswerSnapshot, AnswerSource, BlockedState, BudgetState, CapabilityProfile, CoreRegion,
     DistillState, Domain, ExecState, GateError, PendingApproval, Phase, Question, QuestionKind,
     QuestionStatus, ReviewState, SCHEMA_VERSION, ScaffoldContract, Strategy, Task, TestContract,
-    TestRunRecord, TestState, TestStatus, WorkflowState, WorkflowStatus, changed_task_ids,
+    TestRunRecord, TestState, TestStatus, WorkflowLane, WorkflowState, WorkflowStatus,
+    changed_task_ids,
 };
 pub use store::{
     AnswerUpdate, ClassifiedFailure, DistillAnswerUpdate, DistillDecision, TestRunUpdate,
