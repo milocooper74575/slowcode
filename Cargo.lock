@@ -2101,7 +2101,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slowcode-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dotenvy",
  "futures-util",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-audit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dotenvy",
  "futures-util",
@@ -2149,18 +2149,18 @@ dependencies = [
 
 [[package]]
 name = "slowcode-cognition"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "slowcode-context"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "slowcode-feedback"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "sha2",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-kernel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-lc-rs",
  "cap-std",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-roles"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cordis-core",
  "futures-util",
@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-skills"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-tests"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "serde_json",
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "crossterm",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "slowcode-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "reqwest",
