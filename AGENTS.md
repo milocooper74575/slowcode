@@ -124,6 +124,9 @@ cargo run -p slowcode-cli -- --read-only --workspace <dir> "task"
   in `crates/slowcode-tests/tests/`.
 - Tests assert observable behavior through public interfaces. No network in
   unit tests.
+- Batch test runs per module. Finish every edit in one module before running
+  its tests; do not re-run the suite after each edit. Re-run on a completed
+  change set, or on a failure that needs a narrower check.
 - Commit in small ordered commits. Say why, what changed, and how it was
   proved.
 - Vendored kernel files follow `crates/slowcode-kernel/UPSTREAM.md`. Record a
