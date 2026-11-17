@@ -1383,6 +1383,31 @@ impl WorkflowStore {
         Ok(state)
     }
 
+    /// Pause the active workflow and clear the active slot.
+    ///
+    /// Unlike [`Self::end`], the workflow stays resumable with
+    /// `/workflow use <id>`. `/plan --new` uses this to step aside instead of
+    /// destroying the old workflow.
+    pub fn pause_active(&self) -> Result<Option<WorkflowState>, WorkflowError> {
+        let _lock = self.lock()?;
+        let mut index = self.read_index()?;
+        let Some(id) = index.active.clone() else {
+            return Ok(None);
+        };
+        let mut state = self.load(&id)?;
+        if state.status != WorkflowStatus::Active {
+            index.active = None;
+            self.write_index(&index)?;
+            return Ok(Some(state));
+        }
+        state.status = WorkflowStatus::Paused;
+        self.commit(
+            &mut state,
+            vec![("workflow.paused", json!({ "reason": "plan_new" }))],
+        )?;
+        Ok(Some(state))
+    }
+
     /// Pause the old active workflow and activate the chosen one.
     pub fn use_workflow(&self, workflow_id: &str) -> Result<WorkflowState, WorkflowError> {
         let _lock = self.lock()?;
@@ -2276,6 +2301,44 @@ mod tests {
         store
             .create_with_tasks("second", None, vec![known_task()])
             .expect("a new workflow may start");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn pausing_the_active_workflow_clears_the_index_and_keeps_it_resumable() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        let state = store
+            .create_with_tasks("first", None, vec![known_task()])
+            .expect("first workflow");
+
+        let paused = store
+            .pause_active()
+            .expect("pause succeeds")
+            .expect("a workflow was active");
+        assert_eq!(paused.workflow_id, state.workflow_id);
+        assert_eq!(paused.status, WorkflowStatus::Paused);
+        assert_eq!(store.active_id().expect("index"), None);
+        assert_eq!(
+            store.load(&state.workflow_id).expect("state").status,
+            WorkflowStatus::Paused
+        );
+
+        store
+            .create_with_tasks("second", None, vec![known_task()])
+            .expect("a new workflow may start");
+        store
+            .use_workflow(&state.workflow_id)
+            .expect("the paused workflow is resumable");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn pausing_without_an_active_workflow_is_a_noop() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        assert!(store.pause_active().expect("pause succeeds").is_none());
+        assert_eq!(store.active_id().expect("index"), None);
         let _ = fs::remove_dir_all(&workspace);
     }
 

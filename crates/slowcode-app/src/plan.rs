@@ -9,7 +9,10 @@ use std::{
     error::Error,
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -35,7 +38,7 @@ use slowcode_kernel::{
     },
     model::{ContentBlock, LlmCallConfig, Message, MessageSource},
     provider::{ModelProvider, deepseek::DEEPSEEK_PROVIDER},
-    session::{ApprovalOutcome, Session, TurnEndReason},
+    session::{ApprovalOutcome, EventKind, NewEvent, Session, SurfaceIntent, TurnEndReason},
 };
 use slowcode_roles::agent::{AgentSpec, RegistryMode};
 use slowcode_runtime::{
@@ -49,11 +52,11 @@ use crate::workflow::{
     MAX_CONSECUTIVE_SAME_FAILURE, MAX_OUTPUT_TOKENS_PER_TURN, ManifestFile, ModelCall, Phase,
     ProjectTestConfig, Question, QuestionKind, QuestionStatus, ScaffoldContract, SecretPolicy,
     SelectorChoice, Strategy, Task as WorkflowTask, TestContract, TestRun, TestRunRecord,
-    TestRunUpdate, TestStatus, UnknownGap, WorkflowBudget, WorkflowState, WorkflowStatus,
-    WorkflowStore, build_contract, build_review_contract, build_skill_manifest, changed_files,
-    derive_selector, detect_project, hash_arguments, input::redact_secrets, read_answer_file,
-    sha256_hex, snapshot_workspace, test_exec, validate_selector, verify_core_implemented,
-    verify_hashes, verify_test_contract_hashes, verify_test_flip,
+    TestRunUpdate, TestStatus, UnknownGap, WorkflowBudget, WorkflowError, WorkflowState,
+    WorkflowStatus, WorkflowStore, build_contract, build_review_contract, build_skill_manifest,
+    changed_files, derive_selector, detect_project, hash_arguments, input::redact_secrets,
+    read_answer_file, sha256_hex, snapshot_workspace, test_exec, validate_selector,
+    verify_core_implemented, verify_hashes, verify_test_contract_hashes, verify_test_flip,
 };
 
 /// Errors from a Plan command. The message is user-facing.
@@ -258,6 +261,23 @@ impl PlanCommand {
     }
 }
 
+/// Split the optional `--new` flag from a `/plan` task.
+///
+/// `--new` means "pause the active workflow and start over". It is a leading
+/// flag only, so a task that merely contains `--new` later is left alone.
+#[must_use]
+pub fn split_new_flag(task: &str) -> (bool, &str) {
+    let trimmed = task.trim_start();
+    let Some(rest) = trimmed.strip_prefix("--new") else {
+        return (false, task);
+    };
+    if rest.chars().next().is_none_or(char::is_whitespace) {
+        (true, rest.trim_start())
+    } else {
+        (false, task)
+    }
+}
+
 /// Result of one Plan command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanOutcome {
@@ -285,25 +305,61 @@ impl PlanSession {
         }
     }
 
+    /// Persist the human text of a Plan command before any gate or parameter
+    /// validation runs.
+    ///
+    /// The text is what the user typed, not what the command did. Recording it
+    /// here keeps the session honest when the command is rejected, and the UI
+    /// event stream renders it even though no model turn starts. Model turns
+    /// must not append the same text again.
+    async fn record_human(&mut self, prefix: &'static str, text: &str) -> Result<(), BoxError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self.session.is_none() {
+            self.session = Some(Session::new(format!("{prefix}{}", now_unix_millis()?))?);
+        }
+        let message = Message::user(
+            next_human_message_id()?,
+            vec![ContentBlock::text(text)?],
+            MessageSource::user()?,
+        )?;
+        self.session
+            .as_mut()
+            .expect("session was created above")
+            .append_settled(NewEvent::surface(
+                EventKind::user_message(message),
+                SurfaceIntent::append(),
+            ))
+            .await?;
+        Ok(())
+    }
+
     fn take_or_create(&mut self, prefix: &'static str) -> Result<Session, BoxError> {
-        if self.reuse {
-            self.session
-                .take()
-                .ok_or_else(|| invalid("plan session is already in use"))
-        } else {
-            Ok(Session::new(format!("{prefix}{}", now_unix_millis()?))?)
+        match self.session.take() {
+            Some(session) => Ok(session),
+            None if self.reuse => Err(invalid("plan session is already in use")),
+            None => Ok(Session::new(format!("{prefix}{}", now_unix_millis()?))?),
         }
     }
 
     fn put(&mut self, session: Session) {
-        if self.reuse {
-            self.session = Some(session);
-        }
+        self.session = Some(session);
     }
 
     fn into_session(self) -> Option<Session> {
-        self.session
+        if self.reuse { self.session } else { None }
     }
+}
+
+fn next_human_message_id() -> Result<String, BoxError> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    Ok(format!(
+        "plan-human-{}-{}",
+        now_unix_millis()?,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 struct PlanAgentPolicy {
@@ -368,6 +424,23 @@ pub async fn run_command_with_session(
     result
 }
 
+/// Human text and session prefix for commands that carry typed input.
+///
+/// Used when a pre-dispatch gate blocks the command before its own handler can
+/// record the text.
+fn command_human_text(command: &PlanCommand) -> Option<(&'static str, &str)> {
+    match command {
+        PlanCommand::Plan(task) => {
+            let (_, task) = split_new_flag(task);
+            Some(("slowcode-plan-", task))
+        }
+        PlanCommand::Answer(answer) => Some(("slowcode-answer-", answer)),
+        PlanCommand::Distill(explanation) => Some(("slowcode-distill-", explanation)),
+        PlanCommand::Hint(question) => Some(("slowcode-hint-", question)),
+        _ => None,
+    }
+}
+
 async fn run_command_inner(
     command: PlanCommand,
     config: &PlanConfig,
@@ -395,6 +468,9 @@ async fn run_command_inner(
     if uses_model && let Some(state) = &active {
         let budget = load_budget(&config.workspace)?;
         if let Some(reason) = budget_exhausted(state, &budget) {
+            if let Some((prefix, text)) = command_human_text(&command) {
+                sessions.record_human(prefix, text).await?;
+            }
             return block_for_budget(&store, state, &reason, "");
         }
     }
@@ -402,7 +478,11 @@ async fn run_command_inner(
     // workflow id, but the runtime never reads the workflow state. Starting a
     // run fails closed; finishing it is best effort so a successful command is
     // not lost when only the audit write fails.
-    let run = if record_run {
+    //
+    // `/plan` creates its own workflow, so a run cannot be linked up front. It
+    // is backfilled after success. Starting one under the currently active
+    // workflow would record a rejected `/plan` against the wrong workflow.
+    let run = if record_run && !creates_workflow {
         match &active {
             Some(state) => {
                 let runs = RunStore::new(
@@ -539,11 +619,14 @@ async fn run_command_inner(
             }
             runs.transition(run_id, RunStatus::Completed, serde_json::json!({}))
         } else {
-            runs.transition(
-                run_id,
-                RunStatus::Failed,
-                serde_json::json!({ "reason": "command_failed" }),
-            )
+            let detail = match result.as_ref().err() {
+                Some(error) => serde_json::json!({
+                    "reason": "command_failed",
+                    "error": error.to_string(),
+                }),
+                None => serde_json::json!({ "reason": "command_failed" }),
+            };
+            runs.transition(run_id, RunStatus::Failed, detail)
         };
     }
     if let Some(state) = active
@@ -607,12 +690,19 @@ async fn run_plan_with_session(
     cancellation: CancellationToken,
     sessions: &mut PlanSession,
 ) -> Result<PlanOutcome, BoxError> {
+    let (start_new, task) = split_new_flag(task);
     let task = task.trim().to_owned();
     if task.is_empty() {
-        return Err(invalid("usage: /plan <task>"));
+        return Err(invalid("usage: /plan [--new] <task>"));
     }
+    sessions.record_human("slowcode-plan-", &task).await?;
     let store = WorkflowStore::new(&config.workspace);
-    store.ensure_no_active()?;
+    if start_new {
+        store.pause_active()?;
+    }
+    if let Err(error) = store.ensure_no_active() {
+        return Err(plan_conflict_error(&store, error));
+    }
 
     let audit_sink = Arc::new(std::sync::Mutex::new(Vec::new()));
     let plan_config = config.clone();
@@ -686,6 +776,22 @@ async fn run_plan_with_session(
     .await
 }
 
+/// Turn the generic "active workflow" error into a message that names the
+/// workflow, its task and the number of open questions, and points at --new.
+fn plan_conflict_error(store: &WorkflowStore, error: WorkflowError) -> BoxError {
+    if let WorkflowError::ActiveExists(id) = &error
+        && let Ok(state) = store.load(id)
+    {
+        return invalid(format!(
+            "workflow {id} is still active ({} open question(s), task: {}); \
+             run /workflow end, /workflow use <id>, or /plan --new <task> to pause it and start over",
+            state.open_questions().len(),
+            state.task
+        ));
+    }
+    error.into()
+}
+
 /// `/answer` records decisions and reclassifies the plan.
 fn run_answer_with_session<'a>(
     config: &'a PlanConfig,
@@ -693,6 +799,32 @@ fn run_answer_with_session<'a>(
     answer: &'a str,
     cancellation: CancellationToken,
     sessions: &'a mut PlanSession,
+) -> PlanOutcomeFuture<'a> {
+    Box::pin(async move {
+        let human_recorded = Arc::new(AtomicBool::new(false));
+        let outcome = run_answer_body(
+            config,
+            provider,
+            answer,
+            cancellation,
+            sessions,
+            Arc::clone(&human_recorded),
+        )
+        .await;
+        if outcome.is_err() && !human_recorded.load(Ordering::Relaxed) {
+            sessions.record_human("slowcode-answer-", answer).await?;
+        }
+        outcome
+    })
+}
+
+fn run_answer_body<'a>(
+    config: &'a PlanConfig,
+    provider: Arc<dyn ModelProvider>,
+    answer: &'a str,
+    cancellation: CancellationToken,
+    sessions: &'a mut PlanSession,
+    human_recorded: Arc<AtomicBool>,
 ) -> PlanOutcomeFuture<'a> {
     Box::pin(async move {
         let argument = parse_answer_argument(answer)?;
@@ -730,6 +862,10 @@ fn run_answer_with_session<'a>(
         if answer_text.trim().is_empty() {
             return Err(invalid("usage: /answer <answer> or /answer @<file>"));
         }
+        sessions
+            .record_human("slowcode-answer-", &answer_text)
+            .await?;
+        human_recorded.store(true, Ordering::Relaxed);
         if active.phase == Phase::Distill {
             if !active
                 .distill
@@ -1856,6 +1992,9 @@ async fn run_distill_with_session(
     if explanation.is_empty() {
         return Err(invalid("usage: /distill <your explanation>"));
     }
+    sessions
+        .record_human("slowcode-distill-", &explanation)
+        .await?;
     let store = WorkflowStore::new(&config.workspace);
     let active = store.require_active()?;
     active.can_enter_distill()?;
@@ -1969,6 +2108,7 @@ async fn run_hint_with_session(
     if question.is_empty() {
         return Err(invalid("usage: /hint <question>"));
     }
+    sessions.record_human("slowcode-hint-", &question).await?;
     let store = WorkflowStore::new(&config.workspace);
     let active = store.require_active()?;
     if active.status != crate::workflow::WorkflowStatus::Active
@@ -2921,9 +3061,9 @@ async fn run_text_turn_usage(
 
 /// One turn whose trailing text was typed by the human.
 ///
-/// The human text is persisted with the `User` source so replay and titles can
-/// use it. Everything the workflow adds stays a plugin message, which the UI
-/// hides.
+/// The caller records the human message before this turn, so only the
+/// workflow instruction is appended here. `split_trailing_human` still guards
+/// the prompt shape: the request text must end with the human text.
 async fn run_human_turn(
     agent: &mut AgentLoop,
     prompt: &str,
@@ -2947,25 +3087,18 @@ async fn run_human_turn_usage(
     config: &PlanConfig,
     cancellation: &CancellationToken,
 ) -> Result<(String, TurnUsage), BoxError> {
-    let (instruction, human) = split_trailing_human(prompt, human)
+    let (instruction, _human) = split_trailing_human(prompt, human)
         .ok_or_else(|| io::Error::other("prompt does not end with the human text"))?;
-    let messages = vec![
-        Message::user(
-            format!("plan-context-{turn}"),
-            vec![ContentBlock::text(instruction)?],
-            MessageSource::plugin("slowcode-plan")?,
-        )?,
-        Message::user(
-            format!("plan-human-{turn}"),
-            vec![ContentBlock::text(human)?],
-            MessageSource::user()?,
-        )?,
-    ];
+    let messages = vec![Message::user(
+        format!("plan-context-{turn}"),
+        vec![ContentBlock::text(instruction)?],
+        MessageSource::plugin("slowcode-plan")?,
+    )?];
     run_messages_usage(agent, messages, prompt, turn, config, cancellation).await
 }
 
-/// One `/plan` turn: the task is the human text, the workflow instruction
-/// follows it in the same turn.
+/// One `/plan` turn: the task was recorded by the caller, so only the
+/// workflow instruction is appended here.
 async fn run_task_turn_usage(
     agent: &mut AgentLoop,
     task: &str,
@@ -2973,18 +3106,11 @@ async fn run_task_turn_usage(
     config: &PlanConfig,
     cancellation: &CancellationToken,
 ) -> Result<(String, TurnUsage), BoxError> {
-    let messages = vec![
-        Message::user(
-            format!("plan-human-{turn}"),
-            vec![ContentBlock::text(task)?],
-            MessageSource::user()?,
-        )?,
-        Message::user(
-            format!("plan-context-{turn}"),
-            vec![ContentBlock::text(PLAN_TURN_INSTRUCTION)?],
-            MessageSource::plugin("slowcode-plan")?,
-        )?,
-    ];
+    let messages = vec![Message::user(
+        format!("plan-context-{turn}"),
+        vec![ContentBlock::text(PLAN_TURN_INSTRUCTION)?],
+        MessageSource::plugin("slowcode-plan")?,
+    )?];
     let request = format!("{task}\n\n{PLAN_TURN_INSTRUCTION}");
     run_messages_usage(agent, messages, &request, turn, config, cancellation).await
 }
@@ -3952,7 +4078,183 @@ validation: ok
         .await
         .expect_err("an active workflow blocks /plan");
 
-        assert!(error.to_string().contains("active workflow"), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("still active"), "{text}");
+        assert!(text.contains("task: existing"), "{text}");
+        assert!(text.contains("/plan --new"), "{text}");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn split_new_flag_accepts_only_a_leading_flag() {
+        assert_eq!(split_new_flag("--new count lines"), (true, "count lines"));
+        assert_eq!(
+            split_new_flag("  --new   count lines"),
+            (true, "count lines")
+        );
+        assert_eq!(
+            split_new_flag("count --new lines"),
+            (false, "count --new lines")
+        );
+        assert_eq!(split_new_flag("--newer task"), (false, "--newer task"));
+        assert_eq!(split_new_flag("--new"), (true, ""));
+    }
+
+    fn human_texts(session: &Session) -> Vec<String> {
+        session
+            .replay_ui_events()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                UiEventKind::UserMessage {
+                    source: UiMessageSource::Human,
+                    text,
+                    ..
+                } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn valid_plan_output() -> &'static str {
+        "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+"
+    }
+
+    #[tokio::test]
+    async fn failed_plan_records_the_task_before_the_gate() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        store
+            .create_with_tasks("existing", None, Vec::new())
+            .expect("active workflow");
+        let mut session = Some(Session::new("session-plan-blocked").expect("session opens"));
+
+        let error = run_command_with_session(
+            PlanCommand::Plan("another task".to_owned()),
+            &PlanConfig::new(workspace.clone()),
+            Arc::new(PanicProvider),
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect_err("an active workflow blocks /plan");
+
+        assert!(error.to_string().contains("still active"), "{error}");
+        let session = session.expect("the session is returned");
+        assert_eq!(human_texts(&session), vec!["another task"]);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn plan_new_pauses_the_active_workflow_and_starts_another() {
+        let workspace = temp_workspace();
+        let store = WorkflowStore::new(&workspace);
+        let old = store
+            .create_with_tasks("existing", None, Vec::new())
+            .expect("active workflow");
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(FakeProvider::with_attempts(vec![text_response(
+                valid_plan_output(),
+            )]));
+        let mut session = Some(Session::new("session-plan-new").expect("session opens"));
+
+        let outcome = run_command_with_session(
+            PlanCommand::Plan("--new count lines".to_owned()),
+            &PlanConfig::new(workspace.clone()),
+            provider,
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect("plan --new succeeds");
+
+        let new_id = outcome.workflow_id.expect("new workflow id");
+        assert_ne!(new_id, old.workflow_id);
+        assert_eq!(
+            store.load(&old.workflow_id).expect("old workflow").status,
+            WorkflowStatus::Paused
+        );
+        assert_eq!(
+            store.active_id().expect("index readable").as_deref(),
+            Some(new_id.as_str())
+        );
+        let session = session.expect("the session is returned");
+        assert_eq!(human_texts(&session), vec!["count lines"]);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn rejected_answer_records_the_raw_argument() {
+        let workspace = temp_workspace();
+        let mut session = Some(Session::new("session-answer-blocked").expect("session opens"));
+
+        let error = run_command_with_session(
+            PlanCommand::Answer("#1 @answers.md".to_owned()),
+            &PlanConfig::new(workspace.clone()),
+            Arc::new(PanicProvider),
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect_err("no active workflow blocks /answer");
+
+        assert!(error.to_string().contains("no active workflow"), "{error}");
+        let session = session.expect("the session is returned");
+        assert_eq!(human_texts(&session), vec!["#1 @answers.md"]);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn rejected_hint_records_the_question() {
+        let workspace = temp_workspace();
+        let mut session = Some(Session::new("session-hint-blocked").expect("session opens"));
+
+        let error = run_command_with_session(
+            PlanCommand::Hint("why is this needed?".to_owned()),
+            &PlanConfig::new(workspace.clone()),
+            Arc::new(PanicProvider),
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect_err("no active workflow blocks /hint");
+
+        assert!(error.to_string().contains("no active workflow"), "{error}");
+        let session = session.expect("the session is returned");
+        assert_eq!(human_texts(&session), vec!["why is this needed?"]);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn rejected_distill_records_the_explanation() {
+        let workspace = temp_workspace();
+        let mut session = Some(Session::new("session-distill-blocked").expect("session opens"));
+
+        let error = run_command_with_session(
+            PlanCommand::Distill("I implemented it".to_owned()),
+            &PlanConfig::new(workspace.clone()),
+            Arc::new(PanicProvider),
+            None,
+            CancellationToken::new(),
+            &mut session,
+        )
+        .await
+        .expect_err("no active workflow blocks /distill");
+
+        assert!(error.to_string().contains("no active workflow"), "{error}");
+        let session = session.expect("the session is returned");
+        assert_eq!(human_texts(&session), vec!["I implemented it"]);
         let _ = fs::remove_dir_all(&workspace);
     }
 

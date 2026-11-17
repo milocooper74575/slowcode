@@ -119,7 +119,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/plan",
-        args: "<task>",
+        args: "[--new] <task>",
         description: "explore and navigate, then pause with a plan",
     },
     CommandSpec {

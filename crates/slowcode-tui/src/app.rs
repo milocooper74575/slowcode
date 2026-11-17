@@ -321,6 +321,7 @@ pub struct App {
     pending_login: Option<PendingLogin>,
     pending_mcp: Option<PendingMcpInstall>,
     pending_update: Option<PendingUpdate>,
+    pending_plan_new: Option<String>,
     available_update: Option<UpdateInfo>,
     update_check_requested: bool,
     mcp_busy: bool,
@@ -375,6 +376,7 @@ impl App {
             pending_login: None,
             pending_mcp: None,
             pending_update: None,
+            pending_plan_new: None,
             available_update: None,
             update_check_requested: false,
             mcp_busy: false,
@@ -409,6 +411,7 @@ impl App {
                 app.session_id
             )));
         }
+        app.announce_active_workflow();
         let status = credential_status(&app.workspace());
         if !status.configured() {
             app.push(MessageBlock::System(format!(
@@ -424,6 +427,25 @@ impl App {
         app.refresh_identity();
         app.recover_pending_approval();
         app
+    }
+
+    /// Surface a workflow that was left active by an earlier session.
+    ///
+    /// A stale active workflow blocks `/plan`; without this banner the first
+    /// sign of it is an error after the user typed a task.
+    fn announce_active_workflow(&mut self) {
+        let store = WorkflowStore::new(&self.workspace());
+        let Ok(Some(state)) = store.load_active() else {
+            return;
+        };
+        self.plan_phase = Some(state.phase);
+        self.plan_workflow = Some(state.workflow_id.clone());
+        self.push(MessageBlock::System(format!(
+            "active workflow {} ({}, {} open question(s)); /status for the next action, /plan --new <task> to pause it and start over",
+            state.workflow_id,
+            state.phase,
+            state.open_questions().len()
+        )));
     }
 
     fn recover_pending_approval(&mut self) {
@@ -1070,6 +1092,7 @@ impl App {
             || self.pending_skill.is_some()
             || self.pending_feedback.is_some()
             || self.pending_mcp.is_some()
+            || self.pending_plan_new.is_some()
         {
             self.composer.clear();
             self.composer_cursor = 0;
@@ -1088,6 +1111,26 @@ impl App {
         self.scroll_to_bottom();
 
         if let Some(command) = command {
+            if let Command::Plan(task) = &command
+                && !self.running
+            {
+                let (start_new, new_task) = slowcode_app::plan::split_new_flag(task);
+                if start_new
+                    && !new_task.trim().is_empty()
+                    && let Ok(Some(active)) = WorkflowStore::new(&self.workspace()).load_active()
+                {
+                    self.messages.push(MessageBlock::Prompt(format!(
+                        "start a new plan and pause workflow {} ({}, {} open question(s))?\nnew task: {}\n\nreply y to continue, n to cancel",
+                        active.workflow_id,
+                        active.phase,
+                        active.open_questions().len(),
+                        new_task.trim()
+                    )));
+                    self.scroll_to_bottom();
+                    self.pending_plan_new = Some(task.clone());
+                    return KeyAction::none();
+                }
+            }
             if echoes_command_locally(&command, self.active_phase()) {
                 self.messages.push(MessageBlock::User(input));
                 self.stick_to_bottom();
@@ -1137,6 +1180,30 @@ impl App {
     }
 
     async fn respond_to_prompt(&mut self, input: &str) {
+        if let Some(task) = self.pending_plan_new.take() {
+            match parse_yes_no(input) {
+                YesNoReply::Yes => {
+                    self.push_system(
+                        "starting a new plan; the previous workflow is paused".to_owned(),
+                    );
+                    self.handle_plan_command(Command::Plan(task)).await;
+                }
+                YesNoReply::No => {
+                    self.push(MessageBlock::System(
+                        "plan --new cancelled; the active workflow is unchanged".to_owned(),
+                    ));
+                }
+                YesNoReply::Invalid => {
+                    self.messages.push(MessageBlock::System(
+                        "reply y to start a new plan, n to cancel".to_owned(),
+                    ));
+                    self.scroll_to_bottom();
+                    self.pending_plan_new = Some(task);
+                }
+            }
+            return;
+        }
+
         if let Some(record) = self.recovered_approval.take() {
             self.handle_recovered_approval(input, record);
             self.scroll_to_bottom();
@@ -3122,7 +3189,9 @@ fn command_help_text(name: &str, args: &str, description: &str) -> String {
         "/update" => text.push_str(
             "\nchecks the latest release, then asks before downloading and replacing the binary\nthe model cannot trigger it; pass --check to `slowcode update` to only report\nexample: /update",
         ),
-        "/plan" => text.push_str("\nexample: /plan add a line-count summary to notes.txt"),
+        "/plan" => text.push_str(
+            "\nexample: /plan add a line-count summary to notes.txt\nexample: /plan --new <task> pauses the active workflow and starts over",
+        ),
         _ => {}
     }
     text
@@ -5888,6 +5957,148 @@ mod tests {
         assert!(is_plan_command(&Command::Hint("why".to_owned())));
         assert!(!is_plan_command(&Command::Help(None)));
         assert!(!is_plan_command(&Command::Model(None)));
+    }
+
+    async fn app_in(
+        workspace: PathBuf,
+    ) -> (
+        App,
+        slowcode_kernel::ui::UiEventReceiver,
+        mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let guard = SESSION_ROOT_LOCK.lock().await;
+        let root = unique_temp_dir("app-live");
+        unsafe { std::env::set_var("DSH_SESSION_ROOT", root.join("sessions")) };
+        let started = Runtime::start(RuntimeConfig::new(workspace), SessionChoice::New)
+            .await
+            .expect("runtime");
+        unsafe { std::env::remove_var("DSH_SESSION_ROOT") };
+        drop(guard);
+
+        let model = started.runtime.model().to_owned();
+        let role = started
+            .runtime
+            .role()
+            .map(|role| role.as_str().to_owned())
+            .unwrap_or_else(|| "driver".to_owned());
+        let (app_tx, app_rx) = mpsc::unbounded_channel();
+        let app = App::new(
+            Arc::new(Mutex::new(started.runtime)),
+            started.session_id,
+            model,
+            role,
+            started.history,
+            app_tx,
+        );
+        (app, started.events, app_rx)
+    }
+
+    fn seeded_workspace(tag: &str, task: &str) -> (PathBuf, slowcode_app::workflow::WorkflowState) {
+        let root = unique_temp_dir(tag);
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join(".env"),
+            "DEEPSEEK_API_KEY=sk-test-secret-123\n",
+        )
+        .expect("credential fixture");
+        let state = WorkflowStore::new(&workspace)
+            .create_with_tasks(task, None, Vec::new())
+            .expect("active workflow");
+        (workspace, state)
+    }
+
+    fn message_text(message: &MessageBlock) -> Option<&str> {
+        match message {
+            MessageBlock::System(text)
+            | MessageBlock::Prompt(text)
+            | MessageBlock::User(text)
+            | MessageBlock::Assistant(text)
+            | MessageBlock::Error(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_new_requires_confirmation_before_pausing() {
+        let (workspace, state) = seeded_workspace("plan-new-confirm", "old task");
+        let store = WorkflowStore::new(&workspace);
+        let (mut app, _, _) = app_in(workspace.clone()).await;
+
+        app.composer = "/plan --new another task".to_owned();
+        app.composer_cursor = app.composer.len();
+        app.submit().await;
+
+        assert!(app.pending_plan_new.is_some());
+        assert!(app.messages.iter().any(|message| {
+            message_text(message)
+                .is_some_and(|text| text.contains("another task") && text.contains("pause"))
+        }));
+        assert_eq!(
+            store.load(&state.workflow_id).expect("state").status,
+            slowcode_app::workflow::WorkflowStatus::Active
+        );
+
+        app.composer = "n".to_owned();
+        app.composer_cursor = 1;
+        app.submit().await;
+
+        assert!(app.pending_plan_new.is_none());
+        assert_eq!(
+            store.load(&state.workflow_id).expect("state").status,
+            slowcode_app::workflow::WorkflowStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_announces_an_active_workflow() {
+        let (workspace, state) = seeded_workspace("active-start", "old task");
+        let (app, _, _) = app_in(workspace.clone()).await;
+
+        assert_eq!(app.plan_phase, Some(state.phase));
+        assert!(app.messages.iter().any(|message| {
+            message_text(message).is_some_and(|text| {
+                text.contains("active workflow") && text.contains(&state.workflow_id)
+            })
+        }));
+        let _ = std::fs::remove_dir_all(workspace.parent().expect("root"));
+    }
+
+    #[tokio::test]
+    async fn failed_plan_shows_the_typed_task_before_the_error() {
+        let (workspace, state) = seeded_workspace("plan-blocked-ui", "old task");
+        let (mut app, mut events, mut app_rx) = app_in(workspace.clone()).await;
+
+        app.composer = "/plan another task".to_owned();
+        app.composer_cursor = app.composer.len();
+        app.submit().await;
+
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), app_rx.recv())
+            .await
+            .expect("plan command finishes")
+            .expect("plan event arrives");
+        while let Ok(event) = events.try_recv() {
+            app.handle_ui_event(event);
+        }
+        app.handle_app_event(finished);
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message_text(message) == Some("another task")),
+            "the typed task is visible even though the command was rejected"
+        );
+        assert!(app.messages.iter().any(|message| {
+            message_text(message).is_some_and(|text| text.contains("still active"))
+        }));
+        assert_eq!(
+            WorkflowStore::new(&workspace)
+                .load(&state.workflow_id)
+                .expect("state")
+                .status,
+            slowcode_app::workflow::WorkflowStatus::Active
+        );
+        let _ = std::fs::remove_dir_all(workspace.parent().expect("root"));
     }
 
     #[test]

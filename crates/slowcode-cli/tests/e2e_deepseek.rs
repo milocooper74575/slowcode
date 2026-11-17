@@ -132,3 +132,101 @@ fn plan_produces_a_table_and_pauses() {
     println!("stderr:\n{stderr}");
     let _ = fs::remove_dir_all(&workspace);
 }
+
+#[test]
+#[ignore = "requires DEEPSEEK_API_KEY and makes two real API calls"]
+fn plan_new_pauses_the_previous_workflow() {
+    let root = repo_root();
+    let _ = dotenvy::from_path(root.join(".env"));
+    assert!(
+        std::env::var_os("DEEPSEEK_API_KEY").is_some(),
+        "DEEPSEEK_API_KEY is missing; put it in {} or export it",
+        root.join(".env").display()
+    );
+
+    let workspace = temp_workspace();
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n").expect("fixture is written");
+
+    let run = |prompt: &str| {
+        Command::new(env!("CARGO_BIN_EXE_slowcode"))
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--model")
+            .arg(
+                std::env::var("SLOWCODE_E2E_MODEL").unwrap_or_else(|_| "deepseek-flash".to_owned()),
+            )
+            .arg("--max-tokens")
+            .arg("32768")
+            .arg(prompt)
+            .output()
+            .expect("slowcode binary runs")
+    };
+
+    let first =
+        run("/plan 为 notes.txt 增加一个统计行数的函数，并说明哪些核心逻辑需要用户自己实现。");
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first.status.success(),
+        "first /plan failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let index_path = workspace.join(".scratch/workflows/index.json");
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(&index_path).expect("index is readable"))
+            .expect("index is JSON");
+    let old_id = index["active"]
+        .as_str()
+        .expect("the first plan is active")
+        .to_owned();
+
+    let second = run(
+        "/plan --new 为 notes.txt 增加一个统计单词数的函数，并说明哪些核心逻辑需要用户自己实现。",
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "/plan --new failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(&index_path).expect("index is readable"))
+            .expect("index is JSON");
+    let new_id = index["active"]
+        .as_str()
+        .expect("the second plan is active")
+        .to_owned();
+    assert_ne!(new_id, old_id);
+    let old_state: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            workspace
+                .join(".scratch/workflows")
+                .join(&old_id)
+                .join("state.json"),
+        )
+        .expect("old state is readable"),
+    )
+    .expect("old state is JSON");
+    assert_eq!(
+        old_state["status"].as_str(),
+        Some("paused"),
+        "the previous workflow is paused, not ended"
+    );
+
+    let third = run("/plan 再增加一个别的函数。");
+    let stdout = String::from_utf8_lossy(&third.stdout);
+    let stderr = String::from_utf8_lossy(&third.stderr);
+    assert!(
+        !third.status.success(),
+        "a third /plan must be rejected\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("still active") && stderr.contains("/plan --new"),
+        "the rejection names the active workflow and the flag\nstderr:\n{stderr}"
+    );
+
+    println!("stdout:\n{stdout}");
+    println!("stderr:\n{stderr}");
+    let _ = fs::remove_dir_all(&workspace);
+}

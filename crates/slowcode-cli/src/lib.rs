@@ -61,7 +61,7 @@ Without PROMPT, slowcode starts the TUI. Use `slowcode repl` for the line-based
 REPL; type `exit` or `quit` there to leave.
 
 Commands:
-  /plan <task>             Explore + Navigate, write a plan artifact, then pause
+  /plan [--new] <task>     Explore + Navigate, write a plan artifact, then pause
   /answer <text>           Record decisions and reclassify the plan
   /scaffold                Generate scaffolds for 待用户实现 tasks
   /continue                Check the core implementation and enter test fix
