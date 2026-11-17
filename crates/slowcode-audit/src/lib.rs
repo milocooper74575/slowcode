@@ -134,6 +134,7 @@ pub struct SessionView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepeatedRead {
     pub path: String,
+    pub arguments: String,
     pub redundant: usize,
     pub calls: Vec<CallRef>,
 }
@@ -536,40 +537,56 @@ pub fn signals(view: &SessionView) -> Signals {
 }
 
 fn repeated_reads(view: &SessionView) -> Vec<RepeatedRead> {
-    let mut open: HashMap<String, Vec<&ToolCall>> = HashMap::new();
+    // Key by path and arguments so a different slice of the same file is not
+    // counted as a repeated read.
+    let mut open: HashMap<(String, String), Vec<&ToolCall>> = HashMap::new();
     let mut groups: Vec<RepeatedRead> = Vec::new();
 
     for call in &view.calls {
         match call.name.as_str() {
             "read" => {
                 if let Some(path) = file_path(call) {
-                    open.entry(path.to_owned()).or_default().push(call);
+                    open.entry((path.to_owned(), call.arguments_key.clone()))
+                        .or_default()
+                        .push(call);
                 }
             }
             "write" | "edit" => {
-                if let Some(path) = file_path(call)
-                    && let Some(group) = open.remove(path)
-                {
-                    push_read_group(&mut groups, path, group);
+                if let Some(path) = file_path(call) {
+                    let keys: Vec<(String, String)> = open
+                        .keys()
+                        .filter(|(key_path, _)| key_path == path)
+                        .cloned()
+                        .collect();
+                    for key in keys {
+                        if let Some(group) = open.remove(&key) {
+                            push_read_group(&mut groups, &key, group);
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
-    for (path, group) in open {
-        push_read_group(&mut groups, &path, group);
+    for (key, group) in open {
+        push_read_group(&mut groups, &key, group);
     }
     groups.sort_by_key(|group| group.calls.first().map(|call| call.seq).unwrap_or(0));
     groups
 }
 
-fn push_read_group(groups: &mut Vec<RepeatedRead>, path: &str, group: Vec<&ToolCall>) {
+fn push_read_group(
+    groups: &mut Vec<RepeatedRead>,
+    (path, arguments): &(String, String),
+    group: Vec<&ToolCall>,
+) {
     if group.len() < 2 {
         return;
     }
     let calls: Vec<CallRef> = group.iter().map(|call| call_ref(call)).collect();
     groups.push(RepeatedRead {
         path: path.to_owned(),
+        arguments: arguments.clone(),
         redundant: group.len() - 1,
         calls,
     });
@@ -761,8 +778,9 @@ pub fn render_report(view: &SessionView, signals: &Signals) -> String {
                 .map(|call| format!("t{}/s{} seq {}", call.turn, call.step, call.seq))
                 .collect();
             out.push_str(&format!(
-                "- `{}`: {} reads, {} redundant ({}). Reuse the first result.\n",
+                "- `{}` {}: {} identical reads, {} redundant ({}). Reuse the first result.\n",
                 group.path,
+                group.arguments,
                 group.calls.len(),
                 group.redundant,
                 locations.join(", ")
@@ -977,6 +995,32 @@ mod tests {
             result(4, "c2", "written", false),
             call(5, 1, 3, "c3", "read", json!({"file_path": "a.rs"})),
             result(6, "c3", "fn b", false),
+        ]));
+        assert!(signals(&view).repeated_reads.is_empty());
+    }
+
+    #[test]
+    fn different_slices_of_one_file_are_not_repeated_reads() {
+        let view = parse_session(&journal(vec![
+            header(),
+            call(
+                1,
+                1,
+                1,
+                "c1",
+                "read",
+                json!({"file_path": "a.rs", "limit": 400}),
+            ),
+            result(2, "c1", "lines 1-400", false),
+            call(
+                3,
+                1,
+                2,
+                "c2",
+                "read",
+                json!({"file_path": "a.rs", "offset": 400, "limit": 450}),
+            ),
+            result(4, "c2", "lines 400-850", false),
         ]));
         assert!(signals(&view).repeated_reads.is_empty());
     }
