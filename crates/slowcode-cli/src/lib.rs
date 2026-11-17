@@ -63,6 +63,8 @@ REPL; type `exit` or `quit` there to leave.
 Commands:
   /plan [--new] <task>     Explore + Navigate, write a plan artifact, then pause
   /answer <text>           Record decisions and reclassify the plan
+  /approve                 Accept the review table and continue
+  /workflow [selector]     Show workflow state or set a test selector
   /scaffold                Generate scaffolds for 待用户实现 tasks
   /continue                Check the core implementation and enter test fix
   /execute                 Execute only 可执行 tasks
@@ -222,6 +224,8 @@ pub async fn run_with_provider(
                 | SlashCommand::Fix
                 | SlashCommand::Execute
                 | SlashCommand::Distill(_)
+                | SlashCommand::Approve
+                | SlashCommand::Workflow(_)
         )
     );
     if plan_command && options.session.is_some() {
@@ -281,6 +285,17 @@ pub async fn run_with_provider(
             println!("{}", outcome.output);
             return Ok(());
         }
+        Some(SlashCommand::Approve) => {
+            let outcome = Box::pin(run_plan_command(
+                slowcode_app::plan::PlanCommand::Approve,
+                &options,
+                None,
+                provider,
+            ))
+            .await?;
+            println!("{}", outcome.output);
+            return Ok(());
+        }
         Some(SlashCommand::Status(argument)) => {
             let argument = (!argument.is_empty()).then(|| argument.to_owned());
             let outcome = Box::pin(run_plan_command(
@@ -296,6 +311,18 @@ pub async fn run_with_provider(
         Some(SlashCommand::Next) => {
             let outcome = Box::pin(run_plan_command(
                 slowcode_app::plan::PlanCommand::Next,
+                &options,
+                None,
+                provider,
+            ))
+            .await?;
+            println!("{}", outcome.output);
+            return Ok(());
+        }
+        Some(SlashCommand::Workflow(argument)) => {
+            let argument = (!argument.is_empty()).then(|| argument.to_owned());
+            let outcome = Box::pin(run_plan_command(
+                slowcode_app::plan::PlanCommand::Workflow(argument),
                 &options,
                 None,
                 provider,
@@ -735,8 +762,10 @@ enum SlashCommand<'a> {
     Fix,
     Execute,
     Distill(&'a str),
+    Approve,
     Status(&'a str),
     Next,
+    Workflow(&'a str),
     Role(&'a str),
 }
 
@@ -754,11 +783,20 @@ fn split_command(input: &str) -> Option<SlashCommand<'_>> {
         "/fix" => Some(SlashCommand::Fix),
         "/execute" => Some(SlashCommand::Execute),
         "/distill" => Some(SlashCommand::Distill(rest)),
+        "/approve" => Some(SlashCommand::Approve),
         "/status" => Some(SlashCommand::Status(rest)),
         "/next" => Some(SlashCommand::Next),
+        "/workflow" => Some(SlashCommand::Workflow(rest)),
         "/role" => Some(SlashCommand::Role(rest)),
         _ => None,
     }
+}
+
+fn command_updates_plan(command: &SlashCommand<'_>) -> bool {
+    matches!(
+        command,
+        SlashCommand::Plan(_) | SlashCommand::Answer(_) | SlashCommand::Distill(_)
+    )
 }
 
 async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box<dyn Error>> {
@@ -781,6 +819,7 @@ async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box
             break;
         }
         if let Some(command) = split_command(line) {
+            let updates_plan = command_updates_plan(&command);
             let result = match command {
                 SlashCommand::Plan(task) => {
                     run_plan_command_with_optional_session(
@@ -862,6 +901,16 @@ async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box
                     )
                     .await
                 }
+                SlashCommand::Approve => {
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Approve,
+                        options,
+                        pending_plan.as_deref(),
+                        Arc::clone(&plan_provider),
+                        Some(session),
+                    )
+                    .await
+                }
                 SlashCommand::Status(argument) => {
                     let argument = (!argument.is_empty()).then(|| argument.to_owned());
                     run_plan_command_with_optional_session(
@@ -883,6 +932,17 @@ async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box
                     )
                     .await
                 }
+                SlashCommand::Workflow(argument) => {
+                    let argument = (!argument.is_empty()).then(|| argument.to_owned());
+                    run_plan_command_with_optional_session(
+                        slowcode_app::plan::PlanCommand::Workflow(argument),
+                        options,
+                        None,
+                        Arc::clone(&plan_provider),
+                        Some(session),
+                    )
+                    .await
+                }
                 SlashCommand::Role(argument) => {
                     if let Err(error) = run_role_command(session, argument).await {
                         eprintln!("error: {error}");
@@ -893,7 +953,9 @@ async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box
             match result {
                 Ok(outcome) => {
                     println!("{}", outcome.output);
-                    pending_plan = Some(outcome.path);
+                    if updates_plan {
+                        pending_plan = Some(outcome.path);
+                    }
                 }
                 Err(error) => eprintln!("error: {error}"),
             }
@@ -1048,16 +1110,35 @@ mod tests {
             Some(SlashCommand::Distill("because"))
         ));
         assert!(matches!(
+            split_command("/approve"),
+            Some(SlashCommand::Approve)
+        ));
+        assert!(matches!(
             split_command("/status --workflow plan-1"),
             Some(SlashCommand::Status("--workflow plan-1"))
         ));
         assert!(matches!(split_command("/next"), Some(SlashCommand::Next)));
+        assert!(matches!(
+            split_command("/workflow selector"),
+            Some(SlashCommand::Workflow("selector"))
+        ));
+        assert!(matches!(
+            split_command("/workflow"),
+            Some(SlashCommand::Workflow(""))
+        ));
         assert!(matches!(
             split_command("/role navigator"),
             Some(SlashCommand::Role("navigator"))
         ));
         assert!(split_command("/planet").is_none());
         assert!(split_command("plan it").is_none());
+
+        assert!(command_updates_plan(&SlashCommand::Plan("x")));
+        assert!(command_updates_plan(&SlashCommand::Answer("x")));
+        assert!(command_updates_plan(&SlashCommand::Distill("x")));
+        assert!(!command_updates_plan(&SlashCommand::Approve));
+        assert!(!command_updates_plan(&SlashCommand::Workflow("selector")));
+        assert!(!command_updates_plan(&SlashCommand::Status("")));
     }
 
     struct PlanProvider {
