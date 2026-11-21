@@ -115,12 +115,18 @@ async fn run_headless(options: CliOptions) -> ExitCode {
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_path(options.workspace.join(".env"));
     let status = slowcode_app::credential_status(&options.workspace);
-    if !status.configured() {
+    // Fail before building the session only when this prompt actually needs
+    // the model. Local commands, and the REPL itself, stay usable.
+    let needs_credential = options
+        .prompt
+        .as_deref()
+        .is_some_and(slowcode_cli::prompt_requires_model);
+    if needs_credential && !status.configured() {
         eprintln!(
             "error: no DeepSeek API key is configured\n\
              \n\
              Fix it with any of these:\n\
-             \x20 1. run `slowcode` and type /login to save the key to {}\n\
+             \x20 1. run `slowcode` or `slowcode repl` and type /login to save the key to {}\n\
              \x20 2. export DEEPSEEK_API_KEY=<key>\n\
              \x20 3. add DEEPSEEK_API_KEY=<key> to {}",
             status.env_path.display(),

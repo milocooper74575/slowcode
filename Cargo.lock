@@ -2135,6 +2135,7 @@ version = "0.1.1"
 dependencies = [
  "dotenvy",
  "futures-util",
+ "rustix 1.1.4",
  "serde_json",
  "slowcode-app",
  "slowcode-cognition",

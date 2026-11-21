@@ -17,6 +17,10 @@ use std::{
     },
 };
 
+use slowcode_app::{
+    CredentialSourceKind, command_requires_model, command_specs, credential_status, remove_api_key,
+    save_api_key,
+};
 use slowcode_kernel::{
     agent::{
         ApprovalFuture, ApprovalProvider, ApprovalProviderError, ApprovalRequest, TurnOutcome,
@@ -61,6 +65,11 @@ Without PROMPT, slowcode starts the TUI. Use `slowcode repl` for the line-based
 REPL; type `exit` or `quit` there to leave.
 
 Commands:
+  /help                    List the commands available in the REPL
+  /status [--workflow ID]  Show the active workflow phase and next action
+  /next                    Show the next question or phase action
+  /login                   Save a DeepSeek API key without echoing it
+  /logout                  Remove the workspace API key
   /plan [--new] <task>     Explore + Navigate, write a plan artifact, then pause
   /answer <text>           Record decisions and reclassify the plan
   /approve                 Accept the review table and continue
@@ -237,6 +246,18 @@ pub async fn run_with_provider(
     }
 
     match command {
+        Some(SlashCommand::Help) => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Some(SlashCommand::Login) => {
+            repl_login(&options.workspace);
+            return Ok(());
+        }
+        Some(SlashCommand::Logout) => {
+            repl_logout(&options.workspace);
+            return Ok(());
+        }
         Some(SlashCommand::Plan(task)) => {
             let outcome = Box::pin(run_plan_with_provider(&options, provider, task)).await?;
             println!("{}", outcome.output);
@@ -754,6 +775,9 @@ async fn run_plan_command_with_optional_session(
 }
 
 enum SlashCommand<'a> {
+    Help,
+    Login,
+    Logout,
     Plan(&'a str),
     Answer(&'a str),
     Scaffold,
@@ -775,6 +799,9 @@ fn split_command(input: &str) -> Option<SlashCommand<'_>> {
     let name = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
     match name {
+        "/help" => Some(SlashCommand::Help),
+        "/login" => Some(SlashCommand::Login),
+        "/logout" => Some(SlashCommand::Logout),
         "/plan" => Some(SlashCommand::Plan(rest)),
         "/answer" => Some(SlashCommand::Answer(rest)),
         "/scaffold" => Some(SlashCommand::Scaffold),
@@ -792,6 +819,33 @@ fn split_command(input: &str) -> Option<SlashCommand<'_>> {
     }
 }
 
+impl SlashCommand<'_> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Help => "/help",
+            Self::Login => "/login",
+            Self::Logout => "/logout",
+            Self::Plan(_) => "/plan",
+            Self::Answer(_) => "/answer",
+            Self::Scaffold => "/scaffold",
+            Self::Continue => "/continue",
+            Self::Test => "/test",
+            Self::Fix => "/fix",
+            Self::Execute => "/execute",
+            Self::Distill(_) => "/distill",
+            Self::Approve => "/approve",
+            Self::Status(_) => "/status",
+            Self::Next => "/next",
+            Self::Workflow(_) => "/workflow",
+            Self::Role(_) => "/role",
+        }
+    }
+
+    fn requires_model(&self) -> bool {
+        command_requires_model(self.name())
+    }
+}
+
 fn command_updates_plan(command: &SlashCommand<'_>) -> bool {
     matches!(
         command,
@@ -799,11 +853,31 @@ fn command_updates_plan(command: &SlashCommand<'_>) -> bool {
     )
 }
 
+/// Whether this prompt needs a model credential before it can start.
+///
+/// Plain text is a model turn. A recognized local command is not. Unknown
+/// slash commands are treated as plain text because the REPL forwards them.
+#[must_use]
+pub fn prompt_requires_model(prompt: &str) -> bool {
+    match split_command(prompt) {
+        Some(command) => command.requires_model(),
+        None => true,
+    }
+}
+
 async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
     let mut turn = 0_u64;
     let mut pending_plan: Option<PathBuf> = None;
     let plan_provider = session.provider();
+    let credential = credential_status(&options.workspace);
+    if !credential.configured() {
+        eprintln!(
+            "credential: not configured; local commands work, model commands will fail. \
+             Use /login or set {}.",
+            slowcode_app::API_KEY_ENV
+        );
+    }
     loop {
         print!("slowcode> ");
         io::stdout().flush()?;
@@ -819,8 +893,28 @@ async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box
             break;
         }
         if let Some(command) = split_command(line) {
+            if command.requires_model() && !credential_status(&options.workspace).configured() {
+                eprintln!(
+                    "error: {} needs a model credential. Use /login or set {}.",
+                    command.name(),
+                    slowcode_app::API_KEY_ENV
+                );
+                continue;
+            }
             let updates_plan = command_updates_plan(&command);
             let result = match command {
+                SlashCommand::Help => {
+                    print_repl_help();
+                    continue;
+                }
+                SlashCommand::Login => {
+                    repl_login(&options.workspace);
+                    continue;
+                }
+                SlashCommand::Logout => {
+                    repl_logout(&options.workspace);
+                    continue;
+                }
                 SlashCommand::Plan(task) => {
                     run_plan_command_with_optional_session(
                         slowcode_app::plan::PlanCommand::Plan(task.to_owned()),
@@ -962,9 +1056,134 @@ async fn repl(session: &mut RoleSession, options: &CliOptions) -> Result<(), Box
             continue;
         }
         turn += 1;
+        if !credential_status(&options.workspace).configured() {
+            eprintln!(
+                "error: a model turn needs a model credential. Use /login or set {}.",
+                slowcode_app::API_KEY_ENV
+            );
+            continue;
+        }
         run_prompt(session, line, turn).await?;
     }
     Ok(())
+}
+
+/// Commands the line-based REPL understands.
+const REPL_COMMANDS: &[&str] = &[
+    "/help",
+    "/status",
+    "/next",
+    "/workflow",
+    "/role",
+    "/login",
+    "/logout",
+    "/plan",
+    "/answer",
+    "/scaffold",
+    "/continue",
+    "/test",
+    "/fix",
+    "/execute",
+    "/distill",
+    "/approve",
+];
+
+fn print_repl_help() {
+    println!("REPL commands:");
+    for spec in command_specs()
+        .iter()
+        .filter(|spec| REPL_COMMANDS.contains(&spec.name))
+    {
+        let usage = if spec.args.is_empty() {
+            spec.name.to_owned()
+        } else {
+            format!("{} {}", spec.name, spec.args)
+        };
+        println!("  {usage:<28} {}", spec.description);
+    }
+    println!("  {:<28} leave the REPL", "exit | quit");
+}
+
+fn repl_login(workspace: &Path) {
+    let status = credential_status(workspace);
+    let source = match status.source {
+        CredentialSourceKind::WorkspaceEnv => "workspace .env",
+        CredentialSourceKind::Environment => "environment",
+        CredentialSourceKind::Missing => "not configured",
+    };
+    println!("credential: {source}");
+    let key = match read_hidden_key() {
+        Ok(key) => key,
+        Err(error) => {
+            eprintln!("login: {error}");
+            return;
+        }
+    };
+    if key.is_empty() {
+        eprintln!("login: empty key; nothing saved");
+        return;
+    }
+    match save_api_key(workspace, &key) {
+        Ok(path) => println!(
+            "login: saved to {} with mode 0600; the key is never printed",
+            path.display()
+        ),
+        Err(error) => eprintln!("login: {error}"),
+    }
+}
+
+fn repl_logout(workspace: &Path) {
+    match remove_api_key(workspace) {
+        Ok(true) => println!(
+            "logout: removed {} from {}",
+            slowcode_app::API_KEY_ENV,
+            workspace.join(".env").display()
+        ),
+        Ok(false) => {
+            let status = credential_status(workspace);
+            if status.configured() {
+                println!(
+                    "logout: no key in the workspace .env; the current key comes from the \
+                     environment. Unset {} to remove it.",
+                    slowcode_app::API_KEY_ENV
+                );
+            } else {
+                println!("logout: no credential is configured");
+            }
+        }
+        Err(error) => eprintln!("logout: {error}"),
+    }
+}
+
+fn read_hidden_key() -> io::Result<String> {
+    use rustix::termios::{LocalModes, OptionalActions};
+
+    let stdin = rustix::stdio::stdin();
+    if !rustix::termios::isatty(stdin) {
+        return Err(io::Error::other(
+            "cannot read a hidden key without a terminal; set DEEPSEEK_API_KEY or edit the \
+             workspace .env",
+        ));
+    }
+    let original = rustix::termios::tcgetattr(stdin).map_err(termios_error)?;
+    let mut hidden = original.clone();
+    hidden.local_modes.remove(LocalModes::ECHO);
+    rustix::termios::tcsetattr(stdin, OptionalActions::Now, &hidden).map_err(termios_error)?;
+
+    eprint!("DeepSeek API key (input hidden): ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line);
+    let restore =
+        rustix::termios::tcsetattr(stdin, OptionalActions::Now, &original).map_err(termios_error);
+    eprintln!();
+    read?;
+    restore?;
+    Ok(line.trim().to_owned())
+}
+
+fn termios_error(error: rustix::io::Errno) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 fn print_outcome(outcome: &TurnOutcome, cache: Option<&CacheReport>) {
@@ -1083,6 +1302,17 @@ mod tests {
         assert!(config.read_only);
         assert_eq!(config.workspace, PathBuf::from("/tmp/work"));
         assert!(config.base_system_prompt.contains("slowcode"));
+    }
+
+    #[test]
+    fn only_model_prompts_need_a_credential_up_front() {
+        assert!(prompt_requires_model("read hello.txt"));
+        assert!(prompt_requires_model("/plan do it"));
+        assert!(!prompt_requires_model("/status"));
+        assert!(!prompt_requires_model("/role navigator"));
+        assert!(!prompt_requires_model("/login"));
+        assert!(!prompt_requires_model("/logout"));
+        assert!(!prompt_requires_model("/help"));
     }
 
     #[test]

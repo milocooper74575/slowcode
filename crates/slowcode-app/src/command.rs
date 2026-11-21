@@ -56,6 +56,65 @@ pub struct CommandSpec {
     pub description: &'static str,
 }
 
+/// Commands whose first action may call the model.
+///
+/// Keep every command in exactly one of this list and [`LOCAL_COMMANDS`].
+/// The REPL uses this table to fail at the command boundary instead of
+/// discovering a missing credential inside a model turn.
+const MODEL_COMMANDS: &[&str] = &[
+    "/plan",
+    "/answer",
+    "/scaffold",
+    "/continue",
+    "/test",
+    "/fix",
+    "/execute",
+    "/distill",
+    "/approve",
+    "/reclassify",
+    "/hint",
+    "/ask",
+];
+
+/// Commands that never call the model.
+const LOCAL_COMMANDS: &[&str] = &[
+    "/help",
+    "/model",
+    "/session",
+    "/role",
+    "/context",
+    "/cache",
+    "/login",
+    "/logout",
+    "/skills",
+    "/mcp",
+    "/feedback",
+    "/update",
+    "/status",
+    "/next",
+    "/workflow",
+    "/quit",
+];
+
+impl CommandSpec {
+    /// Whether starting this command may call the model.
+    #[must_use]
+    pub fn requires_model(&self) -> bool {
+        command_requires_model(self.name)
+    }
+}
+
+/// Whether a command name may call the model.
+///
+/// Unknown names are treated as local: the caller must reject them anyway.
+#[must_use]
+pub fn command_requires_model(name: &str) -> bool {
+    if LOCAL_COMMANDS.contains(&name) {
+        return false;
+    }
+    MODEL_COMMANDS.contains(&name)
+}
+
 /// Commands available in the TUI. Order is stable for rendering.
 pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
@@ -568,6 +627,33 @@ mod tests {
     #[test]
     fn ordinary_prompt_is_not_a_command() {
         assert_eq!(parse_command("read hello.txt"), None);
+    }
+
+    #[test]
+    fn every_command_declares_whether_it_needs_the_model() {
+        for spec in COMMAND_SPECS {
+            let model = MODEL_COMMANDS.contains(&spec.name);
+            let local = LOCAL_COMMANDS.contains(&spec.name);
+            assert_ne!(
+                model, local,
+                "{} must appear in exactly one capability list",
+                spec.name
+            );
+            assert_eq!(spec.requires_model(), model);
+        }
+        assert_eq!(
+            MODEL_COMMANDS.len() + LOCAL_COMMANDS.len(),
+            COMMAND_SPECS.len(),
+            "a command is missing from both capability lists"
+        );
+    }
+
+    #[test]
+    fn plan_commands_need_the_model_but_status_does_not() {
+        assert!(command_requires_model("/plan"));
+        assert!(command_requires_model("/execute"));
+        assert!(!command_requires_model("/status"));
+        assert!(!command_requires_model("/role"));
     }
 
     #[test]
