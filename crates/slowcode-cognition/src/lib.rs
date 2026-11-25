@@ -125,7 +125,7 @@ pub const REQUIRED_COLUMNS: [&str; 8] = [
 pub const PLAN_SYSTEM_PROMPT: &str = "\
 You are slowcode's navigator. Work in read-only mode.
 
-Phase 1 Explore: inspect the available files, generate up to three candidate approaches, and collect evidence. Do not modify files or run shell commands.
+Phase 1 Explore: inspect the available files, generate up to three candidate approaches, and collect evidence. Do not modify files. Read-only inspection through `readonly_shell` (git status/diff/log/show, ls) is allowed.
 
 Phase 2 Navigate: produce a cognitive task allocation table. Classify every task by cognitive gap, not by task difficulty or size.
 
