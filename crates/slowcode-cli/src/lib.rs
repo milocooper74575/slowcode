@@ -4,6 +4,7 @@
 //! and the read/write/edit/bash tool registry. It does not implement a TUI or
 //! token streaming.
 
+pub mod audit;
 pub mod feedback;
 pub mod update;
 
@@ -46,6 +47,7 @@ Usage:
   slowcode repl [OPTIONS]            Start the line-based REPL
   slowcode update [--check]          Check for or install a newer release
   slowcode feedback SESSION-ID       Write an issue-ready feedback bundle
+  slowcode audit rebuild [ID|--all]  Rebuild local workflow audit sites
   slowcode [OPTIONS] [PROMPT...]     Legacy headless form
 
 Options:

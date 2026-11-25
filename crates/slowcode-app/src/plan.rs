@@ -355,6 +355,16 @@ impl PlanSession {
         self.session = Some(session);
     }
 
+    /// Durable id of the shared conversation session, when the caller supplied
+    /// one. Ephemeral Plan sessions use a descriptive id and are not linked to
+    /// a journal.
+    fn durable_session_id(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .map(|session| session.id().to_string())
+            .filter(|id| id.starts_with("session-"))
+    }
+
     fn into_session(self) -> Option<Session> {
         if self.reuse { self.session } else { None }
     }
@@ -708,6 +718,7 @@ async fn run_plan_with_session(
         return Err(invalid("usage: /plan [--new] <task>"));
     }
     sessions.record_human("slowcode-plan-", &task).await?;
+    let session_id = sessions.durable_session_id();
     let store = WorkflowStore::new(&config.workspace);
     if start_new {
         store.pause_active()?;
@@ -788,7 +799,8 @@ async fn run_plan_with_session(
                 }
                 let tasks = workflow_tasks(&parse_task_table(&output), &[]);
                 let questions = workflow_questions(&tasks, &parse_question_table(&output));
-                let state = store.create_with_questions(task, None, tasks, questions)?;
+                let state =
+                    store.create_with_questions(task, session_id.as_deref(), tasks, questions)?;
                 let state = store.record_model_usage(
                     &state.workflow_id,
                     usage.model_calls,
@@ -2831,7 +2843,21 @@ fn render_workflow_status(state: &WorkflowState) -> String {
         } else {
             "clean"
         }
-    )
+    ) + &{
+        let entry = crate::workflow::audit_site::entry_path(
+            std::path::Path::new(&state.workspace),
+            &state.workflow_id,
+        );
+        if entry.is_file() {
+            format!("\naudit: {}", entry.display())
+        } else {
+            format!(
+                "\naudit: {} (missing; run `slowcode audit rebuild {}`)",
+                entry.display(),
+                state.workflow_id
+            )
+        }
+    }
 }
 
 fn render_workflow_list(listing: &crate::workflow::WorkflowListing) -> String {
@@ -2853,7 +2879,7 @@ fn render_workflow_list(listing: &crate::workflow::WorkflowListing) -> String {
     output.trim_end().to_owned()
 }
 
-fn next_action(state: &WorkflowState) -> String {
+pub(crate) fn next_action(state: &WorkflowState) -> String {
     match state.phase {
         Phase::Classify => "finish classification".to_owned(),
         Phase::Interview => "answer the open question with /answer".to_owned(),

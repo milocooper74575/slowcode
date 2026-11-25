@@ -2,7 +2,7 @@
   "version": 1,
   "updated_at": "2026-11-25",
   "title": "slowcode 任务源",
-  "next_task": "AUDIT-001",
+  "next_task": "FIX-002",
   "rules": [
     "这是仓库唯一的任务状态源；HANDOFF 只写交接上下文，不另起任务状态。",
     "开始任务前先读 docs 字段指向的文档；完成时更新 status、evidence、next_action。",
@@ -44,13 +44,14 @@
     {
       "id": "AUDIT-001",
       "phase": "P1",
-      "status": "todo",
+      "status": "done",
       "priority": "high",
       "title": "本地会话与 workflow 审计文档站",
       "docs": ["session-audit-site.md", "workflow.md"],
       "acceptance": "创建 workflow 时在 workspace 专用目录生成只读静态审计站；覆盖总览、节点、会话与 feedback；TUI 底部常驻入口；文字版 workflow 只保留当前节点或精简摘要；断网可打开且与 state/journal 一致。",
+      "evidence": "crates/slowcode-app/src/workflow/audit_site.rs（纯投影、缺源降级、原子写入）；crates/slowcode-cli/src/audit.rs（audit rebuild）；store write_state 刷新；TUI footer 入口；cargo test -p slowcode-app --lib workflow::audit_site（12 passed）；cargo test -p slowcode-cli --test plan_new_fake（2 passed，含 /plan 生成站点断言）；scripts/test-fast.sh 684 passed；cargo run -p slowcode-cli -- audit rebuild --all 手工冒烟通过。",
       "depends_on": ["DOCS-001"],
-      "next_action": "先确认审计站目录与生成时机，再实现 workflow/session 投影与 TUI 入口。"
+      "next_action": "已关；旧 workflow 用 `slowcode audit rebuild --all` 重新生成。"
     },
     {
       "id": "DOCS-001",

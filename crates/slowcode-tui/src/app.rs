@@ -315,6 +315,7 @@ enum PendingMcpInstall {
 
 pub struct App {
     runtime: Arc<Mutex<Runtime>>,
+    workspace: std::path::PathBuf,
     session_id: String,
     model: String,
     role: String,
@@ -373,8 +374,13 @@ impl App {
         history: Vec<UiEvent>,
         app_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Self {
+        let workspace = runtime
+            .try_lock()
+            .map(|runtime| runtime.workspace().to_path_buf())
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
         let mut app = Self {
             runtime,
+            workspace,
             session_id,
             model,
             role,
@@ -471,6 +477,20 @@ impl App {
             state.phase,
             state.open_questions().len()
         )));
+        self.warn_if_audit_missing();
+    }
+
+    fn warn_if_audit_missing(&mut self) {
+        let Some(workflow) = self.plan_workflow.clone() else {
+            return;
+        };
+        let path = slowcode_app::workflow::audit_site::entry_path(&self.workspace(), &workflow);
+        if !path.is_file() {
+            self.push_system(format!(
+                "audit site unavailable at {}; run `slowcode audit rebuild {workflow}`",
+                path.display()
+            ));
+        }
     }
 
     fn recover_pending_approval(&mut self) {
@@ -560,6 +580,7 @@ impl App {
                             self.plan_workflow = Some(workflow_id.clone());
                         }
                         self.refresh_plan_phase();
+                        self.warn_if_audit_missing();
                         if expects_assistant {
                             self.push_system(format!("[plan saved to {}]", outcome.path.display()));
                         }
@@ -2918,10 +2939,7 @@ impl App {
     }
 
     fn workspace(&self) -> std::path::PathBuf {
-        self.runtime
-            .try_lock()
-            .map(|runtime| runtime.workspace().to_path_buf())
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+        self.workspace.clone()
     }
 
     fn record_usage(&mut self, usage: &UiUsage) {
@@ -3119,7 +3137,7 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let composer_height = composer_height(&self.composer, area.width);
-        let footer_height = if self.plan_phase.is_some() { 2 } else { 1 };
+        let footer_height = self.footer_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -3134,6 +3152,17 @@ impl App {
         self.draw_messages(frame, chunks[1]);
         self.draw_composer(frame, chunks[2]);
         self.draw_footer(frame, chunks[3]);
+    }
+
+    fn footer_height(&self) -> u16 {
+        let mut height = 1;
+        if self.plan_phase.is_some() {
+            height += 1;
+        }
+        if self.audit_entry().is_some() {
+            height += 1;
+        }
+        height
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
@@ -3230,18 +3259,33 @@ impl App {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let footer_area = if self.plan_phase.is_some() && area.height > 1 {
-            let phase = Rect::new(area.x, area.y, area.width, 1);
+        let mut footer_area = area;
+        if self.plan_phase.is_some() && footer_area.height > 1 {
+            let phase = Rect::new(footer_area.x, footer_area.y, footer_area.width, 1);
             self.draw_plan_phase(frame, phase);
-            Rect::new(
-                area.x,
-                area.y.saturating_add(1),
-                area.width,
-                area.height.saturating_sub(1),
-            )
-        } else {
-            area
-        };
+            footer_area = Rect::new(
+                footer_area.x,
+                footer_area.y.saturating_add(1),
+                footer_area.width,
+                footer_area.height.saturating_sub(1),
+            );
+        }
+        if let Some(entry) = self.audit_entry()
+            && footer_area.height > 1
+        {
+            let line = Line::from(vec![
+                Span::styled("audit ", Style::default().fg(Color::DarkGray)),
+                Span::styled(entry, Style::default().fg(Color::DarkGray)),
+            ]);
+            let row = Rect::new(footer_area.x, footer_area.y, footer_area.width, 1);
+            frame.render_widget(Paragraph::new(line), row);
+            footer_area = Rect::new(
+                footer_area.x,
+                footer_area.y.saturating_add(1),
+                footer_area.width,
+                footer_area.height.saturating_sub(1),
+            );
+        }
         let hint = if self.handoff_running {
             "writing HANDOFF.md  Ctrl-C quit"
         } else if self.recovered_approval.is_some() {
@@ -3270,6 +3314,14 @@ impl App {
             Span::styled(progress, Style::default().fg(Color::DarkGray)),
         ]);
         frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), footer_area);
+    }
+
+    /// Stable audit entry for the active workflow, shown at the bottom.
+    fn audit_entry(&self) -> Option<String> {
+        let workflow = self.plan_workflow.as_deref()?;
+        let path = slowcode_app::workflow::audit_site::entry_path(&self.workspace(), workflow);
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        Some(path.display().to_string())
     }
 
     fn draw_plan_phase(&self, frame: &mut Frame, area: Rect) {
@@ -7696,6 +7748,22 @@ mod tests {
         assert!(content.contains("ready for approval"), "{content}");
         assert!(!content.contains("phase"), "{content}");
         assert!(!content.contains("review"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn active_workflow_shows_the_audit_entry_in_the_footer() {
+        let mut app = test_app().await;
+        assert_eq!(app.footer_height(), 1);
+
+        app.plan_phase = Some(slowcode_app::workflow::Phase::Review);
+        app.plan_workflow = Some("plan-1".to_owned());
+
+        let entry = app.audit_entry().expect("audit entry");
+        assert!(
+            entry.contains(".slowcode/audit/plan-1/index.html"),
+            "{entry}"
+        );
+        assert_eq!(app.footer_height(), 3);
     }
 
     #[tokio::test]

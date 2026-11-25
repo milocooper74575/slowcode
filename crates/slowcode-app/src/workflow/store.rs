@@ -2175,6 +2175,9 @@ impl WorkflowStore {
             serde_json::to_vec(state).map_err(|error| WorkflowError::Corrupt(error.to_string()))?;
         let bytes = self.redact_bytes(bytes)?;
         write_atomic(&self.state_path(&state.workflow_id), &bytes)?;
+        // The audit site is a projection, never a gate. A failure here must not
+        // block the workflow, so the error is intentionally dropped.
+        super::audit_site::refresh_best_effort(&self.workspace_root(), state);
         Ok(())
     }
 

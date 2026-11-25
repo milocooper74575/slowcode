@@ -1,6 +1,7 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>会话与 workflow 本地审计站 · slowcode 文档</title><link rel="stylesheet" href="./style.css"></head><body><div class="layout"><aside class="sidebar"><a class="brand" href="./index.html"><strong>slowcode 文档</strong><span>认知协作式 coding agent 的设计、工作流与进度</span></a><div class="nav-section"><h2>总览</h2><a class="nav-link" href="./overview.html">slowcode 是什么</a><a class="nav-link" href="./roadmap.html">路线与主流程</a></div><div class="nav-section"><h2>工作流</h2><a class="nav-link" href="./workflow.html">Plan workflow 与阶段门禁</a><a class="nav-link current" href="./session-audit-site.html">会话与 workflow 本地审计站</a></div><div class="nav-section"><h2>架构</h2><a class="nav-link" href="./architecture.html">架构与目录</a></div><div class="nav-section"><h2>参与</h2><a class="nav-link" href="./contributing.html">参与与验证</a></div><div class="nav-task"><a class="nav-link" href="./tasks.html">任务源</a><div class="meta" style="padding:6px 9px 0">0 进行中 · 3 待开始</div></div></aside><main class="content"><div class="content-inner"><p class="crumb"><a href="./index.html">总览</a> / 工作流</p><div class="markdown"><h1>会话与 workflow 本地审计站</h1>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>会话与 workflow 本地审计站 · slowcode 文档</title><link rel="stylesheet" href="./style.css"></head><body><div class="layout"><aside class="sidebar"><a class="brand" href="./index.html"><strong>slowcode 文档</strong><span>认知协作式 coding agent 的设计、工作流与进度</span></a><div class="nav-section"><h2>总览</h2><a class="nav-link" href="./overview.html">slowcode 是什么</a><a class="nav-link" href="./roadmap.html">路线与主流程</a></div><div class="nav-section"><h2>工作流</h2><a class="nav-link" href="./workflow.html">Plan workflow 与阶段门禁</a><a class="nav-link current" href="./session-audit-site.html">会话与 workflow 本地审计站</a></div><div class="nav-section"><h2>架构</h2><a class="nav-link" href="./architecture.html">架构与目录</a></div><div class="nav-section"><h2>参与</h2><a class="nav-link" href="./contributing.html">参与与验证</a></div><div class="nav-task"><a class="nav-link" href="./tasks.html">任务源</a><div class="meta" style="padding:6px 9px 0">0 进行中 · 2 待开始</div></div></aside><main class="content"><div class="content-inner"><p class="crumb"><a href="./index.html">总览</a> / 工作流</p><div class="markdown"><h1>会话与 workflow 本地审计站</h1>
 <blockquote>
-<p>状态：设计已记录为 <code>AUDIT-001</code>，尚未实现。</p>
+<p>状态：<code>AUDIT-001</code> 已实现。生成在 <code>slowcode-app::workflow::audit_site</code>，
+每次 workflow state 写入后刷新；显式重建用 <code>slowcode audit rebuild [&lt;id&gt;|--all]</code>。</p>
 </blockquote>
 <p>slowcode 的会话不是一段聊天记录，而是一条 workflow。用户需要能审计、回顾、定位问题，并且随时知道自己在哪个节点、系统做了什么决定。当前 TUI 里的文字版 workflow 只能顺序阅读，节点一多就失去结构；会话历史也散在 JSONL 与终端滚动里。</p>
 <p>这份设计把已经落地的文档站能力扩展到产品内部：<strong>每次创建 workflow 时，在 workspace 的专用目录生成一个只读静态审计站</strong>，作为会话与 workflow 的投影。它不是第二个状态源，任务与决策仍以 workflow state、run journal 和 <code>site/tasks.json</code> 为准。</p>
@@ -57,8 +58,34 @@
 <li><code>/plan</code> 创建 workflow 时生成骨架、入口与当前节点页。</li>
 <li>每次 workflow 事件或 run 状态提交后，更新受影响的页面；写入使用临时文件加 rename，避免半页。</li>
 <li>生成失败不阻塞主流程，但在 TUI 显示可恢复的告警，并保留上一次完整版本。</li>
-<li>可选：提供显式命令重新生成整站，用于修复或迁移。</li>
+<li>提供显式命令 <code>slowcode audit rebuild [&lt;workflow_id&gt;|--all]</code> 重新生成整站。它不是日常写入路径，只在下面几类情况使用：
+<ul>
+<li>渲染器或数据结构升级：旧目录需要按新格式重生成，增量更新回填不了历史页面。</li>
+<li>上次生成失败留下的缺口：失败事件当时没有投影，需要从 durable 源对齐。</li>
+<li>脱敏规则变更：必须用新规则重写所有旧页面，才能清除已写入 HTML 的敏感内容。</li>
+<li>目录迁移或导入：workspace 换路径、从备份拷回 <code>.scratch/workflows</code>，但没带 <code>audit/</code>。</li>
+<li>一致性校验：全量重建后与现有 HTML 对比，可作为漂移检测手段。</li>
+</ul>
+</li>
 </ol>
+<h2>还原契约</h2>
+<p>审计站 HTML 是纯投影，不是源。还原能力由这一点决定：</p>
+<ul>
+<li>唯一源是 <code>.scratch/workflows/&lt;workflow_id&gt;/state.json</code>、<code>events.jsonl</code>、会话 JSONL、plan artifact、model call archive 与本地 <code>feedback/</code>。</li>
+<li>日常增量生成与显式重建走同一个纯函数 <code>render(state, events, sessions, feedback)</code>，显式重建不引入第二条代码路径。</li>
+<li>手工编辑 HTML 无意义，下一次生成会覆盖；任何状态修正都改源，不改进站。</li>
+<li>与文档站的区别：<code>site/dist/</code> 是 committed 的，源在 <code>site/content/*.md</code>，可 checkout 后重建；审计站的源全部 gitignored 且只在本机，<strong>HTML 丢失后只能在源仍在的同一台机器或同一份备份上还原</strong>。<code>.scratch</code> 与会话 JSONL 都丢失时无法还原。</li>
+<li>会话 JSONL 位于平台 application-state 目录（<code>DSH_SESSION_ROOT</code>），不在 workspace，<code>state.json</code> 只记录 <code>session_id</code>。只拷 <code>.scratch</code> 而不拷会话日志时，workflow 时间线可还原，但会话页只能降级。</li>
+</ul>
+<h3>缺源降级</h3>
+<p>每个页面必须显式报告源状态，不允许静默留白或伪装完整：</p>
+<ul>
+<li>页面顶部显示 <code>sources: state ✓ / events ✓ / session ✗ / feedback ✓</code>。</li>
+<li>缺会话日志时 <code>session.html</code> 显示 <code>source missing: session journal &lt;id&gt;</code>, 其余页照常生成。</li>
+<li><code>events.jsonl</code> 只有有效前缀时，时间线显示 <code>recovered prefix: N events</code>, 并标注之后可能有缺口。</li>
+<li>缺 feedback 包时 <code>feedback.html</code> 显示空态，而不是报错中止。</li>
+<li>任一源缺失都不应让整站生成失败；只有 workspace 与 workflow 目录都不可写时才告警。</li>
+</ul>
 <h2>TUI 变化</h2>
 <ul>
 <li>底部常驻一行入口，例如 <code>audit: .slowcode/audit/&lt;workflow_id&gt;/index.html</code>。</li>

@@ -172,6 +172,15 @@ async fn plan_new_pauses_the_active_workflow_and_starts_another() {
         "count lines",
         "the --new flag is not part of the task"
     );
+    let audit = workspace
+        .join(".slowcode")
+        .join("audit")
+        .join(&new_id)
+        .join("index.html");
+    assert!(audit.is_file(), "missing audit site at {}", audit.display());
+    let html = fs::read_to_string(&audit).expect("audit html");
+    assert!(html.contains("count lines"), "{html}");
+    assert!(html.contains("sources: state"), "{html}");
     let _ = fs::remove_dir_all(&workspace);
 }
 

@@ -63,6 +63,16 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        "audit" => {
+            args.remove(0);
+            match slowcode_cli::audit::run(args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => match parse_options(args) {
             Ok(options) if options.prompt.is_some() => run_headless(options).await,
             Ok(options) => start_tui(Ok(options)).await,

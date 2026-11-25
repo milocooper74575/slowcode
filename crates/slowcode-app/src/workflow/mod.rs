@@ -5,6 +5,7 @@
 //! changing the public data model.
 
 pub mod approval;
+pub mod audit_site;
 pub mod budget;
 pub mod contract;
 pub mod input;

@@ -1,6 +1,7 @@
 # 会话与 workflow 本地审计站
 
-> 状态：设计已记录为 `AUDIT-001`，尚未实现。
+> 状态：`AUDIT-001` 已实现。生成在 `slowcode-app::workflow::audit_site`，
+> 每次 workflow state 写入后刷新；显式重建用 `slowcode audit rebuild [<id>|--all]`。
 
 slowcode 的会话不是一段聊天记录，而是一条 workflow。用户需要能审计、回顾、定位问题，并且随时知道自己在哪个节点、系统做了什么决定。当前 TUI 里的文字版 workflow 只能顺序阅读，节点一多就失去结构；会话历史也散在 JSONL 与终端滚动里。
 
@@ -65,7 +66,32 @@ slowcode 的会话不是一段聊天记录，而是一条 workflow。用户需�
 1. `/plan` 创建 workflow 时生成骨架、入口与当前节点页。
 2. 每次 workflow 事件或 run 状态提交后，更新受影响的页面；写入使用临时文件加 rename，避免半页。
 3. 生成失败不阻塞主流程，但在 TUI 显示可恢复的告警，并保留上一次完整版本。
-4. 可选：提供显式命令重新生成整站，用于修复或迁移。
+4. 提供显式命令 `slowcode audit rebuild [<workflow_id>|--all]` 重新生成整站。它不是日常写入路径，只在下面几类情况使用：
+   - 渲染器或数据结构升级：旧目录需要按新格式重生成，增量更新回填不了历史页面。
+   - 上次生成失败留下的缺口：失败事件当时没有投影，需要从 durable 源对齐。
+   - 脱敏规则变更：必须用新规则重写所有旧页面，才能清除已写入 HTML 的敏感内容。
+   - 目录迁移或导入：workspace 换路径、从备份拷回 `.scratch/workflows`，但没带 `audit/`。
+   - 一致性校验：全量重建后与现有 HTML 对比，可作为漂移检测手段。
+
+## 还原契约
+
+审计站 HTML 是纯投影，不是源。还原能力由这一点决定：
+
+- 唯一源是 `.scratch/workflows/<workflow_id>/state.json`、`events.jsonl`、会话 JSONL、plan artifact、model call archive 与本地 `feedback/`。
+- 日常增量生成与显式重建走同一个纯函数 `render(state, events, sessions, feedback)`，显式重建不引入第二条代码路径。
+- 手工编辑 HTML 无意义，下一次生成会覆盖；任何状态修正都改源，不改进站。
+- 与文档站的区别：`site/dist/` 是 committed 的，源在 `site/content/*.md`，可 checkout 后重建；审计站的源全部 gitignored 且只在本机，**HTML 丢失后只能在源仍在的同一台机器或同一份备份上还原**。`.scratch` 与会话 JSONL 都丢失时无法还原。
+- 会话 JSONL 位于平台 application-state 目录（`DSH_SESSION_ROOT`），不在 workspace，`state.json` 只记录 `session_id`。只拷 `.scratch` 而不拷会话日志时，workflow 时间线可还原，但会话页只能降级。
+
+### 缺源降级
+
+每个页面必须显式报告源状态，不允许静默留白或伪装完整：
+
+- 页面顶部显示 `sources: state ✓ / events ✓ / session ✗ / feedback ✓`。
+- 缺会话日志时 `session.html` 显示 `source missing: session journal <id>`, 其余页照常生成。
+- `events.jsonl` 只有有效前缀时，时间线显示 `recovered prefix: N events`, 并标注之后可能有缺口。
+- 缺 feedback 包时 `feedback.html` 显示空态，而不是报错中止。
+- 任一源缺失都不应让整站生成失败；只有 workspace 与 workflow 目录都不可写时才告警。
 
 ## TUI 变化
 
