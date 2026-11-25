@@ -1,0 +1,24 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>路线与主流程 · slowcode 文档</title><link rel="stylesheet" href="./style.css"></head><body><div class="layout"><aside class="sidebar"><a class="brand" href="./index.html"><strong>slowcode 文档</strong><span>认知协作式 coding agent 的设计、工作流与进度</span></a><div class="nav-section"><h2>总览</h2><a class="nav-link" href="./overview.html">slowcode 是什么</a><a class="nav-link current" href="./roadmap.html">路线与主流程</a></div><div class="nav-section"><h2>工作流</h2><a class="nav-link" href="./workflow.html">Plan workflow 与阶段门禁</a></div><div class="nav-section"><h2>架构</h2><a class="nav-link" href="./architecture.html">架构与目录</a></div><div class="nav-section"><h2>参与</h2><a class="nav-link" href="./contributing.html">参与与验证</a></div><div class="nav-task"><a class="nav-link" href="./tasks.html">任务源</a><div class="meta" style="padding:6px 9px 0">0 进行中 · 2 待开始</div></div></aside><main class="content"><div class="content-inner"><p class="crumb"><a href="./index.html">总览</a> / 总览</p><div class="markdown"><h1>路线与主流程</h1>
+<!-- docs:main-flow:start -->
+<p>plan -&gt; approve -&gt; scaffold -&gt; continue -&gt; distill -&gt; feedback</p>
+<!-- docs:main-flow:end -->
+<p>主流程只有一个：先把未知域问清楚，再让 agent 写已知域，最后用 Teach-back 检查理解。</p>
+<h2>阶段划分</h2>
+<table><thead><tr><th>阶段</th><th>主题</th><th>退出条件</th></tr></thead><tbody>
+<tr><td>P0 基座</td><td>kernel、runtime、roles、只读工具</td><td>单测、集成测试与恢复语义稳定</td></tr>
+<tr><td>P1 Plan workflow</td><td>认知任务表、访谈、门禁、distill</td><td>从 <code>/plan</code> 到 <code>/distill</code> 能闭环</td></tr>
+<tr><td>P2 使用与发布</td><td>TUI、CLI、文档站、MCP、skills、update</td><td>用户可安装、可恢复、可审计</td></tr>
+<tr><td>P3 运营与生态</td><td>审计指标、skill 生态、多模型路由</td><td>有可重复的运营与评估流程</td></tr>
+</tbody></table>
+<h2>主流程每一步</h2>
+<ol>
+<li><strong>plan</strong>：<code>/plan &lt;task&gt;</code> 在一个只读 turn 内完成 Explore 与 Navigate，输出证据包、认知任务分配表与半已知域问题。</li>
+<li><strong>approve</strong>：用户逐题回答，系统记录决策并把任务重新分类；<code>/approve</code> 批准分类表并绑定 hash。</li>
+<li><strong>scaffold</strong>：只为已知域生成脚手架与契约测试；未知域留出 <code>TODO(user)</code> 空白核心。</li>
+<li><strong>continue</strong>：用户实现核心后 <code>/continue</code> 检查标记、文件 hash 与契约，未完成不放行。</li>
+<li><strong>distill</strong>：<code>/distill &lt;explanation&gt;</code> 做 Teach-back，输出理解漏洞报告与一次修复尝试。</li>
+<li><strong>feedback</strong>：<code>/feedback</code> 把会话整理成可回归的问题包；修复必须同时补单测与用户路径测试。</li>
+</ol>
+<h2>当前焦点</h2>
+<p>文档站与唯一任务源已经落地：<code>site/tasks.json</code> 是任务状态的唯一来源，<code>site/dist</code> 是可离线打开的静态站。下一步见 <a href="tasks.html">任务源</a> 里的 <code>next_task</code>。</p>
+</div><div class="footer">由 <code>slowcode-docs</code> 生成 · 2026-11-25 · 任务状态以 <code>site/tasks.json</code> 为准</div></div></main></div></body></html>

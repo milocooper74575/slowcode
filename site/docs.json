@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "updated_at": "2026-11-25",
+  "title": "slowcode 文档",
+  "subtitle": "认知协作式 coding agent 的设计、工作流与进度",
+  "sections": [
+    {
+      "id": "overview",
+      "title": "总览",
+      "summary": "先看产品定位、路线与唯一任务源。",
+      "pages": [
+        {
+          "id": "overview",
+          "file": "overview.md",
+          "title": "slowcode 是什么",
+          "summary": "人创造未知，AI 实现已知。"
+        },
+        {
+          "id": "roadmap",
+          "file": "roadmap.md",
+          "title": "路线与主流程",
+          "summary": "主导航、阶段划分与当前焦点。"
+        }
+      ]
+    },
+    {
+      "id": "product",
+      "title": "工作流",
+      "summary": "Plan workflow、阶段门禁与角色边界。",
+      "pages": [
+        {
+          "id": "workflow",
+          "file": "workflow.md",
+          "title": "Plan workflow 与阶段门禁",
+          "summary": "从 /plan 到 /distill 的状态流转。"
+        }
+      ]
+    },
+    {
+      "id": "internals",
+      "title": "架构",
+      "summary": "crate 分层、会话与可恢复运行时。",
+      "pages": [
+        {
+          "id": "architecture",
+          "file": "architecture.md",
+          "title": "架构与目录",
+          "summary": "kernel、roles、runtime、app 与 TUI 的职责。"
+        }
+      ]
+    },
+    {
+      "id": "contribute",
+      "title": "参与",
+      "summary": "构建、验证、反馈与安全边界。",
+      "pages": [
+        {
+          "id": "contributing",
+          "file": "contributing.md",
+          "title": "参与与验证",
+          "summary": "代码规范、测试门禁、反馈回归与文档站维护。"
+        }
+      ]
+    }
+  ]
+}

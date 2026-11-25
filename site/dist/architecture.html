@@ -1,0 +1,49 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>架构与目录 · slowcode 文档</title><link rel="stylesheet" href="./style.css"></head><body><div class="layout"><aside class="sidebar"><a class="brand" href="./index.html"><strong>slowcode 文档</strong><span>认知协作式 coding agent 的设计、工作流与进度</span></a><div class="nav-section"><h2>总览</h2><a class="nav-link" href="./overview.html">slowcode 是什么</a><a class="nav-link" href="./roadmap.html">路线与主流程</a></div><div class="nav-section"><h2>工作流</h2><a class="nav-link" href="./workflow.html">Plan workflow 与阶段门禁</a></div><div class="nav-section"><h2>架构</h2><a class="nav-link current" href="./architecture.html">架构与目录</a></div><div class="nav-section"><h2>参与</h2><a class="nav-link" href="./contributing.html">参与与验证</a></div><div class="nav-task"><a class="nav-link" href="./tasks.html">任务源</a><div class="meta" style="padding:6px 9px 0">0 进行中 · 2 待开始</div></div></aside><main class="content"><div class="content-inner"><p class="crumb"><a href="./index.html">总览</a> / 架构</p><div class="markdown"><h1>架构与目录</h1>
+<p>slowcode 按“内核 → 角色 → 运行时 → 应用 → 界面”分层。每一层只做一个决定，跨层通过显式接口连接。</p>
+<h2>crate 分层</h2>
+<table><thead><tr><th>路径</th><th>职责</th></tr></thead><tbody>
+<tr><td><code>crates/slowcode-kernel</code></td><td>从 dsh-rs 引入的非 UI 内核：agent loop、模型流、会话、工具。改前先读 <code>UPSTREAM.md</code></td></tr>
+<tr><td><code>crates/slowcode-roles</code></td><td>navigator/driver 组装、Cordis fiber、会话续接与缓存报告</td></tr>
+<tr><td><code>crates/slowcode-runtime</code></td><td>Run 状态机、转移、预算、审批与模型调用归档</td></tr>
+<tr><td><code>crates/slowcode-cognition</code></td><td>Plan 校验、认知任务表、artifact 渲染</td></tr>
+<tr><td><code>crates/slowcode-app</code></td><td>会话装配、命令注册、Plan workflow、模型切换</td></tr>
+<tr><td><code>crates/slowcode-cli</code></td><td>CLI 入口，二进制 <code>slowcode</code></td></tr>
+<tr><td><code>crates/slowcode-tui</code></td><td>ratatui 用户界面</td></tr>
+<tr><td><code>crates/slowcode-context</code></td><td>AGENTS.md 状态、GLOSSARY 稳定前缀、HANDOFF 指针</td></tr>
+<tr><td><code>crates/slowcode-mcp</code></td><td>MCP 配置合并、stdio 与 HTTP 连接、工具调用</td></tr>
+<tr><td><code>crates/slowcode-skills</code></td><td>本地 skill 安装、校验、锁文件与移除</td></tr>
+<tr><td><code>crates/slowcode-feedback</code></td><td>从会话 journal 生成可提交的反馈包</td></tr>
+<tr><td><code>crates/slowcode-update</code></td><td>Release 检查与校验后的自替换</td></tr>
+<tr><td><code>crates/slowcode-audit</code></td><td>离线会话审计：token、重复读取、空转重试、计划抖动</td></tr>
+<tr><td><code>crates/slowcode-docs</code></td><td>文档站校验、生成与漂移检查</td></tr>
+<tr><td><code>crates/slowcode-tests</code></td><td>跨 crate 集成测试</td></tr>
+</tbody></table>
+<h2>一次 turn 的数据流</h2>
+<pre><code class="language-text">TUI / CLI
+  -&gt; slowcode-app 选择角色与命令
+  -&gt; slowcode-roles 组装 AgentLoop
+  -&gt; slowcode-kernel 调用模型、分发工具、写入会话
+  -&gt; slowcode-runtime 记录 run 状态、预算与审批
+  -&gt; JSONL 会话与 .scratch workflow artifact
+</code></pre>
+<h2>会话与可恢复性</h2>
+<ul>
+<li>session id 同时是 traceId；会话是 append-only JSONL。</li>
+<li>run 状态包含 <code>Queued</code>、<code>CallingModel</code>、<code>AwaitingApproval</code>、<code>ExecutingTool</code>、<code>Completed</code>、<code>Failed</code>、<code>Cancelled</code>。</li>
+<li><code>CallingModel</code> 与 <code>ExecutingTool</code> 在崩溃后视为未知结果：先查幂等记录或外部状态，再决定是否重试。</li>
+<li>工具结果丢失时写入 <code>TOOL_OUTCOME_UNKNOWN</code>，但 turn 的结束原因跟随真正的停止原因，而不是一律 <code>AGENT_TOOL_EXECUTOR</code>。</li>
+</ul>
+<h2>公开参考</h2>
+<ul>
+<li><code>README.md</code>：用户视角的安装与命令。</li>
+<li><code>GLOSSARY.md</code>：领域术语。</li>
+<li><code>CODING_STANDARDS.md</code>：代码风格与 review 规则。</li>
+<li><code>site/tasks.json</code>：唯一任务状态源。</li>
+<li><code>site/dist/index.html</code>：本页所在的离线文档站。</li>
+</ul>
+<h2>相关</h2>
+<ul>
+<li><a href="./workflow.html">Plan workflow 与阶段门禁</a></li>
+<li><a href="./roadmap.html">路线与主流程</a></li>
+</ul>
+</div><div class="footer">由 <code>slowcode-docs</code> 生成 · 2026-11-25 · 任务状态以 <code>site/tasks.json</code> 为准</div></div></main></div></body></html>

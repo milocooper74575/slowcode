@@ -1,0 +1,58 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>参与与验证 · slowcode 文档</title><link rel="stylesheet" href="./style.css"></head><body><div class="layout"><aside class="sidebar"><a class="brand" href="./index.html"><strong>slowcode 文档</strong><span>认知协作式 coding agent 的设计、工作流与进度</span></a><div class="nav-section"><h2>总览</h2><a class="nav-link" href="./overview.html">slowcode 是什么</a><a class="nav-link" href="./roadmap.html">路线与主流程</a></div><div class="nav-section"><h2>工作流</h2><a class="nav-link" href="./workflow.html">Plan workflow 与阶段门禁</a></div><div class="nav-section"><h2>架构</h2><a class="nav-link" href="./architecture.html">架构与目录</a></div><div class="nav-section"><h2>参与</h2><a class="nav-link current" href="./contributing.html">参与与验证</a></div><div class="nav-task"><a class="nav-link" href="./tasks.html">任务源</a><div class="meta" style="padding:6px 9px 0">0 进行中 · 2 待开始</div></div></aside><main class="content"><div class="content-inner"><p class="crumb"><a href="./index.html">总览</a> / 参与</p><div class="markdown"><h1>参与与验证</h1>
+<h2>构建与测试</h2>
+<pre><code class="language-bash">cargo fmt --all -- --check
+scripts/clippy.sh
+cargo test --workspace --exclude slowcode-kernel
+</code></pre>
+<p>快速循环，安装 <code>cargo-nextest</code> 后并行跑测试二进制：</p>
+<pre><code class="language-bash">scripts/test-fast.sh                 # 不含 vendored kernel
+scripts/test-fast.sh slowcode-tui    # 单 crate
+scripts/test-fast.sh --full          # 含 kernel
+</code></pre>
+<p>Kernel 改动单独跑：</p>
+<pre><code class="language-bash">cargo test -p slowcode-kernel --lib
+</code></pre>
+<p>真实 provider 测试是 <code>#[ignore]</code>，需要 <code>DEEPSEEK_API_KEY</code>：</p>
+<pre><code class="language-bash">cargo test -p slowcode-cli --test e2e_deepseek -- --ignored --nocapture
+cargo test -p slowcode-cli --test plan_flow_deepseek -- --ignored --nocapture
+</code></pre>
+<p>没跑过相关测试，不要说一个改动已经验证。</p>
+<h2>代码规范</h2>
+<ul>
+<li>Rust 2024，<code>rust-version = 1.88</code>，不引入新 warning。</li>
+<li>一个决定只放一处；优先用枚举和 newtype 让非法状态不可表示。</li>
+<li>外部数据在入口校验一次：CLI 参数、配置、JSONL、MCP 响应、skill frontmatter。</li>
+<li>持久化写入使用临时文件加 <code>fs::rename</code>，失败可回滚。</li>
+<li>错误用 <code>thiserror</code>，不引入 <code>anyhow</code>。</li>
+<li>单测放在代码旁的 <code>#[cfg(test)]</code>；跨 crate 测试放在 <code>crates/slowcode-tests/tests/</code>。</li>
+<li>小步提交，说明为什么改、改了什么、怎么证明。</li>
+</ul>
+<h2>反馈回归</h2>
+<p>每个 <code>/feedback</code> 问题在关闭前必须变成回归覆盖：</p>
+<ol>
+<li>一个针对失败 seam 的单测。</li>
+<li>一个覆盖用户可见工作流的端到端测试。</li>
+</ol>
+<p>只做手工验证不算完成。</p>
+<h2>文档站与任务源</h2>
+<p>文档源在 <code>site/</code>，生成站点在 <code>site/dist/</code>。<code>site/tasks.json</code> 是唯一任务状态源，<code>HANDOFF</code> 只写交接上下文。</p>
+<pre><code class="language-bash">cargo run -p slowcode-docs -- check        # 校验层级、任务源、主流程
+cargo run -p slowcode-docs -- build        # 重新生成 site/dist
+cargo run -p slowcode-docs -- build --check  # CI 漂移门禁
+</code></pre>
+<p>编辑规则：</p>
+<ul>
+<li><code>site/content/*.md</code> 每一篇都必须挂到 <code>docs.json</code>。</li>
+<li>任务必须写 <code>docs</code> 与 <code>acceptance</code>；<code>done</code> 必须有 <code>evidence</code>；<code>deprecated</code> 必须有 <code>reason</code>；<code>in_progress</code> 必须有 <code>next_action</code>。</li>
+<li>依赖必须指向已存在的任务 ID。</li>
+<li><code>roadmap.md</code> 有且只有一个主流程标记段落。</li>
+<li>改完 <code>site/</code> 后重建并提交 <code>site/dist</code>，否则 CI 会失败。</li>
+</ul>
+<h2>安全</h2>
+<ul>
+<li>key 来自 <code>.env</code> 或 <code>DEEPSEEK_API_KEY</code>，不打印、不提交。</li>
+<li>MCP 项目级 server 在 <code>/mcp enable</code> 前保持 dormant，工具按风险分级审批。</li>
+<li>反馈包可能包含对话内容，分享前先检查。</li>
+<li>模型不会安装 skill，也不会批准自己的写入。</li>
+</ul>
+</div><div class="footer">由 <code>slowcode-docs</code> 生成 · 2026-11-25 · 任务状态以 <code>site/tasks.json</code> 为准</div></div></main></div></body></html>

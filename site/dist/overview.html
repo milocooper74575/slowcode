@@ -1,0 +1,20 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>slowcode 是什么 · slowcode 文档</title><link rel="stylesheet" href="./style.css"></head><body><div class="layout"><aside class="sidebar"><a class="brand" href="./index.html"><strong>slowcode 文档</strong><span>认知协作式 coding agent 的设计、工作流与进度</span></a><div class="nav-section"><h2>总览</h2><a class="nav-link current" href="./overview.html">slowcode 是什么</a><a class="nav-link" href="./roadmap.html">路线与主流程</a></div><div class="nav-section"><h2>工作流</h2><a class="nav-link" href="./workflow.html">Plan workflow 与阶段门禁</a></div><div class="nav-section"><h2>架构</h2><a class="nav-link" href="./architecture.html">架构与目录</a></div><div class="nav-section"><h2>参与</h2><a class="nav-link" href="./contributing.html">参与与验证</a></div><div class="nav-task"><a class="nav-link" href="./tasks.html">任务源</a><div class="meta" style="padding:6px 9px 0">0 进行中 · 2 待开始</div></div></aside><main class="content"><div class="content-inner"><p class="crumb"><a href="./index.html">总览</a> / 总览</p><div class="markdown"><h1>slowcode 是什么</h1>
+<p>slowcode 是 Rust 写的认知协作式 coding agent。</p>
+<blockquote>
+<p>人创造未知，AI 实现已知。</p>
+</blockquote>
+<p>它不追求把 AI 的自动化比例拉满，而是把两件事当成一等公民：人的认知负荷，以及人对代码的所有权。到了关键节点，它会停下来，把创造空间留给人类：先拆认知任务，再区分已知域、半已知域与未知域，跳过需要人判断的部分，只实现已经讲清楚的部分。</p>
+<h2>三条设计主线</h2>
+<ul>
+<li><strong>认知协作</strong>：Plan workflow 先输出证据包与认知任务分配表，再逐题访谈，把半已知域变成可执行决策，把未知域留给用户实现。</li>
+<li><strong>阶段门禁</strong>：未批准不能 scaffold，未实现核心不能 continue，测试未绿不能 distill。门禁在代码里，不靠提示词。</li>
+<li><strong>可恢复运行</strong>：会话是 JSONL，run 有状态机、预算、审批与模型调用归档；中断后先核对未知结果，再决定是否重试。</li>
+</ul>
+<h2>从哪里继续读</h2>
+<ul>
+<li>想了解从 <code>/plan</code> 到 <code>/distill</code> 的实际流转：看 <a href="./workflow.html">Plan workflow 与阶段门禁</a>。</li>
+<li>想了解 crate 分层与角色边界：看 <a href="./architecture.html">架构与目录</a>。</li>
+<li>想了解当前进度与下一步：看 <a href="./roadmap.html">路线与主流程</a>，任务状态以 <a href="tasks.html">任务源</a> 为准。</li>
+<li>想参与构建与验证：看 <a href="./contributing.html">参与与验证</a>。</li>
+</ul>
+</div><div class="footer">由 <code>slowcode-docs</code> 生成 · 2026-11-25 · 任务状态以 <code>site/tasks.json</code> 为准</div></div></main></div></body></html>

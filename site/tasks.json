@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "updated_at": "2026-11-25",
+  "title": "slowcode 任务源",
+  "next_task": "DOCS-003",
+  "rules": [
+    "这是仓库唯一的任务状态源；HANDOFF 只写交接上下文，不另起任务状态。",
+    "开始任务前先读 docs 字段指向的文档；完成时更新 status、evidence、next_action。",
+    "新增任务必须写 docs 与 acceptance；依赖必须指向已存在的任务 ID。",
+    "完成的任务必须有 evidence；废弃任务必须写 reason。",
+    "修改 site/ 后运行 slowcode-docs build 并提交 site/dist。"
+  ],
+  "phases": [
+    {
+      "id": "P0",
+      "title": "基座"
+    },
+    {
+      "id": "P1",
+      "title": "Plan workflow"
+    },
+    {
+      "id": "P2",
+      "title": "使用与发布"
+    },
+    {
+      "id": "P3",
+      "title": "运营与生态"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "FIX-001",
+      "phase": "P0",
+      "status": "done",
+      "priority": "high",
+      "title": "readonly_shell 参数错误不再终止 turn",
+      "docs": ["workflow.md"],
+      "acceptance": "非法参数返回模型可见的工具错误；git log 计数缩写被接受；/plan 回归测试覆盖拒绝后继续。",
+      "evidence": "55ae2a7、98f35ee；cargo test -p slowcode-kernel --lib readonly_shell；cargo test -p slowcode-app --lib plan::tests::plan_",
+      "depends_on": [],
+      "next_action": "已关；后续由 FIX-002 明确超时语义。"
+    },
+    {
+      "id": "DOCS-001",
+      "phase": "P2",
+      "status": "done",
+      "priority": "high",
+      "title": "文档站与唯一任务源",
+      "docs": ["overview.md", "roadmap.md"],
+      "acceptance": "site/content 每篇文档挂入 docs.json；tasks.json 是唯一任务源；check、build 与 build --check 通过；生成站点提交。",
+      "evidence": "crates/slowcode-docs；site/dist；cargo test -p slowcode-docs；cargo run -p slowcode-docs -- check",
+      "depends_on": [],
+      "next_action": "新增文档或任务时先改 site/，再重建站点。"
+    },
+    {
+      "id": "DOCS-002",
+      "phase": "P2",
+      "status": "done",
+      "priority": "high",
+      "title": "文档站接入 CI 漂移门禁",
+      "docs": ["contributing.md", "roadmap.md"],
+      "acceptance": "PR 必跑 slowcode-docs check 与 build --check；生成站点与源不一致时 CI 失败。",
+      "evidence": ".github/workflows/ci.yml；cargo run -p slowcode-docs -- build --check",
+      "depends_on": ["DOCS-001"],
+      "next_action": "已关；分支保护里把 test job 设为 required check。"
+    },
+    {
+      "id": "DOCS-003",
+      "phase": "P2",
+      "status": "todo",
+      "priority": "medium",
+      "title": "把 GLOSSARY 与 CODING_STANDARDS 挂入文档站",
+      "docs": ["architecture.md", "contributing.md"],
+      "acceptance": "两篇参考文档进入文档站；站内链接可跳转；docs.json 覆盖检查仍通过。",
+      "depends_on": ["DOCS-001"],
+      "next_action": "先决定是复制到 site/content 还是允许 docs.json 引用仓库根目录，再改校验器与链接重写。"
+    },
+    {
+      "id": "FIX-002",
+      "phase": "P0",
+      "status": "todo",
+      "priority": "medium",
+      "title": "明确 readonly_shell 超时与 IO 失败的错误分类",
+      "docs": ["workflow.md"],
+      "acceptance": "超时、spawn 失败与读管道失败分别归入工具错误或基础设施错误；有单测与一份决策记录。",
+      "depends_on": ["FIX-001"],
+      "next_action": "先写决策记录：只读命令无副作用，是否全部作为模型可见错误返回。"
+    }
+  ]
+}
