@@ -139,7 +139,11 @@ include those JSON fixtures by relative path.
   auditor profiles. It accepts strict argv only, binds commands to one
   workspace, and exposes `shell.readonly` metadata to the application layer.
   Git inspection commands force `--no-pager`, `--no-ext-diff` and
-  `--no-textconv`. `tools/mod.rs` exports it as `tools::readonly_shell`.
+  `--no-textconv`. Invalid argv and workspace paths return a model-visible
+  `INVALID_ARGS` tool result instead of an executor error, so a bad call does
+  not end the turn as `TOOL_OUTCOME_UNKNOWN`. `git log` accepts `-n <n>`,
+  `-n<n>`, `-<n>` and `--max-count[=]<n>`. `tools/mod.rs` exports it as
+  `tools::readonly_shell`.
 - `Cargo.toml`: enabled the `process` feature on `tokio` so the read-only shell
   can spawn and reap bounded subprocesses with cancellation and a timeout.
 - `agent/mod.rs`: a tool result lost to an interrupted round is still recorded

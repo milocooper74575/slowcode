@@ -28,6 +28,8 @@ use crate::{
     tools::ToolRegistryBuildError,
 };
 
+use super::error::{ToolCallError, ToolCallResult};
+
 /// Tool name exposed to read-only profiles.
 pub const READONLY_SHELL_TOOL_NAME: &str = "readonly_shell";
 
@@ -107,61 +109,69 @@ impl ToolExecutor for ReadonlyShellTool {
                     "readonly_shell received another tool name",
                 ));
             }
-            let argv = parse_argv(request.arguments().as_value())?;
-            validate_argv(&argv, &workspace)?;
+            // Invalid arguments are model mistakes, not executor faults. Report
+            // them as a tool result so the model can correct the call and the
+            // turn keeps running.
+            let argv = match parse_argv(request.arguments().as_value()) {
+                Ok(argv) => argv,
+                Err(error) => return error.into_execution_result(),
+            };
+            if let Err(error) = validate_argv(&argv, &workspace) {
+                return error.into_execution_result();
+            }
             run(&argv, &workspace, cancellation).await
         })
     }
 }
 
-fn parse_argv(value: &serde_json::Value) -> Result<Vec<String>, ToolExecutorError> {
+fn parse_argv(value: &serde_json::Value) -> ToolCallResult<Vec<String>> {
     let args = value
         .get("argv")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| ToolExecutorError::new("argv must be a non-empty array"))?;
+        .ok_or_else(|| ToolCallError::invalid_args("argv must be a non-empty array"))?;
     if args.is_empty() || args.len() > MAX_ARGS {
-        return Err(ToolExecutorError::new("argv length is out of bounds"));
+        return Err(ToolCallError::invalid_args("argv length is out of bounds"));
     }
     let mut argv = Vec::with_capacity(args.len());
     for arg in args {
         let arg = arg
             .as_str()
-            .ok_or_else(|| ToolExecutorError::new("argv entries must be strings"))?;
+            .ok_or_else(|| ToolCallError::invalid_args("argv entries must be strings"))?;
         if arg.is_empty()
             || arg.len() > MAX_ARG_BYTES
             || arg.chars().any(|ch| ch == '\0' || ch.is_control())
         {
-            return Err(ToolExecutorError::new("argv entry is invalid"));
+            return Err(ToolCallError::invalid_args("argv entry is invalid"));
         }
         argv.push(arg.to_owned());
     }
     Ok(argv)
 }
 
-fn validate_argv(argv: &[String], workspace: &Path) -> Result<(), ToolExecutorError> {
+fn validate_argv(argv: &[String], workspace: &Path) -> ToolCallResult<()> {
     match argv[0].as_str() {
         "ls" => validate_ls(&argv[1..], workspace),
         "git" => validate_git(&argv[1..], workspace),
-        other => Err(ToolExecutorError::new(format!(
+        other => Err(ToolCallError::invalid_args(format!(
             "command `{other}` is not in the read-only allowlist"
         ))),
     }
 }
 
-fn validate_ls(args: &[String], workspace: &Path) -> Result<(), ToolExecutorError> {
+fn validate_ls(args: &[String], workspace: &Path) -> ToolCallResult<()> {
     let mut paths = 0;
     for arg in args {
         match arg.as_str() {
             "-a" | "-l" | "-la" | "-al" | "-1" => {}
             value if value.starts_with('-') => {
-                return Err(ToolExecutorError::new(format!(
+                return Err(ToolCallError::invalid_args(format!(
                     "ls flag `{value}` is not allowed"
                 )));
             }
             value => {
                 paths += 1;
                 if paths > 1 {
-                    return Err(ToolExecutorError::new("ls accepts at most one path"));
+                    return Err(ToolCallError::invalid_args("ls accepts at most one path"));
                 }
                 validate_relative_path(value, workspace)?;
             }
@@ -170,28 +180,28 @@ fn validate_ls(args: &[String], workspace: &Path) -> Result<(), ToolExecutorErro
     Ok(())
 }
 
-fn validate_git(args: &[String], workspace: &Path) -> Result<(), ToolExecutorError> {
+fn validate_git(args: &[String], workspace: &Path) -> ToolCallResult<()> {
     let Some(subcommand) = args.first() else {
-        return Err(ToolExecutorError::new("git subcommand is required"));
+        return Err(ToolCallError::invalid_args("git subcommand is required"));
     };
     match subcommand.as_str() {
         "status" => validate_git_status(&args[1..]),
         "diff" => validate_git_diff(&args[1..], workspace),
         "log" => validate_git_log(&args[1..]),
         "show" => validate_git_show(&args[1..], workspace),
-        other => Err(ToolExecutorError::new(format!(
+        other => Err(ToolCallError::invalid_args(format!(
             "git subcommand `{other}` is not in the read-only allowlist"
         ))),
     }
 }
 
-fn validate_git_status(args: &[String]) -> Result<(), ToolExecutorError> {
+fn validate_git_status(args: &[String]) -> ToolCallResult<()> {
     for arg in args {
         if !matches!(
             arg.as_str(),
             "-s" | "--short" | "--porcelain" | "--branch" | "-sb" | "--porcelain=v1"
         ) {
-            return Err(ToolExecutorError::new(format!(
+            return Err(ToolCallError::invalid_args(format!(
                 "git status argument `{arg}` is not allowed"
             )));
         }
@@ -199,7 +209,7 @@ fn validate_git_status(args: &[String]) -> Result<(), ToolExecutorError> {
     Ok(())
 }
 
-fn validate_git_diff(args: &[String], workspace: &Path) -> Result<(), ToolExecutorError> {
+fn validate_git_diff(args: &[String], workspace: &Path) -> ToolCallResult<()> {
     let mut after_separator = false;
     for arg in args {
         if after_separator {
@@ -211,7 +221,7 @@ fn validate_git_diff(args: &[String], workspace: &Path) -> Result<(), ToolExecut
             "--stat" | "--name-only" | "--name-status" | "--cached" | "--staged" | "--no-color" => {
             }
             value if value.starts_with('-') => {
-                return Err(ToolExecutorError::new(format!(
+                return Err(ToolCallError::invalid_args(format!(
                     "git diff argument `{value}` is not allowed"
                 )));
             }
@@ -221,14 +231,19 @@ fn validate_git_diff(args: &[String], workspace: &Path) -> Result<(), ToolExecut
     Ok(())
 }
 
-fn validate_git_log(args: &[String]) -> Result<(), ToolExecutorError> {
+fn validate_git_log(args: &[String]) -> ToolCallResult<()> {
     let mut index = 0;
     while index < args.len() {
-        match args[index].as_str() {
+        let arg = args[index].as_str();
+        match arg {
             "--oneline" | "--stat" | "--no-color" => index += 1,
-            "-n" => {
+            // `git log -n 15`, `-n15`, `-15` and `--max-count 15` all mean the
+            // same read-only request.
+            "-n" | "--max-count" => {
                 let Some(value) = args.get(index + 1) else {
-                    return Err(ToolExecutorError::new("git log -n needs a count"));
+                    return Err(ToolCallError::invalid_args(format!(
+                        "git log `{arg}` needs a count"
+                    )));
                 };
                 validate_count(value)?;
                 index += 2;
@@ -237,8 +252,16 @@ fn validate_git_log(args: &[String]) -> Result<(), ToolExecutorError> {
                 validate_count(&value["--max-count=".len()..])?;
                 index += 1;
             }
+            value if value.starts_with("-n") => {
+                validate_count(&value[2..])?;
+                index += 1;
+            }
+            value if value.starts_with('-') && value[1..].chars().all(|ch| ch.is_ascii_digit()) => {
+                validate_count(&value[1..])?;
+                index += 1;
+            }
             value => {
-                return Err(ToolExecutorError::new(format!(
+                return Err(ToolCallError::invalid_args(format!(
                     "git log argument `{value}` is not allowed"
                 )));
             }
@@ -247,7 +270,7 @@ fn validate_git_log(args: &[String]) -> Result<(), ToolExecutorError> {
     Ok(())
 }
 
-fn validate_git_show(args: &[String], workspace: &Path) -> Result<(), ToolExecutorError> {
+fn validate_git_show(args: &[String], workspace: &Path) -> ToolCallResult<()> {
     let mut revisions = 0;
     let mut after_separator = false;
     for arg in args {
@@ -259,14 +282,14 @@ fn validate_git_show(args: &[String], workspace: &Path) -> Result<(), ToolExecut
             "--" => after_separator = true,
             "--stat" | "--oneline" | "--no-color" => {}
             value if value.starts_with('-') => {
-                return Err(ToolExecutorError::new(format!(
+                return Err(ToolCallError::invalid_args(format!(
                     "git show argument `{value}` is not allowed"
                 )));
             }
             value => {
                 revisions += 1;
                 if revisions > 1 || !is_safe_revision(value) {
-                    return Err(ToolExecutorError::new(format!(
+                    return Err(ToolCallError::invalid_args(format!(
                         "git show revision `{value}` is not allowed"
                     )));
                 }
@@ -276,12 +299,14 @@ fn validate_git_show(args: &[String], workspace: &Path) -> Result<(), ToolExecut
     Ok(())
 }
 
-fn validate_count(value: &str) -> Result<(), ToolExecutorError> {
+fn validate_count(value: &str) -> ToolCallResult<()> {
     let count = value
         .parse::<u32>()
-        .map_err(|_| ToolExecutorError::new("git log count must be a number"))?;
+        .map_err(|_| ToolCallError::invalid_args("git log count must be a number"))?;
     if count == 0 || count > 200 {
-        return Err(ToolExecutorError::new("git log count is out of bounds"));
+        return Err(ToolCallError::invalid_args(
+            "git log count is out of bounds",
+        ));
     }
     Ok(())
 }
@@ -303,9 +328,11 @@ fn is_safe_revision(value: &str) -> bool {
     rest.chars().all(|ch| ch.is_ascii_digit())
 }
 
-fn validate_relative_path(value: &str, workspace: &Path) -> Result<(), ToolExecutorError> {
+fn validate_relative_path(value: &str, workspace: &Path) -> ToolCallResult<()> {
     if value.is_empty() || value.starts_with('/') || value.starts_with(':') {
-        return Err(ToolExecutorError::new("path must be workspace-relative"));
+        return Err(ToolCallError::invalid_args(
+            "path must be workspace-relative",
+        ));
     }
     let path = Path::new(value);
     if path.components().any(|component| {
@@ -314,14 +341,16 @@ fn validate_relative_path(value: &str, workspace: &Path) -> Result<(), ToolExecu
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        return Err(ToolExecutorError::new("path cannot escape the workspace"));
+        return Err(ToolCallError::invalid_args(
+            "path cannot escape the workspace",
+        ));
     }
     let resolved = workspace.join(path);
     let canonical = resolved.canonicalize().map_err(|_| {
-        ToolExecutorError::new(format!("path `{value}` does not exist in the workspace"))
+        ToolCallError::invalid_args(format!("path `{value}` does not exist in the workspace"))
     })?;
     if !canonical.starts_with(workspace) {
-        return Err(ToolExecutorError::new("path escapes the workspace"));
+        return Err(ToolCallError::invalid_args("path escapes the workspace"));
     }
     Ok(())
 }
@@ -533,11 +562,15 @@ mod tests {
             vec!["git", "diff", "../escape"],
             vec!["git", "diff", "--output", "out.txt"],
         ] {
-            assert!(
-                tool.execute(request(&argv), CancellationToken::new())
-                    .await
-                    .is_err(),
-                "{argv:?} should be rejected"
+            let result = tool
+                .execute(request(&argv), CancellationToken::new())
+                .await
+                .unwrap_or_else(|error| panic!("{argv:?} should be a tool result: {error}"));
+            assert!(result.is_error(), "{argv:?} should be rejected");
+            assert_eq!(
+                result.error().expect("failure").code,
+                "INVALID_ARGS",
+                "{argv:?}"
             );
         }
         let _ = fs::remove_dir_all(&workspace);
@@ -594,6 +627,11 @@ mod tests {
         for argv in [
             vec!["git", "diff", "--stat"],
             vec!["git", "log", "--oneline"],
+            vec!["git", "log", "--oneline", "-15"],
+            vec!["git", "log", "--oneline", "-n", "15"],
+            vec!["git", "log", "--oneline", "-n15"],
+            vec!["git", "log", "--oneline", "--max-count=15"],
+            vec!["git", "log", "--oneline", "--max-count", "15"],
             vec!["git", "show", "--stat", "HEAD"],
         ] {
             let result = tool
