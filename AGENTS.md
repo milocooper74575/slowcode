@@ -30,14 +30,41 @@ skill installation.
 | `crates/slowcode-feedback` | Issue-ready feedback bundles from a session journal. |
 | `crates/slowcode-update` | Release checks and verified self-replace. |
 | `crates/slowcode-audit` | Offline session audit: tokens, repeated reads, idle retries, plan churn. |
+| `crates/slowcode-docs` | Static docs site validation, generation and drift check. |
 | `crates/slowcode-tests` | Cross-crate integration tests. |
+| `site/` | Public docs source, single task source and generated static site. |
 
 Public references:
 
 - `README.md` for users.
 - `GLOSSARY.md` for domain terms.
 - `CODING_STANDARDS.md` for code style and review rules.
+- `site/dist/index.html` for the public docs site.
+- `site/tasks.json` for the single task status source.
+- `site/README.md` for how to edit the site.
 - `crates/slowcode-kernel/UPSTREAM.md` for vendored changes and local deltas.
+
+## Docs site and task source
+
+- `site/tasks.json` is the only task status source. `HANDOFF.md` carries
+  handoff context, never a second task list.
+- A session todo list is transient working memory. Durable progress,
+  ownership and next actions belong in `site/tasks.json`; do not leave them
+  only in a chat transcript or `HANDOFF.md`.
+- Before starting a task, read the documents named in its `docs` field. On
+  completion update `status`, `evidence` and `next_action`.
+- A new task needs `docs` and `acceptance`. Dependencies must name existing
+  task IDs. `done` needs `evidence`, `deprecated` needs `reason`, and
+  `in_progress` needs `next_action`.
+- Every `site/content/*.md` must be mounted in `site/docs.json`. The roadmap
+  has exactly one main-flow marker section.
+- `site/dist/` is generated and committed. Do not hand-edit it.
+
+```bash
+cargo run -p slowcode-docs -- check           # hierarchy, tasks, main flow
+cargo run -p slowcode-docs -- build           # regenerate site/dist
+cargo run -p slowcode-docs -- build --check   # CI drift gate
+```
 
 ## Private local paths
 

@@ -26,5 +26,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude slowcode-kernel
 
+      - name: Docs check
+        run: cargo run -p slowcode-docs -- check
+
+      - name: Docs site is current
+        run: cargo run -p slowcode-docs -- build --check
+
       - name: Clippy
         run: scripts/clippy.sh

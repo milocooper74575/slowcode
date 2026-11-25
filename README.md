@@ -19,6 +19,20 @@ slowcode 不是让 AI 多写代码。它在关键节点停下来，把创造空�
 - **Skills**：本地 skill 安装、校验、锁文件、`--name` 改名与 `--dry-run` 预览。
 - **Plan artifact 与审计**：workflow 事件、run journal、审批记录与模型调用归档。
 
+## 文档与进度
+
+- 离线文档站：[`site/dist/index.html`](site/dist/index.html)
+- 唯一任务源：[`site/tasks.json`](site/tasks.json)
+- 文档源与编辑规则：[`site/README.md`](site/README.md)
+
+文档站的源文件在 `site/`，生成产物在 `site/dist/`。任务状态只写在
+`site/tasks.json`，`HANDOFF` 只保存交接上下文。改完 `site/` 后运行：
+
+```bash
+cargo run -p slowcode-docs -- check
+cargo run -p slowcode-docs -- build
+```
+
 ## 快速开始
 
 ### 安装预编译包
