@@ -5264,6 +5264,97 @@ validation: ok
         let _ = fs::remove_dir_all(&workspace);
     }
 
+    const PLAN_FIXTURE: &str = "\
+## 证据包
+- read src/main.rs
+
+## 认知任务分配表
+| 任务 | 认知属性 | 判定依据 | 执行状态 | Agent 行为 | 用户角色 | 最小深度链路 | 验收 |
+|---|---|---|---|---|---|---|---|
+| 读取输入 | 已知域 | src/main.rs | 可执行 | 自主执行 | 审查者 | read | 打印内容 |
+";
+
+    fn init_git_repository(workspace: &Path) {
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace)
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        fs::write(workspace.join("README.md"), "seed").expect("seed file");
+        git(&["add", "README.md"]);
+        git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn plan_accepts_git_log_count_shorthands_via_readonly_shell() {
+        let workspace = temp_workspace();
+        init_git_repository(&workspace);
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::with_attempts(vec![
+            tool_call_response(
+                "readonly_shell",
+                serde_json::json!({ "argv": ["git", "log", "--oneline", "-15"] }),
+            ),
+            text_response(PLAN_FIXTURE),
+        ]));
+        let plan = run_plan(
+            &config,
+            provider,
+            "inspect the workspace",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("plan succeeds");
+        let store = WorkflowStore::new(&workspace);
+        let state = store
+            .load(plan.workflow_id.as_deref().expect("workflow id"))
+            .expect("state loads");
+        let events = fs::read_to_string(store.root().join(&state.workflow_id).join("events.jsonl"))
+            .expect("events");
+        assert!(
+            events.contains("\"argv\":[\"git\",\"log\",\"--oneline\",\"-15\"]"),
+            "{events}\n\n{}",
+            plan.output
+        );
+        assert!(plan.output.contains("## 认知任务分配表"), "{}", plan.output);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn plan_continues_after_readonly_shell_rejects_arguments() {
+        let workspace = temp_workspace();
+        let config = PlanConfig::new(workspace.clone());
+        let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::with_attempts(vec![
+            tool_call_response(
+                "readonly_shell",
+                serde_json::json!({ "argv": ["git", "log", "--author=x"] }),
+            ),
+            text_response(PLAN_FIXTURE),
+        ]));
+        let plan = run_plan(
+            &config,
+            provider,
+            "inspect the workspace",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("plan survives a rejected tool call");
+        assert!(plan.output.contains("## 认知任务分配表"), "{}", plan.output);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
     #[tokio::test]
     async fn hint_runs_a_read_only_turn_and_records_the_override() {
         let workspace = temp_workspace();
