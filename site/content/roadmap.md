@@ -26,4 +26,4 @@ plan -> approve -> scaffold -> continue -> distill -> feedback
 
 ## 当前焦点
 
-文档站与唯一任务源已经落地：`site/tasks.json` 是任务状态的唯一来源，`site/dist` 是可离线打开的静态站。下一步见 [任务源](tasks.html) 里的 `next_task`。
+文档站与唯一任务源已经落地：`site/tasks.json` 是任务状态的唯一来源，`site/dist` 是可离线打开的静态站。下一步是把同一套离线站能力扩展为产品内的会话与 workflow 本地审计站（`AUDIT-001`），让用户随时回看节点、证据与 feedback。详见 [会话与 workflow 本地审计站](session-audit-site.md)。

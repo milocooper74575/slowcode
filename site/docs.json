@@ -33,6 +33,12 @@
           "file": "workflow.md",
           "title": "Plan workflow 与阶段门禁",
           "summary": "从 /plan 到 /distill 的状态流转。"
+        },
+        {
+          "id": "session-audit-site",
+          "file": "session-audit-site.md",
+          "title": "会话与 workflow 本地审计站",
+          "summary": "把文档站扩展为本地会话与 workflow 审计入口。"
         }
       ]
     },

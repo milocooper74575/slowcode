@@ -2,7 +2,7 @@
   "version": 1,
   "updated_at": "2026-11-25",
   "title": "slowcode 任务源",
-  "next_task": "DOCS-003",
+  "next_task": "AUDIT-001",
   "rules": [
     "这是仓库唯一的任务状态源；HANDOFF 只写交接上下文，不另起任务状态。",
     "开始任务前先读 docs 字段指向的文档；完成时更新 status、evidence、next_action。",
@@ -40,6 +40,17 @@
       "evidence": "55ae2a7、98f35ee；cargo test -p slowcode-kernel --lib readonly_shell；cargo test -p slowcode-app --lib plan::tests::plan_",
       "depends_on": [],
       "next_action": "已关；后续由 FIX-002 明确超时语义。"
+    },
+    {
+      "id": "AUDIT-001",
+      "phase": "P1",
+      "status": "todo",
+      "priority": "high",
+      "title": "本地会话与 workflow 审计文档站",
+      "docs": ["session-audit-site.md", "workflow.md"],
+      "acceptance": "创建 workflow 时在 workspace 专用目录生成只读静态审计站；覆盖总览、节点、会话与 feedback；TUI 底部常驻入口；文字版 workflow 只保留当前节点或精简摘要；断网可打开且与 state/journal 一致。",
+      "depends_on": ["DOCS-001"],
+      "next_action": "先确认审计站目录与生成时机，再实现 workflow/session 投影与 TUI 入口。"
     },
     {
       "id": "DOCS-001",
