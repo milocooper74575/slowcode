@@ -167,32 +167,12 @@ update available: 0.2.0 (current 0.1.0); type /update
 
 ## 使用方式
 
-```bash
-# TUI
-slowcode --workspace <dir>
+安装后直接运行 `slowcode` 进入 TUI，默认 workspace 是当前目录，需要时用
+`--workspace` 指定。任务输入、会话切换、写文件与 shell 审批、`/plan` 到
+`/distill` 都在 TUI 内完成。
 
-# headless 单次任务
-slowcode run --workspace <dir> "任务"
-
-# 简单 REPL
-slowcode repl --workspace <dir>
-
-# 写文件与 shell 前审批
-slowcode --ask --workspace <dir>
-
-# 只读
-slowcode --read-only --workspace <dir> "只读任务"
-
-# 新建会话并打印 session id
-slowcode run --workspace <dir> --session new "任务"
-
-# 恢复同一会话
-slowcode run --workspace <dir> --session <id> --resume "继续"
-```
-
-默认模型是 `deepseek-flash`，可用 `--model` 覆盖。`--max-tokens` 与 `--context-window` 可覆盖限制。
-
-`--ask` 需要可交互终端。非 TTY 环境会以 `approval_required` 退出，而不是静默放行。
+默认模型是 `deepseek-flash`，可用 `--model` 覆盖。需要脚本调用时用
+`slowcode run`，完整参数见 `slowcode --help`。
 
 ## Plan workflow
 
@@ -228,6 +208,7 @@ workflow 状态写在目标 workspace 的 `.scratch/workflows/<workflow_id>/`，
 ## 角色与安全
 
 - navigator 只读，driver 可写。
+- 非交互环境不会静默放行审批：需要审批时以 `approval_required` 退出。
 - MCP 项目级 server 默认 dormant，`/mcp enable` 激活并按配置指纹缓存信任。
 - MCP 工具按风险分级。只读注解与用户级 `trusted` 自动放行，其余本会话首次调用询问。
 - 密钥从 `.env` 或环境变量读取。`.env`、本地 session、`.scratch/` 与反馈包都不应提交。
