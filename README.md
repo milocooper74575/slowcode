@@ -231,51 +231,6 @@ workflow 状态写在目标 workspace 的 `.scratch/workflows/<workflow_id>/`，
 | `crates/slowcode-update` | 版本比较、更新检查缓存、校验与自替换 |
 | `crates/slowcode-tests` | 跨 crate 集成测试 |
 
-## 开发与测试
-
-```bash
-cargo fmt --all -- --check
-scripts/clippy.sh
-cargo test --workspace --exclude slowcode-kernel
-```
-
-`slowcode-kernel` 是 vendored 上游代码。改动它之前先读 `crates/slowcode-kernel/UPSTREAM.md`，并单独运行：
-
-```bash
-cargo test -p slowcode-kernel --lib
-```
-
-真实 provider 测试默认 ignored，需要 key：
-
-```bash
-cargo test -p slowcode-cli --test e2e_deepseek -- --ignored --nocapture
-cargo test -p slowcode-cli --test plan_flow_deepseek -- --ignored --nocapture
-```
-
-端到端脚本：
-
-```bash
-scripts/e2e.sh            # 真实模型主链路
-scripts/e2e-tui.sh        # macOS PTY 冒烟
-scripts/e2e-tui-turn.sh   # 真实模型审批
-scripts/e2e-tui-handoff.sh
-scripts/e2e-tui-session.sh
-scripts/e2e-mcp.sh
-```
-
-后几个脚本会消耗 provider token，部分依赖 macOS PTY 与 `python3`。
-
-## 贡献
-
-欢迎 issue 与 pull request。提交前请：
-
-1. 保持改动聚焦，一个 PR 解决一件事。
-2. 补上覆盖改动的测试，单元测试放代码旁，跨 crate 测试放 `crates/slowcode-tests/tests/`。
-3. 跑 `cargo fmt --all -- --check`、`scripts/clippy.sh` 与 `cargo test --workspace --exclude slowcode-kernel`。
-4. 不提交密钥、session JSONL、`.scratch/` 现场或本地 skill 安装目录。
-
-领域术语见 `GLOSSARY.md`，代码风格见 `CODING_STANDARDS.md`。
-
 ## Vendored code
 
 `crates/slowcode-kernel` 来自 [`deepseek-harness-rs`](https://github.com/xizheyin/deepseek-harness-rs)，按 MIT 许可证 vendor。改动记录在 `crates/slowcode-kernel/UPSTREAM.md` 与同目录的 `LICENSE`。
