@@ -81,7 +81,7 @@ Windows 原生包暂未提供。
 
 macOS 预编译包当前未做 Apple 签名与 notarization。通过 `curl` 安装不会带上
 Gatekeeper 的 quarantine 属性，所以终端里通常可以直接运行。如果系统仍拦截，
-可以在系统设置中允许，或改为从源码构建。签名会在拿到证书后补上。
+可以在系统设置中允许。签名会在拿到证书后补上。
 
 ### 配置 DeepSeek API key
 
@@ -165,55 +165,32 @@ update available: 0.2.0 (current 0.1.0); type /update
 同源，只能防止传输损坏，不能防御发布渠道被攻破；签名验证尚未实现。自动检查
 更新是低风险、可缓存的只读动作，替换必须留给用户。
 
-### 从源码构建
-
-从源码构建需要 Rust 1.88 或更高。
-
-```bash
-git clone <your-repo-url>
-cd slowcode
-
-cp .env.example .env
-# 在 .env 中填写 DEEPSEEK_API_KEY
-
-cargo build --release -p slowcode-cli
-./target/release/slowcode --workspace /path/to/project
-```
-
-没有参数、只有 flag 或使用 `tui` 子命令都会进入 TUI。
-
-也可以直接从环境变量读取 key：
-
-```bash
-export DEEPSEEK_API_KEY=...
-```
-
-默认模型是 `deepseek-flash`，可用 `--model` 覆盖。`--max-tokens` 与 `--context-window` 可覆盖限制。
-
 ## 使用方式
 
 ```bash
 # TUI
-cargo run -p slowcode-cli -- --workspace <dir>
+slowcode --workspace <dir>
 
 # headless 单次任务
-cargo run -p slowcode-cli -- run --workspace <dir> "任务"
+slowcode run --workspace <dir> "任务"
 
 # 简单 REPL
-cargo run -p slowcode-cli -- repl --workspace <dir>
+slowcode repl --workspace <dir>
 
 # 写文件与 shell 前审批
-cargo run -p slowcode-cli -- --ask --workspace <dir>
+slowcode --ask --workspace <dir>
 
 # 只读
-cargo run -p slowcode-cli -- --read-only --workspace <dir> "只读任务"
+slowcode --read-only --workspace <dir> "只读任务"
 
 # 新建会话并打印 session id
-cargo run -p slowcode-cli -- run --workspace <dir> --session new "任务"
+slowcode run --workspace <dir> --session new "任务"
 
 # 恢复同一会话
-cargo run -p slowcode-cli -- run --workspace <dir> --session <id> --resume "继续"
+slowcode run --workspace <dir> --session <id> --resume "继续"
 ```
+
+默认模型是 `deepseek-flash`，可用 `--model` 覆盖。`--max-tokens` 与 `--context-window` 可覆盖限制。
 
 `--ask` 需要可交互终端。非 TTY 环境会以 `approval_required` 退出，而不是静默放行。
 
