@@ -8,6 +8,16 @@ slowcode 不是让 AI 多写代码。它在关键节点停下来，把创造空�
 
 ![status](https://img.shields.io/badge/status-early%20preview-orange)
 
+## 你可能不需要 slowcode
+
+slowcode 主动放慢编码节奏，把一部分实现交回给人。这是一笔成本。如果符合下列任意一条，用别的工具会更合适：
+
+1. 追求绝对的编码速度，而不关心编码质量。
+2. 没有因为 AI coding 而感觉到代码失控，或是认知失调。
+3. 不使用 AI coding。
+
+这三条里只要中了一条，slowcode 的门禁、访谈和 Teach-back 对你都是纯粹的摩擦。
+
 ## 它能做什么
 
 - **Plan workflow**：`/plan` 生成认知任务分配表，逐题访谈，`/approve` 后按分类进入脚手架或测试修复，最后用 `/distill` 做 Teach-back 与理解漏洞报告。
