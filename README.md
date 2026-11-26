@@ -23,11 +23,11 @@ slowcode 主动放慢编码节奏，把一部分实现交回给人。这是一�
 - **Plan workflow**：`/plan` 生成认知任务分配表，逐题访谈，`/approve` 后按分类进入脚手架或测试修复，最后用 `/distill` 做 Teach-back 与理解漏洞报告。
 - **阶段门禁**：未批准不能 scaffold，未实现核心不能继续，测试未绿不能 distill，预算耗尽进入可恢复的 Blocked。
 - **角色切换**：navigator 只读，driver 读写并运行 shell，同一会话内按阶段或用户命令切换。
-- **TUI**：流式文本与推理，工具卡片，内联审批与补全，鼠标选区复制，上下文占比，`/session switch`，`/quit` handoff。
-- **会话持久化**：JSONL 会话，session id 即 traceId，支持 `--resume`。
-- **MCP**：用户级与项目级配置合并，stdio 与 Streamable HTTP，项目级 server 默认 dormant，工具按风险分级审批。
-- **Skills**：本地 skill 安装、校验、锁文件、`--name` 改名与 `--dry-run` 预览。
-- **Plan artifact 与审计**：workflow 事件、run journal、审批记录与模型调用归档。
+- **本地审计站**：`slowcode audit rebuild` 把 workflow 事件、会话、审批与 feedback 还原成离线站点，源文件缺失时降级展示而不是报错。
+- **文档站与唯一任务源**：`site/tasks.json` 是仓库唯一的任务状态源，`slowcode-docs check/build` 校验文档层级、任务字段与主流程，`build --check` 用在 CI 防漂移。
+- **可追溯的会话**：JSONL 事件与 run journal，session id 即 traceId，支持 `--resume`；模型调用与审批留档，`/feedback` 从会话日志生成可提交 issue 的反馈包。
+- **上下文与交接**：AGENTS.md 状态、GLOSSARY 稳定前缀、HANDOFF 指针，`/quit` 输出交接信息。
+- **标配能力**：TUI、MCP、本地 Skills 都有，细节见文档站。
 
 ## 文档与进度
 
