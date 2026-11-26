@@ -25,7 +25,7 @@ slowcode 主动放慢编码节奏，把一部分实现交回给人。这是一�
 - **角色切换**：navigator 只读，driver 读写并运行 shell，同一会话内按阶段或用户命令切换。
 - **本地审计站**：`slowcode audit rebuild` 把 workflow 事件、会话、审批与 feedback 还原成离线站点，源文件缺失时降级展示而不是报错。
 - **文档站与唯一任务源**：`site/tasks.json` 是仓库唯一的任务状态源，`slowcode-docs check/build` 校验文档层级、任务字段与主流程，`build --check` 用在 CI 防漂移。
-- **可追溯的会话**：JSONL 事件与 run journal，session id 即 traceId，支持 `--resume`；模型调用与审批留档，`/feedback` 从会话日志生成可提交 issue 的反馈包。
+- **可追溯的会话**：JSONL 事件与 run journal 都 append-only，session id 即 traceId，支持 `--resume`；模型调用与审批留档，`/feedback` 从会话日志生成可提交 issue 的反馈包。
 - **上下文与交接**：AGENTS.md 状态、GLOSSARY 稳定前缀、HANDOFF 指针，`/quit` 输出交接信息。
 - **标配能力**：TUI、MCP、本地 Skills 都有，细节见文档站。
 
